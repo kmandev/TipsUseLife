@@ -2,5 +2,34 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "facebook-feed-webhook",
   "main": "src/index.js",
-  "compatibility_date": "2026-09-10"
+  "compatibility_date": "2026-09-10",
+
+  // Non-sensitive configuration only. Secrets (META_APP_SECRET,
+  // META_VERIFY_TOKEN, HERMES_SECRET, PAGE_ACCESS_TOKEN) are set with
+  // `wrangler secret put` and are never committed here.
+  "vars": {
+    // SAFETY: DRY_RUN means no Facebook reply mutation is ever performed.
+    // Only the exact string "LIVE" enables live replies, and LIVE also
+    // requires a PAGE_ACCESS_TOKEN secret to be present.
+    "REPLY_MODE": "DRY_RUN",
+    "PAGE_ID": "853313081388711",
+    "HERMES_URL": "https://hermes-feed.cloudnext.icu/webhooks/facebook-comments",
+    "HERMES_TIMEOUT_MS": "25000",
+    "GRAPH_API_VERSION": "v21.0",
+    "MAX_REPLY_LENGTH": "600"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tipsuselife-ai",
+      "database_id": "c5621ac3-eb15-4044-8d87-6a0ebde8209b",
+      // Migrations live at the repo root, outside the Worker directory.
+      "migrations_dir": "../database/migrations"
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
 }

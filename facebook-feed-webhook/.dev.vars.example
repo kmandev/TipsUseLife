@@ -1,0 +1,14 @@
+# Local development only. Copy to `.dev.vars` and fill in real values.
+# `.dev.vars` is gitignored. NEVER commit real values.
+#
+# In production these are set with:
+#   wrangler secret put <NAME>
+#
+# Placeholders only below -- no real secrets in this file, ever.
+
+META_APP_SECRET=replace-me
+META_VERIFY_TOKEN=replace-me
+HERMES_SECRET=replace-me
+
+# Only needed if LIVE mode is ever enabled. Leave unset for DRY_RUN.
+# PAGE_ACCESS_TOKEN=replace-me
