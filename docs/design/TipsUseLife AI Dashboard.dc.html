@@ -643,7 +643,7 @@ Hard rules:
               </div>
               <div style="display:flex; align-items:center; gap:12px; padding:13px 15px; border:1px solid {{ conn.bd }}; border-radius:12px; background: {{ conn.bg }};">
                 <span style="width:9px; height:9px; border-radius:50%; flex:0 0 9px; background: {{ conn.dot }};"></span>
-                <div style="flex:1 1 180px; min-width:0;"><div style="font-weight:600; font-size:14px;">D1 Database</div><div style="font-size:12.5px; color:#8A93AE; font-family:'IBM Plex Mono', monospace;">tipsuselife-comments</div></div>
+                <div style="flex:1 1 180px; min-width:0;"><div style="font-weight:600; font-size:14px;">D1 Database</div><div style="font-size:12.5px; color:#8A93AE; font-family:'IBM Plex Mono', monospace;">tipsuselife-ai</div></div>
                 <span style="font-size:12px; font-weight:600; color: {{ conn.fg }};">{{ conn.label }}</span>
               </div>
             </div>
@@ -687,11 +687,11 @@ Hard rules:
       <div style="width:46px; height:46px; border-radius:13px; background:#FBE2E2; color:#D33B3B; display:flex; align-items:center; justify-content:center; margin-bottom:14px;">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4"></path><path d="M12 17h.01"></path><path d="M10.3 3.9 1.9 18a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"></path></svg>
       </div>
-      <h3 style="margin:0 0 8px; font-size:17px; font-weight:700;">เปลี่ยนเป็นโหมด LIVE?</h3>
-      <p style="margin:0 0 20px; font-size:14px; color:#5D6785; line-height:1.7;">การเปิด LIVE จะทำให้ระบบสามารถตอบความคิดเห็นจริงบน Facebook</p>
+      <h3 style="margin:0 0 8px; font-size:17px; font-weight:700;">จำลองโหมด LIVE (Preview เท่านั้น)</h3>
+      <p style="margin:0 0 20px; font-size:14px; color:#5D6785; line-height:1.7;">Prototype นี้ไม่ได้เชื่อมกับ Worker จริง การกดยืนยันจะจำลองหน้าตาของโหมด LIVE ในดีไซน์นี้เท่านั้น การเปิด LIVE จริงต้องแก้ค่า REPLY_MODE ใน Worker configuration แล้ว deploy ใหม่ — dashboard นี้ไม่มีช่องทางสั่งงานนั้น</p>
       <div style="display:flex; gap:9px; justify-content:flex-end;">
         <button onClick="{{ cancelLive }}" style="padding:10px 20px; border-radius:10px; border:1px solid #DDE3F0; cursor:pointer; background:#fff; color:#6B7595; font-family:inherit; font-size:14px;" style-hover="background:#F1F4FB">ยกเลิก</button>
-        <button onClick="{{ confirmLive }}" style="padding:10px 20px; border-radius:10px; border:0; cursor:pointer; background:#D33B3B; color:#fff; font-family:inherit; font-size:14px; font-weight:600;" style-hover="background:#B62F2F">ยืนยัน</button>
+        <button onClick="{{ confirmLive }}" style="padding:10px 20px; border-radius:10px; border:0; cursor:pointer; background:#D33B3B; color:#fff; font-family:inherit; font-size:14px; font-weight:600;" style-hover="background:#B62F2F">ยืนยัน (จำลองเท่านั้น)</button>
       </div>
     </div>
   </sc-if>
@@ -963,15 +963,15 @@ class Component extends DCLogic {
       modeCard: {
         iconBg: isLive ? "#FEECEC" : "#F3EEFF",
         iconFg: isLive ? "#D33B3B" : "#6D3DE8",
-        note: isLive ? "ระบบตอบความคิดเห็นจริงบน Facebook" : "ยังไม่ส่งข้อความจริงไป Facebook"
+        note: isLive ? "จำลอง LIVE ใน Prototype — Worker จริงต้อง deploy จึงจะมีผล" : "ยังไม่ส่งข้อความจริงไป Facebook"
       },
       modeNotice: {
         bg: isLive ? "#FEF3F3" : "#F6F3FF",
         bd: isLive ? "#F6CFCF" : "#DCD2FB",
         fg: isLive ? "#D33B3B" : "#6D3DE8",
         text: isLive
-          ? "LIVE: ทุกคำตอบของ AI จะถูกโพสต์จริงบนเพจ TipsUseLife"
-          : "DRY_RUN: AI ร่างคำตอบเก็บไว้ให้ตรวจ ยังไม่ตอบ Facebook จริง"
+          ? "LIVE (จำลองใน Prototype): ใน production จริง โหมดนี้จะทำให้ AI โพสต์คำตอบจริงบนเพจ — แต่การสลับใน dashboard นี้ไม่มีผลต่อ Worker จริง ต้องแก้ REPLY_MODE ใน Worker configuration แล้ว deploy ใหม่จึงจะมีผล"
+          : "DRY_RUN: AI ร่างคำตอบเก็บไว้ให้ตรวจ ยังไม่ตอบ Facebook จริง (ค่าเริ่มต้นที่ปลอดภัยของระบบ)"
       },
       toggle: {
         dry: { bg: isLive ? "#F1F4FB" : "#2B50F0", fg: isLive ? "#6B7595" : "#ffffff", bd: isLive ? "#E6EAF4" : "#2B50F0" },
@@ -981,7 +981,7 @@ class Component extends DCLogic {
       askLive: () => this.setState({ liveModalOpen: true }),
       liveModalOpen: s.liveModalOpen,
       cancelLive: () => this.setState({ liveModalOpen: false }),
-      confirmLive: () => { this.setState({ mode: "LIVE", liveModalOpen: false }); this.toast("เปลี่ยนเป็นโหมด LIVE แล้ว (Mock)"); },
+      confirmLive: () => { this.setState({ mode: "LIVE", liveModalOpen: false }); this.toast("จำลองโหมด LIVE แล้ว (Preview เท่านั้น — Worker จริงยังเป็น DRY_RUN)"); },
 
       provider: s.provider,
       model: s.model,
