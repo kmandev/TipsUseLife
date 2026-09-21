@@ -12,3 +12,9 @@ HERMES_SECRET=replace-me
 
 # Only needed if LIVE mode is ever enabled. Leave unset for DRY_RUN.
 # PAGE_ACCESS_TOKEN=replace-me
+
+# NEXT-02 admin read API (POST /admin/login, GET /admin/comments).
+# Set in production with `wrangler secret put <NAME>`.
+# ADMIN_SESSION_SECRET should be a long random string, not a guessable one.
+ADMIN_PASSWORD=replace-me
+ADMIN_SESSION_SECRET=replace-me

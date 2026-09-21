@@ -11,6 +11,7 @@
  */
 
 import { resolveConfig, MODE_DRY_RUN } from "./config.js";
+import { isAdminPath, handleAdminRequest } from "./admin.js";
 import { hmacSha256Hex, timingSafeEqual } from "./crypto.js";
 import { extractCommentEvents, isSelfEvent } from "./facebook.js";
 import { processCommentEvent } from "./pipeline.js";
@@ -24,6 +25,13 @@ export default {
    */
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // NEXT-02 -- admin read API. Claims exactly two paths, checked before
+    // the Meta webhook handling below so that every other path (the
+    // webhook itself included) behaves exactly as it did before.
+    if (isAdminPath(url.pathname)) {
+      return handleAdminRequest(request, url, env);
+    }
 
     if (request.method === "GET") {
       return handleVerification(url, env);
