@@ -70,6 +70,25 @@ export function parseAgentResponse(raw) {
     return { ok: false, reason: "AI_RESPONSE_EMPTY" };
   }
 
+  // Some agent gateways wrap their JSON payload in a single-element
+  // array (e.g. a content-block list: [{"type":"text","text":"..."}]).
+  // We accept ONLY the unambiguous single-element case and recurse into
+  // it; anything else (empty, multi-element, non-object element) stays
+  // fail-closed exactly like any other unrecognized shape.
+  if (Array.isArray(raw)) {
+    if (raw.length !== 1) {
+      return { ok: false, reason: "AI_RESPONSE_UNRECOGNIZED_SHAPE" };
+    }
+    const [sole] = raw;
+    if (sole && typeof sole === "object" && !Array.isArray(sole)) {
+      if (sole.type === "text" && typeof sole.text === "string") {
+        return parseAgentResponse(sole.text);
+      }
+      return parseAgentResponse(sole);
+    }
+    return { ok: false, reason: "AI_RESPONSE_UNRECOGNIZED_SHAPE" };
+  }
+
   if (typeof raw === "object") {
     const candidate =
       raw.action !== undefined
@@ -180,4 +199,24 @@ export function evaluateAgentResponse(raw, options) {
   const parsed = parseAgentResponse(raw);
   if (!parsed.ok) return parsed;
   return validateAgentResponse(parsed.value, options);
+}
+
+/**
+ * Safe, secret-free structural description of an agent response, for
+ * diagnostic logging only. Never includes any content -- only the JS
+ * type, whether it is an array, and (for a plain object) up to its
+ * first 10 top-level key NAMES. No values, no comment text, no prompt,
+ * no raw response body.
+ *
+ * @param {unknown} raw
+ * @returns {{raw_type: string, is_array: boolean, top_level_keys: string[] | null}}
+ */
+export function describeResponseShape(raw) {
+  const isArray = Array.isArray(raw);
+  const rawType = raw === null ? "null" : isArray ? "array" : typeof raw;
+  let topLevelKeys = null;
+  if (raw && typeof raw === "object" && !isArray) {
+    topLevelKeys = Object.keys(raw).slice(0, 10);
+  }
+  return { raw_type: rawType, is_array: isArray, top_level_keys: topLevelKeys };
 }

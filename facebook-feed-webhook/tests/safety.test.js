@@ -208,3 +208,40 @@ test("comment text is truncated in logs rather than logged in full", async () =>
   // ...but the full text is still stored in the database.
   assert.equal(db._state.comments[0].comment_text, longText);
 });
+
+test("ai_response_rejected diagnostic metadata carries no content, only shape (NEXT-05)", async () => {
+  const db = createFakeD1();
+  const ctx = createCtx();
+  const secretishText = "PRIVATE_UPSTREAM_FIELD_VALUE_MARKER";
+  const capture = captureConsole();
+
+  // An unrecognized, foreign-keyed envelope -- exactly the class of shape
+  // this diagnostic logging exists to characterize without exposing it.
+  const mock = installFetchMock(() =>
+    jsonResponse({ unexpected_upstream_field: secretishText, nested: { x: 1 } })
+  );
+
+  try {
+    await worker.fetch(await signedRequest(commentPayload()), createEnv({ DB: db }), ctx);
+    await ctx.settle();
+  } finally {
+    mock.restore();
+    capture.restore();
+  }
+
+  const logged = capture.text();
+  assert.ok(logged.includes("ai_response_rejected"), "rejection was logged");
+  assert.ok(logged.includes("AI_RESPONSE_UNRECOGNIZED_SHAPE"));
+
+  // The structural metadata itself must be present...
+  assert.ok(logged.includes('"raw_type":"object"'));
+  assert.ok(logged.includes('"is_array":false'));
+  assert.ok(logged.includes("unexpected_upstream_field"), "key name is safe to log");
+
+  // ...but never the value behind that key, and never a nested value.
+  // ("nested" itself is expected to appear -- it's a safe top-level KEY
+  // NAME -- what must never appear is the object's inner content.)
+  assert.ok(!logged.includes(secretishText), "an upstream field VALUE leaked into logs");
+  assert.ok(!logged.includes('"x":1'), "a nested object's inner value was inlined into the log");
+  assert.ok(!/"nested":\s*\{/.test(logged), "a nested object was inlined into the log");
+});

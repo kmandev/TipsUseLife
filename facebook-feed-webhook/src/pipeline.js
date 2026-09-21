@@ -16,7 +16,7 @@ import { MODE_DRY_RUN, MODE_LIVE } from "./config.js";
 import { buildHermesPayload } from "./facebook.js";
 import { matchProduct } from "./products.js";
 import { sendToHermes, HermesError } from "./hermes.js";
-import { evaluateAgentResponse, ACTIONS, SAFE_GENERIC_REPLY } from "./ai.js";
+import { evaluateAgentResponse, describeResponseShape, ACTIONS, SAFE_GENERIC_REPLY } from "./ai.js";
 import { sendFacebookReply } from "./facebook-reply.js";
 import {
   insertCommentIfNew,
@@ -128,6 +128,7 @@ export async function processCommentEvent(event, { db, env, config }) {
       comment_id: event.comment_id,
       matched_product_id: matchedProductId,
       duration_ms: Date.now() - startedAt,
+      ...describeResponseShape(agentRaw),
     });
 
     // Fail closed to a factless generic draft. Recorded as SKIPPED so it

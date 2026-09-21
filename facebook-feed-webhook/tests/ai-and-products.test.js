@@ -7,6 +7,7 @@ import {
   parseAgentResponse,
   validateAgentResponse,
   evaluateAgentResponse,
+  describeResponseShape,
   SAFE_GENERIC_REPLY,
 } from "../src/ai.js";
 import {
@@ -116,6 +117,99 @@ test("SKIP is a valid action", () => {
   const result = validateAgentResponse({ action: "SKIP" });
   assert.equal(result.ok, true);
   assert.equal(result.action, "SKIP");
+});
+
+test("a single-element array wrapping a bare action object is accepted", () => {
+  const result = parseAgentResponse([{ action: "SKIP" }]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, { action: "SKIP" });
+});
+
+test("a single-element array wrapping a text content-block is accepted", () => {
+  const result = parseAgentResponse([
+    { type: "text", text: JSON.stringify({ action: "SKIP" }) },
+  ]);
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value, { action: "SKIP" });
+});
+
+test("array-shaped REPLY is accepted the same way", () => {
+  const expected = { action: "REPLY", reply_text: "ok" };
+
+  const bare = parseAgentResponse([expected]);
+  assert.equal(bare.ok, true);
+  assert.deepEqual(bare.value, expected);
+
+  const textBlock = parseAgentResponse([{ type: "text", text: JSON.stringify(expected) }]);
+  assert.equal(textBlock.ok, true);
+  assert.deepEqual(textBlock.value, expected);
+});
+
+test("multi-element arrays are rejected, not guessed at", () => {
+  const result = parseAgentResponse([{ action: "SKIP" }, { action: "SKIP" }]);
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "AI_RESPONSE_UNRECOGNIZED_SHAPE");
+});
+
+test("ambiguous or non-object array elements are rejected", () => {
+  for (const raw of [[], [1], ["just a string"], [null], [[{ action: "SKIP" }]]]) {
+    const result = parseAgentResponse(raw);
+    assert.equal(result.ok, false, JSON.stringify(raw));
+    assert.equal(result.reason, "AI_RESPONSE_UNRECOGNIZED_SHAPE", JSON.stringify(raw));
+  }
+});
+
+test("existing raw, fenced and enveloped JSON parsing is unchanged", () => {
+  const expected = { action: "REPLY", reply_text: "ok" };
+
+  assert.deepEqual(parseAgentResponse(JSON.stringify(expected)).value, expected);
+  assert.deepEqual(
+    parseAgentResponse("```json\n" + JSON.stringify(expected) + "\n```").value,
+    expected
+  );
+  assert.deepEqual(parseAgentResponse({ result: expected }).value, expected);
+  assert.deepEqual(parseAgentResponse({ output: JSON.stringify(expected) }).value, expected);
+  assert.deepEqual(parseAgentResponse(expected).value, expected);
+
+  // still rejected exactly as before -- a JSON-array *string* is not an
+  // already-parsed array value, and still fails as not-recognizable JSON.
+  assert.equal(parseAgentResponse("[1,2,3]").ok, false);
+});
+
+test("describeResponseShape reports only safe structural metadata", () => {
+  assert.deepEqual(describeResponseShape({ action: "SKIP", extra: "x" }), {
+    raw_type: "object",
+    is_array: false,
+    top_level_keys: ["action", "extra"],
+  });
+
+  assert.deepEqual(describeResponseShape([{ action: "SKIP" }, { action: "SKIP" }]), {
+    raw_type: "array",
+    is_array: true,
+    top_level_keys: null,
+  });
+
+  assert.deepEqual(describeResponseShape("some raw text"), {
+    raw_type: "string",
+    is_array: false,
+    top_level_keys: null,
+  });
+
+  assert.deepEqual(describeResponseShape(null), {
+    raw_type: "null",
+    is_array: false,
+    top_level_keys: null,
+  });
+
+  // Never content -- only up to 10 key names, never values.
+  const wide = {};
+  for (let i = 0; i < 20; i += 1) wide[`key_${i}`] = "sensitive-looking-value-" + i;
+  const described = describeResponseShape(wide);
+  assert.equal(described.top_level_keys.length, 10);
+  for (const key of described.top_level_keys) {
+    assert.ok(!key.includes("sensitive"), "a value leaked into the key list");
+  }
+  assert.ok(!JSON.stringify(described).includes("sensitive-looking-value"));
 });
 
 test("invented URLs are rejected", () => {
@@ -327,6 +421,75 @@ test("end to end: agent SKIP is recorded without a draft", async () => {
     assert.equal(db._state.comments[0].status, "SKIPPED");
     assert.equal(db._state.replies[0].status, "SKIPPED");
     assert.equal(db._state.replies[0].error_message, "AI_ACTION_SKIP");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("end to end: an array-wrapped SKIP from Hermes is accepted (NEXT-05)", async () => {
+  const db = createFakeD1();
+  const ctx = createCtx();
+  const mock = installFetchMock(() =>
+    jsonResponse([{ type: "text", text: JSON.stringify({ action: "SKIP", mode: "DRY_RUN" }) }])
+  );
+
+  try {
+    await worker.fetch(await signedRequest(commentPayload()), createEnv({ DB: db }), ctx);
+    await ctx.settle();
+
+    assert.equal(db._state.comments[0].status, "SKIPPED");
+    assert.equal(db._state.replies[0].status, "SKIPPED");
+    assert.equal(db._state.replies[0].error_message, "AI_ACTION_SKIP");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("end to end: an array-wrapped REPLY from Hermes is accepted", async () => {
+  const db = createFakeD1({ products: PRODUCTS });
+  const ctx = createCtx();
+  const mock = installFetchMock(() =>
+    jsonResponse([
+      {
+        action: "REPLY",
+        reply_text: "ดูรายละเอียดได้ที่ https://shopee.co.th/product/111/222 ครับ",
+        matched_product_id: 1,
+        mode: "DRY_RUN",
+      },
+    ])
+  );
+
+  try {
+    await worker.fetch(
+      await signedRequest(commentPayload({ value: { message: "สนใจเครื่องดูดฝุ่นครับ" } })),
+      createEnv({ DB: db }),
+      ctx
+    );
+    await ctx.settle();
+
+    assert.equal(db._state.comments[0].status, "PROCESSED");
+    assert.equal(db._state.replies[0].status, "GENERATED");
+    assert.equal(db._state.replies[0].mode, "DRY_RUN");
+  } finally {
+    mock.restore();
+  }
+});
+
+test("end to end: a multi-element array from Hermes stays rejected (fail closed)", async () => {
+  const db = createFakeD1();
+  const ctx = createCtx();
+  const mock = installFetchMock(() =>
+    jsonResponse([{ action: "SKIP" }, { action: "SKIP" }])
+  );
+
+  try {
+    await worker.fetch(await signedRequest(commentPayload()), createEnv({ DB: db }), ctx);
+    await ctx.settle();
+
+    assert.equal(db._state.comments[0].status, "SKIPPED");
+    assert.equal(db._state.replies[0].status, "SKIPPED");
+    assert.equal(db._state.replies[0].response_text, SAFE_GENERIC_REPLY);
+    assert.equal(db._state.replies[0].error_message, "AI_RESPONSE_UNRECOGNIZED_SHAPE");
   } finally {
     mock.restore();
   }
