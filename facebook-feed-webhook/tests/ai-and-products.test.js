@@ -363,11 +363,16 @@ test("end to end: a mapping to an INACTIVE product never falls back to another p
   assert.equal(db._state.replies[0].affiliate_url, null);
 });
 
-test("end to end: no mapping falls back to the conservative keyword matcher", async () => {
+test("end to end: no mapping never falls back to a keyword-matched product (no link)", async () => {
+  // Previously the keyword matcher chose product 1 here; that could attach
+  // the wrong product's link to an unmapped post, so it no longer has authority.
   const db = createFakeD1({ products: PRODUCTS });
   await runComment(db, { action: "REPLY", reply_text: "ได้เลยครับ 👇 กดดูสินค้าได้ที่นี่ครับ", include_affiliate_cta: true }, { message: "เครื่องดูดฝุ่นไร้สายยังมีไหม ขอพิกัด" });
-  assert.equal(db._state.comments[0].product_source, "KEYWORD");
-  assert.equal(db._state.replies[0].affiliate_url, "https://shopee.co.th/product/111/222");
+  assert.equal(db._state.comments[0].product_source, "NONE");
+  assert.equal(db._state.comments[0].matched_product_id, null);
+  assert.equal(db._state.replies[0].affiliate_url, null);
+  assert.equal(db._state.replies[0].status, "SKIPPED");
+  assert.equal(db._state.replies[0].error_message, "CTA_WITHOUT_PRODUCT");
 });
 
 test("end to end: REPLY without CTA carries no link", async () => {

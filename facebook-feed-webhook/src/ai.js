@@ -139,17 +139,48 @@ export function parseAgentResponse(raw) {
   return { ok: false, reason: "AI_RESPONSE_NOT_JSON" };
 }
 
+/*
+ * Generic domain-SHAPE detector (not a TLD list: new TLDs appear constantly,
+ * and Facebook auto-links bare domains, so any list is a future bypass).
+ *
+ * A domain-shaped token is one or more labels, each followed by a dot, then
+ * a final label ("TLD") made only of LETTERS (any script, incl. Thai IDN
+ * such as ".ไทย") of length >= 2, or a punycode TLD ("xn--..."). Requiring
+ * an all-letter TLD is what keeps ordinary Thai text safe: "v1.2", "3.14",
+ * "รุ่น 2.0", "99.90 บาท" end in digits, and "A.I." / "e.g." end in a
+ * single letter, so none of them match. Dot look-alikes (U+3002, U+FF0E,
+ * U+FF61), which IDNA treats as dots, count as dots.
+ */
+const DOMAIN_LABEL = "[\\p{L}\\p{M}\\p{N}](?:[\\p{L}\\p{M}\\p{N}-]*[\\p{L}\\p{M}\\p{N}])?";
+const DOMAIN_DOT = "[.\\u3002\\uFF0E\\uFF61]";
+const DOMAIN_TLD = "(?:[\\p{L}\\p{M}]{2,63}|xn--[a-z0-9-]{1,59})";
+export const DOMAIN_SHAPE_PATTERN = new RegExp(
+  `(?<![\\p{L}\\p{M}\\p{N}-])(?:${DOMAIN_LABEL}${DOMAIN_DOT})+${DOMAIN_TLD}(?![\\p{L}\\p{M}\\p{N}-])`,
+  "iu"
+);
+
 /**
- * Anything that looks like a link, domain, e-mail or phone number. The AI
- * must never write one: the only link a reply may carry is appended later
- * by affiliate.js from the trusted database.
+ * Anything that looks like a link, domain, e-mail, IP, phone number or a
+ * link scheme. The AI must never write one: the only link a reply may carry
+ * is appended later by affiliate.js from the trusted database.
  */
 const LINK_LIKE_PATTERNS = [
   URL_PATTERN,
-  /\b[a-z0-9-]+(\.[a-z0-9-]+)*\.(com|net|org|co|th|ee|me|ly|io|app|shop|link|to|gl|page)\b/i,
+  DOMAIN_SHAPE_PATTERN,
+  /(^|[^\p{L}\p{N}])\/\/\S/u, // scheme-relative //host
+  /\b(?:javascript|vbscript|data|file|blob|about|intent|mailto|tel|sms|ftp)\s*:/i,
+  /\b\d{1,3}(?:\.\d{1,3}){3}\b/, // IPv4
   /[^\s@]+@[^\s@]+\.[^\s@]+/,
   /(\+?66|0)[\s-]?\d{1,2}[\s-]?\d{3}[\s-]?\d{4}/,
 ];
+
+/**
+ * Invisible format characters (zero-width space/joiner, bidi controls) are
+ * removed before link detection so "evil\u200B.xyz" cannot slip through.
+ */
+function linkProbeText(text) {
+  return String(text).replace(/\p{Cf}/gu, "");
+}
 
 /** Signs the model was steered into echoing its instructions or internals. */
 const LEAK_PATTERNS = [
@@ -199,9 +230,10 @@ export function validateAgentResponse(parsed, options = {}) {
   if (!text) return { ok: false, reason: "AI_RESPONSE_EMPTY_TEXT" };
   if (text.length > maxLength) return { ok: false, reason: "AI_RESPONSE_TOO_LONG" };
 
+  const probe = linkProbeText(text);
   for (const pattern of LINK_LIKE_PATTERNS) {
     pattern.lastIndex = 0;
-    if (pattern.test(text)) return { ok: false, reason: "AI_RESPONSE_INVENTED_URL" };
+    if (pattern.test(probe)) return { ok: false, reason: "AI_RESPONSE_INVENTED_URL" };
   }
 
   for (const pattern of FORBIDDEN_CLAIM_PATTERNS) {

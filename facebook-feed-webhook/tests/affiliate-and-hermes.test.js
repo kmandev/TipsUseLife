@@ -53,9 +53,9 @@ test("resolveProduct: mapping first, never falls back when the mapped product is
   assert.equal(resolveProduct({ mappedProduct: P(), activeProducts: [other], commentText: "หูฟัง", allowedHosts: HOSTS }).source, "MAPPING");
   const blocked = resolveProduct({ mappedProduct: P({ active: 0 }), activeProducts: [other], commentText: "หูฟัง หูฟัง", allowedHosts: HOSTS });
   assert.deepEqual(blocked, { product: null, source: "NONE" });
+  // No mapping -> no product, even when the comment names a catalog product.
   const kw = resolveProduct({ mappedProduct: null, activeProducts: [other], commentText: "หูฟังตัวนี้ดีไหม หูฟัง", allowedHosts: HOSTS });
-  assert.equal(kw.source, "KEYWORD");
-  assert.equal(kw.product.id, 8);
+  assert.deepEqual(kw, { product: null, source: "NONE" });
   assert.equal(resolveProduct({ mappedProduct: null, activeProducts: [], commentText: "สวย", allowedHosts: HOSTS }).source, "NONE");
 });
 

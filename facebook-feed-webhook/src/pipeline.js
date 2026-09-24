@@ -4,8 +4,8 @@
  * Ordering matters for safety:
  *   1. persist first (idempotently) -- a duplicate delivery never reaches
  *      the model twice, and nothing runs for an event we could not record;
- *   2. resolve the product from TRUSTED data only (Dashboard mapping for
- *      this post/reel, else the conservative keyword matcher);
+ *   2. resolve the product from TRUSTED data only: the Dashboard mapping
+ *      for this exact post/reel (no mapping -> no product, no link);
  *   3. ask Hermes synchronously (POST /v1/chat/completions);
  *   4. validate the AI output deterministically (ai.js);
  *   5. compose the final reply -- the AI's text plus, only if it asked for
@@ -31,7 +31,6 @@ import { resolveProduct, composeFinalReply, isUsableProduct, PRODUCT_SOURCES } f
 import { sendFacebookReply } from "./facebook-reply.js";
 import {
   insertCommentIfNew,
-  listActiveProducts,
   getMappedProduct,
   hasSentReply,
   authorRecentlyGotLink,
@@ -99,11 +98,8 @@ export async function processCommentEvent(event, { db, env, config }) {
   try {
     const mapped = await getMappedProduct(db, event.page_id, event.post_id);
     if (mapped) contentType = mapped.contentType;
-    const activeProducts = mapped ? [] : await listActiveProducts(db);
     ({ product, source: productSource } = resolveProduct({
       mappedProduct: mapped?.product ?? null,
-      activeProducts,
-      commentText: event.comment_text,
       allowedHosts: config.affiliateAllowedHosts,
     }));
   } catch {

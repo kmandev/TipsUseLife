@@ -8,20 +8,27 @@
  * Which product applies, and which URL is appended, is decided here from
  * trusted database rows:
  *
- *   1. Dashboard content mapping for the exact Facebook post/reel
- *      (source = MAPPING) -- the primary, authoritative path;
- *   2. otherwise the conservative keyword matcher over active products
- *      (source = KEYWORD);
- *   3. otherwise no product (source = NONE) -- the reply carries no link.
+ *   - Dashboard content mapping for the exact Facebook post/reel
+ *     (source = MAPPING) -- the ONLY way a product (and therefore an
+ *     affiliate URL) can be attached to a reply;
+ *   - otherwise no product (source = NONE) -- the reply carries no link.
+ *
+ * INVARIANT: every affiliate URL that can reach Facebook originates from an
+ * active, non-deleted product explicitly mapped to the current post/reel.
+ *
+ * The keyword matcher (products.js) is deliberately NOT consulted here: it
+ * only sees the comment and the catalog, never what the post is about, so
+ * on an unmapped post it could attach product B's link to a post about
+ * product A. It remains available as a pure helper, with no authority.
  *
  * A product is only usable when it is active, not soft-deleted, and its
  * affiliate URL passes validateAffiliateUrl(). Anything else fails closed.
  */
 
-import { matchProduct } from "./products.js";
-
 export const PRODUCT_SOURCES = Object.freeze({
   MAPPING: "MAPPING",
+  // Historical value only (rows written before keyword fallback was
+  // removed); resolveProduct() never returns it.
   KEYWORD: "KEYWORD",
   NONE: "NONE",
 });
@@ -78,27 +85,18 @@ export function affiliateUrlOf(product) {
 }
 
 /**
- * Resolve the product for a comment.
+ * Resolve the product for a comment: the post/reel's mapped product, and
+ * only if it is usable. No mapping, or an unusable mapped product, means
+ * no product -- never a fallback to another one.
  *
- * @param {{mappedProduct: any|null, activeProducts: any[], commentText: string, allowedHosts: string[]}} input
+ * @param {{mappedProduct: any|null, allowedHosts: string[]}} input
  * @returns {{product: any|null, source: string}}
  */
-export function resolveProduct({ mappedProduct, activeProducts, commentText, allowedHosts }) {
-  if (mappedProduct) {
-    // An explicit mapping is authoritative. If the mapped product is not
-    // usable we do NOT fall back to keyword matching -- the admin said
-    // "this post is about product X"; offering product Y instead would be
-    // exactly the "wrong product" failure we must never produce.
-    return isUsableProduct(mappedProduct, allowedHosts)
-      ? { product: mappedProduct, source: PRODUCT_SOURCES.MAPPING }
-      : { product: null, source: PRODUCT_SOURCES.NONE };
+export function resolveProduct({ mappedProduct, allowedHosts }) {
+  if (mappedProduct && isUsableProduct(mappedProduct, allowedHosts)) {
+    return { product: mappedProduct, source: PRODUCT_SOURCES.MAPPING };
   }
-
-  const usable = (activeProducts || []).filter((p) => isUsableProduct(p, allowedHosts));
-  const matched = matchProduct(commentText, usable);
-  return matched
-    ? { product: matched, source: PRODUCT_SOURCES.KEYWORD }
-    : { product: null, source: PRODUCT_SOURCES.NONE };
+  return { product: null, source: PRODUCT_SOURCES.NONE };
 }
 
 /**

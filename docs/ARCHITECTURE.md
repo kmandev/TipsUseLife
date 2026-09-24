@@ -19,7 +19,7 @@ Cloudflare Worker  facebook-feed-webhook.farkram.workers.dev
   │  1. verify X-Hub-Signature-256 (META_APP_SECRET), 401 otherwise
   │  2. drop non-comment / edit / Page-authored events
   │  3. INSERT comment ... ON CONFLICT DO NOTHING      (dedupe)
-  │  4. resolve product: content mapping → keyword → none   (trusted D1 data)
+  │  4. resolve product: content mapping for this post/reel → else none
   │  5. POST /v1/chat/completions  ── Bearer HERMES_API_KEY ──┐
   │                                                           ▼
   │        Cloudflare Tunnel  hermes-feed.cloudnext.icu → localhost:8644
@@ -76,10 +76,14 @@ URL scraped from post text would let any link in a caption become a
    comments but have no mapping yet, so ids never have to be looked up by
    hand. If the mapped product is inactive/deleted/invalid, the reply gets
    **no link** — it never falls back to another product.
-2. **Keyword fallback.** Unmapped posts use the existing conservative
-   matcher (`products.js`: name/keyword score, refuses ambiguity) over
-   active products.
-3. **None.** No link.
+2. **No mapping → no product, no link.** The AI may still answer in plain
+   text. The keyword matcher (`products.js`) is **not** used to pick a
+   product: it only sees the comment and the catalog, never what the post
+   is about, so it could attach product B's link to a post about product A.
+
+Invariant (tested in `tests/high-blockers.test.js`): every affiliate URL
+that can reach Facebook comes from an active, non-deleted product that is
+explicitly mapped to the current post/reel.
 
 The AI never chooses, sees or writes a URL. It only sets
 `include_affiliate_cta`. `affiliate.js` appends the URL from D1 after
@@ -103,7 +107,8 @@ Deterministic gate (`ai.js`, `affiliate.js`) — any failure ⇒ `SKIPPED`,
 nothing posted:
 
 - action ∉ {REPLY, SKIP}; missing/empty text; text > `MAX_REPLY_LENGTH` (300)
-- any URL, bare domain, e-mail or phone number in the AI text
+- any URL, domain-shaped token (any TLD or script, incl. IDN/punycode and
+  dot look-alikes), link scheme, IP, e-mail or phone number in the AI text
 - price / discount / promotion / free shipping / stock / warranty claims
 - prompt or secret leakage ("system prompt", "instructions", "api key", …)
 - CTA requested but no usable product (`CTA_WITHOUT_PRODUCT`)
@@ -170,7 +175,7 @@ comment metadata, `0003` affiliate catalog:
 - `content_mappings(facebook_page_id, facebook_post_id UNIQUE per page,
   facebook_content_type POST|REEL, product_id FK, active, note)`.
 - `comments` + `facebook_post_permalink`, `product_source`
-  (MAPPING|KEYWORD|NONE), `ai_action`.
+  (MAPPING|NONE; KEYWORD only on historical rows), `ai_action`.
 - `replies` + `affiliate_url`; one `SENT` per comment enforced by index.
 
 D1 has no row-level security. It is reachable only through the Worker's
