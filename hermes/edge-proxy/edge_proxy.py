@@ -14,8 +14,10 @@ an explicit allow-list only:
 
     POST /v1/chat/completions   -> Hermes api_server  127.0.0.1:8642
     GET  /health                -> Hermes api_server  127.0.0.1:8642/health
-    POST /webhooks/{route}      -> Hermes webhook     127.0.0.1:8645
-                                   (legacy path, kept for rollback only)
+
+The retired Hermes webhook route (/webhooks/*) is deliberately NOT
+forwarded: the Worker no longer uses it, and its agent runs with the
+webhook platform's default toolsets, so it must not be internet-reachable.
 
 Everything else is a 404 answered here, without touching Hermes.
 
@@ -31,22 +33,18 @@ dependency). Installed as the systemd user unit hermes-edge-proxy.service.
 import asyncio
 import logging
 import os
-import re
 
 from aiohttp import ClientSession, ClientTimeout, web
 
 LISTEN_HOSTS = [h for h in os.environ.get("EDGE_LISTEN_HOSTS", "127.0.0.1,::1").split(",") if h]
 LISTEN_PORT = int(os.environ.get("EDGE_LISTEN_PORT", "8644"))
 API_UPSTREAM = os.environ.get("EDGE_API_UPSTREAM", "http://127.0.0.1:8642")
-WEBHOOK_UPSTREAM = os.environ.get("EDGE_WEBHOOK_UPSTREAM", "http://127.0.0.1:8645")
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 UPSTREAM_TIMEOUT = ClientTimeout(total=float(os.environ.get("EDGE_TIMEOUT_SECONDS", "90")))
 
 CHAT_HEADERS = ("authorization", "content-type", "idempotency-key")
-WEBHOOK_HEADERS = ("content-type", "x-hub-signature-256", "x-request-id")
-ROUTE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 log = logging.getLogger("hermes-edge-proxy")
 
@@ -87,13 +85,6 @@ async def health(request):
     return await _forward(request, f"{API_UPSTREAM}/health", ())
 
 
-async def legacy_webhook(request):
-    route = request.match_info["route"]
-    if not ROUTE_NAME.match(route):
-        return _json_error(404, "not_found")
-    return await _forward(request, f"{WEBHOOK_UPSTREAM}/webhooks/{route}", WEBHOOK_HEADERS)
-
-
 async def not_found(request):
     return _json_error(404, "not_found")
 
@@ -110,7 +101,6 @@ def build_app():
     app = web.Application(client_max_size=MAX_REQUEST_BYTES)
     app.router.add_post("/v1/chat/completions", chat_completions)
     app.router.add_get("/health", health)
-    app.router.add_post("/webhooks/{route}", legacy_webhook)
     app.router.add_route("*", "/{tail:.*}", not_found)
     app.on_startup.append(_on_startup)
     app.on_cleanup.append(_on_cleanup)

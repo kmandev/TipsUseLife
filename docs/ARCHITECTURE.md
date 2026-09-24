@@ -47,9 +47,9 @@ completion callback. Its `api_server` platform awaits the agent and returns
 problem exists. Evidence: `gateway/platforms/webhook.py:974–986`,
 `gateway/platforms/api_server.py:5288, 5322, 5376, 5399` (Hermes v0.20.6).
 
-The legacy webhook route is still reachable through the edge proxy (moved to
-`127.0.0.1:8645`) solely so a code rollback keeps working. The Worker no
-longer uses it.
+The Hermes webhook platform still runs, but only on `127.0.0.1:8645`; the edge
+proxy does **not** forward `/webhooks/*`, so it is not internet-reachable (its
+agent runs with the webhook platform's default toolsets).
 
 ## Facebook Graph API findings (product / link data)
 
@@ -117,10 +117,10 @@ nothing posted:
   proxy to `127.0.0.1:8644` and `[::1]:8644`. Nothing listens on the LAN.
 - Tunnel ingress unchanged (both hostnames → `localhost:8644`). No router
   port, no public IP.
-- Edge proxy allow-list: `POST /v1/chat/completions`, `GET /health`,
-  `POST /webhooks/{route}` (HMAC-protected legacy). Everything else → 404
-  at the proxy (sessions, jobs, runs, browser control, uploads are not
-  reachable from the internet).
+- Edge proxy allow-list: `POST /v1/chat/completions` and `GET /health`
+  only. Everything else → 404 at the proxy (sessions, jobs, runs, browser
+  control, uploads and the retired `/webhooks/*` are not reachable from the
+  internet).
 - `API_SERVER_KEY` (64 hex chars) lives only in `~/.hermes/.env` (0600) and
   the Worker secret `HERMES_API_KEY`; Hermes refuses to start the API
   without a strong key and compares it in constant time.
@@ -129,6 +129,25 @@ nothing posted:
   comment cannot reach terminal, browser, file or memory tools.
 - `Idempotency-Key: fbc:<comment_id>` — Hermes returns the cached result for
   5 minutes instead of re-running the model.
+
+## Facebook reply (LIVE only)
+
+`POST https://graph.facebook.com/{GRAPH_API_VERSION}/{target}/comments`
+with form field `message` and `Authorization: Bearer <PAGE_ACCESS_TOKEN>`
+(never in the URL). `target` is the comment itself for a top-level comment,
+or its top-level parent for a nested reply (Facebook threads are one level
+deep). Requires a Page token of someone with the MODERATE task and the
+`pages_manage_engagement` permission. Gates, all mandatory: `REPLY_MODE ===
+"LIVE"` and token present (`config.js`), validated AI output, usable product
+if a link is attached, comment not previously `SENT`, and
+`sendFacebookReply()` re-checks the mode itself. Our own replies come back
+as Page-authored webhook events and are dropped (self-loop protection).
+
+Link-spam guard: if the same author already received the same affiliate URL
+on the same post in the last 24 h, the new reply is skipped
+(`DUPLICATE_LINK_SUPPRESSED`). Two comments from one author processed at the
+same instant can both pass this check; it is a spam limiter, not a hard
+constraint.
 
 ## Idempotency and failure behaviour
 

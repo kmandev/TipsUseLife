@@ -99,7 +99,7 @@ Settings → "REPLY_MODE (มีผลจริง)" must then read `LIVE`.
 | Stop replying immediately | set `"REPLY_MODE": "DRY_RUN"` and `npx wrangler deploy`, or `npx wrangler secret delete PAGE_ACCESS_TOKEN` (instant hard lock) |
 | Previous Worker version | `npx wrangler rollback` (or `wrangler deployments list` → `rollback <id>`) |
 | Hermes config | backups in `~/.hermes/backups/config.yaml.<ts>` / `.env.<ts>`; copy back, `systemctl --user restart hermes-gateway` |
-| Edge proxy | `systemctl --user disable --now hermes-edge-proxy`, then set webhook port back to 8644 and restart Hermes |
+| Edge proxy | `systemctl --user restart hermes-edge-proxy`; to remove it: `disable --now`, then restore `~/.hermes/backups/config.yaml.<ts>` and restart Hermes |
 | D1 | migrations are additive; older Worker versions ignore the new columns/table |
 
 ## Routine operations

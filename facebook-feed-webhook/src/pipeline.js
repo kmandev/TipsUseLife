@@ -23,6 +23,7 @@
  */
 
 import { MODE_DRY_RUN, MODE_LIVE } from "./config.js";
+import { replyTargetId } from "./facebook.js";
 import { requestAgentReply, HermesError } from "./hermes.js";
 import { SYSTEM_PROMPT, buildUserMessage } from "./agent-prompt.js";
 import { evaluateAgentResponse, describeResponseShape, ACTIONS } from "./ai.js";
@@ -260,7 +261,7 @@ export async function processCommentEvent(event, { db, env, config }) {
 
   try {
     const result = await sendFacebookReply(
-      { commentId: event.comment_id, message: final.text },
+      { commentId: replyTargetId(event), message: final.text },
       { mode: config.mode, accessToken: env.PAGE_ACCESS_TOKEN, graphApiVersion: config.graphApiVersion }
     );
 

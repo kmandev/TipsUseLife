@@ -132,3 +132,19 @@ function safePermalink(value) {
     return null;
   }
 }
+
+/**
+ * Which comment id a public reply should be posted under.
+ *
+ * Facebook threads are one level deep: a reply to a reply belongs to the
+ * top-level comment's thread. For a nested reply the webhook's `parent_id`
+ * is that top-level comment; for a top-level comment `parent_id` is the
+ * post itself. Replying to the top-level comment is valid in both cases.
+ *
+ * @param {NormalizedComment} event
+ */
+export function replyTargetId(event) {
+  const parent = event?.parent_id;
+  if (parent && parent !== event.post_id) return parent;
+  return event.comment_id;
+}

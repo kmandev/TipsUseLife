@@ -272,3 +272,26 @@ test("migration 0003 backfills affiliate_url from the legacy shopee_url", async 
   assert.equal(row.platform, "shopee");
   assert.equal(row.deleted_at, null);
 });
+
+test("LIVE: a reply to a nested comment is posted under its top-level comment", async () => {
+  const db = createFakeD1();
+  const ctx = createCtx();
+  const mock = installFetchMock((url) => (/graph\.facebook\.com/.test(url) ? jsonResponse({ id: "fb_r" }) : hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ" })));
+  try {
+    const payload = commentPayload({ value: { comment_id: "853313081388711_1500", parent_id: "853313081388711_1400", message: "จริงครับ" } });
+    await worker.fetch(await signedRequest(payload), createEnv({ DB: db, ...LIVE_ENV }), ctx);
+    await ctx.settle();
+  } finally {
+    mock.restore();
+  }
+  const graph = mock.graphCalls();
+  assert.equal(graph.length, 1);
+  assert.match(graph[0].url, /\/853313081388711_1400\/comments$/);
+});
+
+test("replyTargetId: top-level comments reply to themselves", async () => {
+  const { replyTargetId } = await import("../src/facebook.js");
+  assert.equal(replyTargetId({ comment_id: "p_2", post_id: "p_1", parent_id: "p_1" }), "p_2");
+  assert.equal(replyTargetId({ comment_id: "p_2", post_id: "p_1", parent_id: null }), "p_2");
+  assert.equal(replyTargetId({ comment_id: "p_3", post_id: "p_1", parent_id: "p_2" }), "p_2");
+});
