@@ -19,7 +19,7 @@ import {
   commentPayload,
   signedRequest,
   installFetchMock,
-  jsonResponse,
+  hermesChat,
 } from "./helpers.js";
 import { createAdminEnv } from "./admin-helpers.js";
 
@@ -79,7 +79,7 @@ test("33. the signed Facebook webhook POST still processes normally", async () =
   const db = createFakeD1();
   const ctx = createCtx();
   const mock = installFetchMock(() =>
-    jsonResponse({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
+    hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
   );
 
   try {
@@ -126,23 +126,31 @@ test("34. unsupported methods on non-admin paths still return 405", async () => 
   }
 });
 
-test("34b. unknown /admin-prefixed paths fall through to the old behaviour", async () => {
-  // Only the two exact admin paths are claimed; anything else keeps the
-  // behaviour it had before NEXT-02.
+test("34b. /admin/* now belongs to the Dashboard; lookalike paths still fall through", async () => {
+  // Unknown paths under /admin/ are answered by the admin router (JSON 404),
+  // never by the Meta verification handler.
   const getOther = await worker.fetch(
     new Request("https://worker.example/admin/unknown", { method: "GET" }),
     createEnv(),
     createCtx()
   );
-  assert.equal(getOther.status, 403, "falls through to Meta verification");
+  assert.equal(getOther.status, 404);
+  assert.equal((await getOther.json()).error.code, "NOT_FOUND");
 
-  const deleteOther = await worker.fetch(
+  const deleteShell = await worker.fetch(
     new Request("https://worker.example/admin", { method: "DELETE" }),
     createEnv(),
     createCtx()
   );
-  assert.equal(deleteOther.status, 405);
-  assert.equal(deleteOther.headers.get("Allow"), "GET, POST");
+  assert.equal(deleteShell.status, 405);
+
+  // "/administrator" is NOT an admin path: it keeps the webhook behaviour.
+  const lookalike = await worker.fetch(
+    new Request("https://worker.example/administrator", { method: "GET" }),
+    createEnv(),
+    createCtx()
+  );
+  assert.equal(lookalike.status, 403, "falls through to Meta verification");
 });
 
 test("34c. the admin routes do not require the webhook secrets, and vice versa", async () => {

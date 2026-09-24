@@ -1,5 +1,9 @@
 # Deployment Runbook — TipsUseLife Facebook Comment AI
 
+> Architecture: `docs/ARCHITECTURE.md`. Day-to-day operations, LIVE switch
+> and rollback: `docs/OPERATIONS.md`. Hermes contract:
+> `hermes/HERMES_API_CONTRACT.md`.
+
 All commands run **on the Raspberry Pi**, where the Cloudflare credentials
 live. The Mac is source + git only.
 
@@ -26,7 +30,7 @@ npm install
 npm test
 ```
 
-Expected: `pass 46`, `fail 0`.
+Expected: `fail 0` (the suite has 140+ tests; it runs against a real in-memory SQLite with every migration applied).
 
 ## 2. Inspect the remote D1 **before** touching it
 
@@ -79,6 +83,15 @@ write an additive `0003` migration instead.
 > COLUMN` statements and two `CREATE INDEX IF NOT EXISTS`. It contains no
 > `DROP` and rewrites no data.
 
+### Migration 0003 (affiliate catalog)
+
+`0003_affiliate_catalog.sql` is additive: new `products` columns
+(`affiliate_url`, `platform`, `image_url`, `deleted_at`, with
+`affiliate_url` back-filled from `shopee_url`), the `content_mappings`
+table, audit columns on `comments`/`replies`, and a partial unique index
+allowing at most one `SENT` reply per comment. Apply it with
+`migrations apply` like the others.
+
 ### Verify the schema afterwards
 
 ```bash
@@ -93,11 +106,13 @@ npx wrangler d1 execute tipsuselife-ai --remote \
 ```bash
 npx wrangler secret put META_APP_SECRET
 npx wrangler secret put META_VERIFY_TOKEN
-npx wrangler secret put HERMES_SECRET
+npx wrangler secret put ADMIN_PASSWORD
+npx wrangler secret put ADMIN_SESSION_SECRET
+grep '^API_SERVER_KEY=' ~/.hermes/.env | cut -d= -f2- | tr -d '\n' | npx wrangler secret put HERMES_API_KEY
 ```
 
 `META_VERIFY_TOKEN` must match what the Meta app dashboard has.
-`HERMES_SECRET` must match the Hermes gateway's — **do not rotate it.**
+`HERMES_API_KEY` must equal Hermes' `API_SERVER_KEY` (piped, never typed).
 
 Do **not** set `PAGE_ACCESS_TOKEN`. It is not needed for DRY_RUN, and its
 absence is a second lock on live replies.
@@ -147,18 +162,20 @@ Tail the logs in a second terminal for the end-to-end test:
 npx wrangler tail --format pretty
 ```
 
-## 7. Update the Hermes agent
+## 7. Hermes (Raspberry Pi)
 
-Apply `hermes/AGENT_PROMPT.md` to the `facebook-comments` agent and
-reload the gateway on port 8644. See `hermes/WEBHOOK_CONTRACT.md` for
-what the request body now looks like.
+The prompt ships with the Worker (`src/agent-prompt.js`); nothing is pasted
+into Hermes. Hermes must run `api_server` on `127.0.0.1:8642` behind
+`hermes-edge-proxy` on `127.0.0.1:8644` with `platform_toolsets.api_server: []`
+— see `docs/OPERATIONS.md` → "Raspberry Pi services".
 
 ## 8. Real end-to-end DRY-RUN test
 
 1. Post a comment on a TipsUseLife post **from a personal account**, not
    as the Page (a Page-authored comment is dropped by design).
    Suggested text: `สนใจครับ`
-2. Watch `wrangler tail` for `comment_received` then `reply_drafted`.
+2. Watch `wrangler tail` for `comment_received`, `product_resolved`, then
+   `reply_drafted` (or `ai_action_skip` if the AI chose SKIP).
 3. Check the database:
 
 ```bash
@@ -173,9 +190,10 @@ npx wrangler d1 execute tipsuselife-ai --remote --command \
 
 | Check | Expected |
 |---|---|
-| `comments.status` | `PROCESSED` (or `SKIPPED` if the agent's draft was rejected) |
+| `comments.status` | `PROCESSED` (`SKIPPED` if the AI chose SKIP or the draft was rejected) |
 | `replies.mode` | `DRY_RUN` |
-| `replies.status` | `GENERATED` |
+| `replies.status` | `GENERATED` (`SKIPPED` with a reason in the SKIP case) |
+| `replies.affiliate_url` | the mapped product's URL when the AI asked for a CTA, else `NULL` |
 | `replies.facebook_reply_id` | `NULL` |
 | The Facebook post | **no automated reply appears** |
 
@@ -190,13 +208,9 @@ investigate — that would mean a guard was bypassed.
 
 ---
 
-## Enabling LIVE mode later (not part of this task)
+## Enabling LIVE mode
 
-Requires all of:
-
-1. `npx wrangler secret put PAGE_ACCESS_TOKEN`
-2. `REPLY_MODE` changed to exactly `LIVE` in `wrangler.jsonc`
-3. Redeploy
-4. Meta app permissions reviewed for `pages_manage_engagement`
-
-Any one of these missing keeps the system in DRY_RUN.
+See `docs/OPERATIONS.md` → "Switching DRY_RUN → LIVE". It requires, all
+together: `PAGE_ACCESS_TOKEN` secret, `REPLY_MODE` exactly `LIVE` in
+`wrangler.jsonc`, a redeploy, and Meta approval of
+`pages_manage_engagement`. Any one missing keeps the system in DRY_RUN.

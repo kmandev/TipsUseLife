@@ -6,14 +6,15 @@ import { hmacSha256Hex } from "../src/crypto.js";
 import {
   TEST_PAGE_ID,
   TEST_VERIFY_TOKEN,
-  TEST_HERMES_SECRET,
+  TEST_HERMES_API_KEY,
+  TEST_META_SECRET,
   createFakeD1,
   createEnv,
   createCtx,
   commentPayload,
   signedRequest,
   installFetchMock,
-  jsonResponse,
+  hermesChat,
 } from "./helpers.js";
 
 function getRequest(params) {
@@ -93,7 +94,7 @@ test("valid Meta signature is accepted", async () => {
   const db = createFakeD1();
   const ctx = createCtx();
   const mock = installFetchMock(() =>
-    jsonResponse({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
+    hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
   );
 
   try {
@@ -185,7 +186,7 @@ test("valid comment event is persisted and drafted in DRY_RUN", async () => {
   const db = createFakeD1();
   const ctx = createCtx();
   const mock = installFetchMock(() =>
-    jsonResponse({
+    hermesChat({
       action: "REPLY",
       reply_text: "ขอบคุณที่สนใจครับ 😊 เดี๋ยวทางเพจแนะนำรายละเอียดให้ครับ",
       matched_product_id: null,
@@ -217,14 +218,14 @@ test("valid comment event is persisted and drafted in DRY_RUN", async () => {
   }
 });
 
-test("the payload forwarded to Hermes is normalized and correctly signed", async () => {
+test("the Hermes request is an authenticated, synchronous chat completion carrying only needed data", async () => {
   const db = createFakeD1();
   const ctx = createCtx();
   let seen = null;
 
   const mock = installFetchMock((url, init) => {
     seen = { url, init };
-    return jsonResponse({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" });
+    return hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ" });
   });
 
   try {
@@ -232,34 +233,33 @@ test("the payload forwarded to Hermes is normalized and correctly signed", async
     await ctx.settle();
 
     assert.ok(seen, "Hermes was called");
+    assert.equal(seen.url, "https://hermes-feed.example.invalid/v1/chat/completions");
+    assert.equal(seen.init.method, "POST");
+    assert.equal(seen.init.headers.authorization, `Bearer ${TEST_HERMES_API_KEY}`);
+    assert.equal(seen.init.headers["idempotency-key"], "fbc:853313081388711_1001");
+
     const body = JSON.parse(seen.init.body);
+    assert.equal(body.stream, false);
+    assert.equal(body.messages.length, 2);
+    assert.equal(body.messages[0].role, "system");
+    assert.equal(body.messages[1].role, "user");
 
-    assert.deepEqual(Object.keys(body).sort(), [
-      "author_id",
+    const data = JSON.parse(body.messages[1].content);
+    assert.deepEqual(Object.keys(data).sort(), [
+      "affiliate_link_available",
       "author_name",
-      "comment_id",
       "comment_text",
-      "created_time",
-      "event",
-      "mode",
-      "page_id",
-      "parent_id",
-      "post_id",
+      "content_type",
       "product",
-      "source",
     ]);
-    assert.equal(body.source, "facebook");
-    assert.equal(body.event, "page_comment");
-    assert.equal(body.mode, "DRY_RUN");
-    assert.equal(body.product, null);
+    assert.equal(data.comment_text, "สนใจครับ");
+    assert.equal(data.product, null);
 
-    // No Meta envelope, no secrets leaked into the forwarded body.
+    // Minimal data: no author id, no Meta envelope, no secrets in the body.
+    assert.ok(!seen.init.body.includes("7777777777"), "author_id must not be sent");
+    assert.ok(!seen.init.body.includes(TEST_HERMES_API_KEY));
+    assert.ok(!seen.init.body.includes(TEST_META_SECRET));
     assert.equal(body.entry, undefined);
-    assert.equal(body.object, undefined);
-    assert.ok(!seen.init.body.includes(TEST_HERMES_SECRET));
-
-    const expected = "sha256=" + (await hmacSha256Hex(TEST_HERMES_SECRET, seen.init.body));
-    assert.equal(seen.init.headers["x-hub-signature-256"], expected);
   } finally {
     mock.restore();
   }
@@ -269,7 +269,7 @@ test("the payload forwarded to Hermes is normalized and correctly signed", async
 test("duplicate comment delivery is deduplicated and never re-invokes the agent", async () => {
   const db = createFakeD1();
   const mock = installFetchMock(() =>
-    jsonResponse({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
+    hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
   );
 
   try {

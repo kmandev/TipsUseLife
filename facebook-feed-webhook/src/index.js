@@ -1,8 +1,10 @@
 /**
  * TipsUseLife -- Facebook Page comment webhook (Cloudflare Worker).
  *
- * Meta Webhook -> this Worker -> D1 -> Hermes gateway -> Hermes agent ->
- * Gemini -> validated Thai draft -> D1 (DRY_RUN).
+ * Meta Webhook -> this Worker -> D1 -> (Cloudflare Tunnel) -> Hermes
+ * api_server POST /v1/chat/completions (synchronous) -> validated Thai
+ * reply + trusted affiliate link -> D1 -> Facebook Graph reply (LIVE only).
+ * The Dashboard (/admin) is served by the same Worker.
  *
  * The Worker acknowledges Meta as soon as the event is verified and
  * durably recorded; the model round-trip runs in ctx.waitUntil() so a

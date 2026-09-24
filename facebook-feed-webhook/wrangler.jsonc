@@ -5,18 +5,21 @@
   "compatibility_date": "2026-09-10",
 
   // Non-sensitive configuration only. Secrets (META_APP_SECRET,
-  // META_VERIFY_TOKEN, HERMES_SECRET, PAGE_ACCESS_TOKEN) are set with
+  // META_VERIFY_TOKEN, HERMES_API_KEY, ADMIN_PASSWORD, ADMIN_SESSION_SECRET,
+  // and -- only for LIVE -- PAGE_ACCESS_TOKEN) are set with
   // `wrangler secret put` and are never committed here.
+  // Optional var: AFFILIATE_ALLOWED_HOSTS (comma separated) overrides the
+  // default affiliate link host allow-list in src/config.js.
   "vars": {
     // SAFETY: DRY_RUN means no Facebook reply mutation is ever performed.
     // Only the exact string "LIVE" enables live replies, and LIVE also
     // requires a PAGE_ACCESS_TOKEN secret to be present.
     "REPLY_MODE": "DRY_RUN",
     "PAGE_ID": "853313081388711",
-    "HERMES_URL": "https://hermes-feed.cloudnext.icu/webhooks/facebook-comments",
+    "HERMES_URL": "https://hermes-feed.cloudnext.icu/v1/chat/completions",
     "HERMES_TIMEOUT_MS": "25000",
     "GRAPH_API_VERSION": "v21.0",
-    "MAX_REPLY_LENGTH": "600"
+    "MAX_REPLY_LENGTH": "300"
   },
 
   "d1_databases": [

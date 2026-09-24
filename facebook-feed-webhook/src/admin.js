@@ -1,16 +1,21 @@
 /**
- * NEXT-02 -- Admin read API.
+ * Admin surface: Dashboard shell, session, and JSON APIs.
  *
- * Two routes only:
- *   POST /admin/login     -> issues a signed, HttpOnly session cookie
- *   GET  /admin/comments  -> paginated, page-scoped comment list from D1
+ *   GET  /admin, /admin/          -> Dashboard single-page app (static)
+ *   GET  /admin/app.js, app.css   -> Dashboard assets (static)
+ *   POST /admin/login             -> issues a signed, HttpOnly session cookie
+ *   POST /admin/logout            -> clears it
+ *   GET  /admin/session           -> {authenticated}
+ *   GET  /admin/comments          -> paginated, page-scoped comment activity
+ *   *    /admin/api/...           -> products / content mappings / overview
+ *                                    (see admin-api.js)
  *
  * SCOPE / SAFETY
  * --------------
- * This module is read-only with respect to the business domain: it never
- * writes to D1, never touches Facebook, Hermes or Meta, and cannot change
- * REPLY_MODE. It sits entirely beside the webhook pipeline, which is
- * untouched.
+ * Never touches Facebook, Hermes or Meta, and cannot change REPLY_MODE.
+ * Every data route authenticates BEFORE touching D1. State-changing
+ * requests additionally require a same-origin `Origin` header and a JSON
+ * body (CSRF defence on top of the SameSite=Strict cookie).
  *
  * Secrets (ADMIN_PASSWORD, ADMIN_SESSION_SECRET) are read from env only.
  * They are never logged, never returned, never sent to the browser and
@@ -22,6 +27,8 @@ import { hmacSha256Hex, timingSafeEqual } from "./crypto.js";
 import { resolveConfig } from "./config.js";
 import { listComments } from "./db.js";
 import { logEvent, logError } from "./log.js";
+import { handleAdminApi } from "./admin-api.js";
+import { DASHBOARD_HTML, DASHBOARD_JS, DASHBOARD_CSS, DASHBOARD_CSP } from "./dashboard.js";
 
 const SESSION_COOKIE = "admin_session";
 const SESSION_TTL_SECONDS = 86400; // 24 hours
@@ -31,7 +38,10 @@ const MIN_LIMIT = 1;
 const MAX_LIMIT = 100;
 
 export const ADMIN_LOGIN_PATH = "/admin/login";
+export const ADMIN_LOGOUT_PATH = "/admin/logout";
+export const ADMIN_SESSION_PATH = "/admin/session";
 export const ADMIN_COMMENTS_PATH = "/admin/comments";
+export const ADMIN_API_PREFIX = "/admin/api/";
 
 /**
  * Exactly the comment statuses the schema allows
@@ -250,12 +260,19 @@ function mapRow(row) {
     matched_product: hasProduct
       ? { id: Number(row.product_id), name: row.product_name ?? null }
       : null,
+    product_source: row.product_source ?? null,
+    ai_action: row.ai_action ?? null,
+    facebook_post_id: row.facebook_post_id ?? null,
     ai_response: row.ai_response ?? null,
     reply: hasReply
       ? {
           mode: row.reply_mode,
           status: row.reply_status ?? null,
           facebook_reply_id: row.reply_facebook_reply_id ?? null,
+          response_text: row.reply_text ?? null,
+          // A fixed, secret-free category (e.g. AI_ACTION_SKIP), never
+          // exception text.
+          reason: row.reply_reason ?? null,
         }
       : null,
     created_at: row.created_at ?? null,
@@ -387,21 +404,89 @@ async function handleComments(request, url, env) {
  * Router
  * ------------------------------------------------------------------ */
 
-/** Exactly two paths are claimed; everything else falls through untouched. */
+/** Claims "/admin" and everything under "/admin/"; nothing else. */
 export function isAdminPath(pathname) {
-  return pathname === ADMIN_LOGIN_PATH || pathname === ADMIN_COMMENTS_PATH;
+  return pathname === "/admin" || pathname.startsWith("/admin/");
+}
+
+function staticAsset(body, contentType, extra = {}) {
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": contentType,
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      ...extra,
+    },
+  });
+}
+
+async function isAuthenticated(request, env) {
+  return verifySession(env?.ADMIN_SESSION_SECRET, readSessionCookie(request));
+}
+
+/** Same-origin + JSON requirement for every state-changing request. */
+function passesCsrfCheck(request, url) {
+  const origin = request.headers.get("origin");
+  if (!origin || origin !== url.origin) return false;
+  const type = request.headers.get("content-type") || "";
+  if (request.method !== "DELETE" && !type.toLowerCase().startsWith("application/json")) return false;
+  return true;
 }
 
 export async function handleAdminRequest(request, url, env) {
   try {
-    if (url.pathname === ADMIN_LOGIN_PATH) {
+    const path = url.pathname;
+
+    if (path === "/admin" || path === "/admin/") {
+      if (request.method !== "GET") return methodNotAllowed("GET");
+      return staticAsset(DASHBOARD_HTML, "text/html; charset=utf-8", {
+        "content-security-policy": DASHBOARD_CSP,
+        "x-frame-options": "DENY",
+      });
+    }
+    if (path === "/admin/app.js") {
+      if (request.method !== "GET") return methodNotAllowed("GET");
+      return staticAsset(DASHBOARD_JS, "text/javascript; charset=utf-8");
+    }
+    if (path === "/admin/app.css") {
+      if (request.method !== "GET") return methodNotAllowed("GET");
+      return staticAsset(DASHBOARD_CSS, "text/css; charset=utf-8");
+    }
+
+    if (path === ADMIN_LOGIN_PATH) {
       if (request.method !== "POST") return methodNotAllowed("POST");
       return await handleLogin(request, env);
     }
 
-    if (url.pathname === ADMIN_COMMENTS_PATH) {
+    if (path === ADMIN_LOGOUT_PATH) {
+      if (request.method !== "POST") return methodNotAllowed("POST");
+      return apiJson({ ok: true }, 200, {
+        "set-cookie": `${SESSION_COOKIE}=; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=0`,
+      });
+    }
+
+    if (path === ADMIN_SESSION_PATH) {
+      if (request.method !== "GET") return methodNotAllowed("GET");
+      return apiJson({ authenticated: await isAuthenticated(request, env) });
+    }
+
+    if (path === ADMIN_COMMENTS_PATH) {
       if (request.method !== "GET") return methodNotAllowed("GET");
       return await handleComments(request, url, env);
+    }
+
+    if (path.startsWith(ADMIN_API_PREFIX)) {
+      if (!(await isAuthenticated(request, env))) {
+        logError("admin_request_rejected", "UNAUTHENTICATED", { path });
+        return unauthenticated("Authentication required");
+      }
+      if (request.method !== "GET" && !passesCsrfCheck(request, url)) {
+        logError("admin_request_rejected", "CSRF_CHECK_FAILED", { path });
+        return apiError(403, "FORBIDDEN", "Cross-site request rejected");
+      }
+      return await handleAdminApi(request, url, env, path.slice("/admin/api".length));
     }
 
     return apiError(404, "NOT_FOUND", "Not found");

@@ -3,121 +3,58 @@
  */
 
 import { hmacSha256Hex } from "../src/crypto.js";
+import { createSqliteD1 } from "./sqlite-d1.js";
 
 export const TEST_PAGE_ID = "853313081388711";
 export const TEST_META_SECRET = "unit-test-meta-app-secret";
 export const TEST_VERIFY_TOKEN = "unit-test-verify-token";
-export const TEST_HERMES_SECRET = "unit-test-hermes-secret";
+export const TEST_HERMES_API_KEY = "unit-test-hermes-api-key-0123456789";
 
-/** Minimal in-memory D1 stand-in with the real UNIQUE / ON CONFLICT semantics. */
-export function createFakeD1({ products = [], failInsert = false } = {}) {
-  const state = {
-    comments: [],
-    replies: [],
-    products,
-    nextCommentId: 1,
-    statements: [],
-  };
-
-  function prepare(sql) {
-    state.statements.push(sql);
-    return {
-      bind(...args) {
-        return {
-          async first() {
-            if (/INSERT INTO comments/i.test(sql)) {
-              if (failInsert) throw new Error("d1 down");
-              const [
-                facebook_comment_id,
-                facebook_post_id,
-                facebook_parent_id,
-                page_id,
-                author_id,
-                author_name,
-                comment_text,
-                facebook_created_time,
-              ] = args;
-
-              // UNIQUE(facebook_comment_id) + ON CONFLICT DO NOTHING
-              if (state.comments.some((c) => c.facebook_comment_id === facebook_comment_id)) {
-                return null;
-              }
-
-              const row = {
-                id: state.nextCommentId++,
-                facebook_comment_id,
-                facebook_post_id,
-                facebook_parent_id,
-                page_id,
-                author_id,
-                author_name,
-                comment_text,
-                facebook_created_time,
-                matched_product_id: null,
-                ai_response: null,
-                status: "RECEIVED",
-              };
-              state.comments.push(row);
-              return { id: row.id };
-            }
-            throw new Error("unexpected first(): " + sql);
-          },
-
-          async all() {
-            if (/FROM products/i.test(sql)) {
-              return { results: state.products.filter((p) => Number(p.active) === 1) };
-            }
-            throw new Error("unexpected all(): " + sql);
-          },
-
-          async run() {
-            if (/UPDATE comments\s+SET status = \?,\s+ai_response/i.test(sql)) {
-              const [status, aiResponse, matchedProductId, id] = args;
-              const row = state.comments.find((c) => c.id === id);
-              if (row) {
-                row.status = status;
-                row.ai_response = aiResponse;
-                row.matched_product_id = matchedProductId;
-              }
-              return { success: true };
-            }
-            if (/UPDATE comments/i.test(sql)) {
-              const [status, id] = args;
-              const row = state.comments.find((c) => c.id === id);
-              if (row) row.status = status;
-              return { success: true };
-            }
-            if (/INSERT INTO replies/i.test(sql)) {
-              const [comment_id, response_text, mode, facebook_reply_id, status, error_message] = args;
-              state.replies.push({
-                id: state.replies.length + 1,
-                comment_id,
-                response_text,
-                mode,
-                facebook_reply_id,
-                status,
-                error_message,
-              });
-              return { success: true };
-            }
-            throw new Error("unexpected run(): " + sql);
-          },
-        };
-      },
-    };
+/**
+ * D1 test double: a real in-memory SQLite database with all migrations
+ * applied (see sqlite-d1.js). `products` rows are inserted as given;
+ * `mappings` are content_mappings rows; `failInsert` makes the comment
+ * INSERT fail like a D1 outage.
+ */
+export function createFakeD1({ products = [], mappings = [], failInsert = false, failOn = null } = {}) {
+  const db = createSqliteD1({ failOn: failInsert ? /INSERT INTO comments/i : failOn });
+  for (const p of products) {
+    db._sqlite
+      .prepare(
+        `INSERT INTO products (id, name, description, keywords, shopee_url, affiliate_url, platform, active, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        p.id,
+        p.name,
+        p.description ?? null,
+        p.keywords ?? "",
+        p.shopee_url ?? null,
+        p.affiliate_url ?? p.shopee_url ?? null,
+        p.platform ?? "shopee",
+        p.active ?? 1,
+        p.deleted_at ?? null
+      );
   }
-
-  return { prepare, _state: state };
+  for (const m of mappings) {
+    db._sqlite
+      .prepare(
+        `INSERT INTO content_mappings (facebook_page_id, facebook_post_id, facebook_content_type, product_id, active)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(m.facebook_page_id ?? TEST_PAGE_ID, m.facebook_post_id, m.facebook_content_type ?? "POST", m.product_id, m.active ?? 1);
+  }
+  return db;
 }
 
 export function createEnv(overrides = {}) {
   return {
     META_APP_SECRET: TEST_META_SECRET,
     META_VERIFY_TOKEN: TEST_VERIFY_TOKEN,
-    HERMES_SECRET: TEST_HERMES_SECRET,
+    HERMES_API_KEY: TEST_HERMES_API_KEY,
     REPLY_MODE: "DRY_RUN",
     PAGE_ID: TEST_PAGE_ID,
-    HERMES_URL: "https://hermes-feed.example.invalid/webhooks/facebook-comments",
+    HERMES_URL: "https://hermes-feed.example.invalid/v1/chat/completions",
     ...overrides,
   };
 }
@@ -192,6 +129,23 @@ export function installFetchMock(handler) {
       globalThis.fetch = original;
     },
   };
+}
+
+/**
+ * A Hermes /v1/chat/completions success body whose assistant content is
+ * `content` (an object is JSON-encoded, a string is used verbatim).
+ */
+export function hermesChat(content, status = 200) {
+  const text = typeof content === "string" ? content : JSON.stringify(content);
+  return jsonResponse(
+    {
+      id: "chatcmpl-test",
+      object: "chat.completion",
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+    status
+  );
 }
 
 export function jsonResponse(data, status = 200) {

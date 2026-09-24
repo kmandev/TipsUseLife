@@ -6,10 +6,11 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --test \"tests/*.test.js\"",
-    "check": "node --check src/index.js && node --check src/pipeline.js",
+    "test": "node --no-warnings --test \"tests/*.test.js\"",
+    "check": "node --check src/index.js && node --check src/pipeline.js && node --check src/admin.js && node --check src/admin-api.js && node --check src/dashboard.js && node --check dashboard/app.js",
     "d1:inspect": "wrangler d1 execute tipsuselife-ai --remote --command \"SELECT name, type FROM sqlite_master ORDER BY type, name;\"",
-    "d1:migrate": "wrangler d1 migrations apply tipsuselife-ai --remote"
+    "d1:migrate": "wrangler d1 migrations apply tipsuselife-ai --remote",
+    "build:dashboard": "node scripts/build-dashboard.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.131.1"

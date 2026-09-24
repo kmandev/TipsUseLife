@@ -19,6 +19,7 @@ const ACTIONABLE_VERB = "add";
  * @property {string|null} author_name
  * @property {string} comment_text
  * @property {string|null} created_time
+ * @property {string|null} post_permalink  value.post.permalink_url when Meta sends it
  */
 
 function str(value) {
@@ -87,6 +88,7 @@ export function extractCommentEvents(payload) {
         author_name: str(value.from?.name),
         comment_text: commentText,
         created_time: isoTime(value.created_time),
+        post_permalink: safePermalink(value.post?.permalink_url),
       });
     }
   }
@@ -114,34 +116,19 @@ export function isSelfEvent(event, pageId) {
 }
 
 /**
- * Build the normalized payload forwarded to Hermes. Deliberately a
- * *subset* of the Meta payload: no signatures, no tokens, no raw envelope.
- *
- * @param {NormalizedComment} event
- * @param {{mode: string, matchedProduct: any}} context
+ * Keep a Facebook permalink only if it really is one. It is display-only
+ * (Dashboard "open post" link) and never sent to the AI or appended to a
+ * reply, but it still comes from the network, so it is checked.
  */
-export function buildHermesPayload(event, { mode, matchedProduct }) {
-  return {
-    source: "facebook",
-    event: "page_comment",
-    page_id: event.page_id,
-    comment_id: event.comment_id,
-    post_id: event.post_id,
-    parent_id: event.parent_id,
-    author_id: event.author_id,
-    author_name: event.author_name,
-    comment_text: event.comment_text,
-    created_time: event.created_time,
-    mode,
-    // Trusted product context. If this is null the agent MUST NOT invent
-    // any product fact (price, stock, link, shipping, warranty, specs).
-    product: matchedProduct
-      ? {
-          id: matchedProduct.id,
-          name: matchedProduct.name,
-          description: matchedProduct.description ?? null,
-          shopee_url: matchedProduct.shopee_url ?? null,
-        }
-      : null,
-  };
+function safePermalink(value) {
+  const s = str(value);
+  if (!s || s.length > 500) return null;
+  try {
+    const url = new URL(s);
+    if (url.protocol !== "https:") return null;
+    const host = url.hostname.toLowerCase();
+    return host === "facebook.com" || host.endsWith(".facebook.com") ? s : null;
+  } catch {
+    return null;
+  }
 }

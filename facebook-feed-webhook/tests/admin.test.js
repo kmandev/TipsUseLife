@@ -543,7 +543,8 @@ test("27. only the latest reply is returned, and the comment is not duplicated",
 
   const body = await response.json();
   assert.equal(body.data.length, 1, "three replies must not fan out into three rows");
-  assert.deepEqual(body.data[0].reply, {
+  const { mode, status, facebook_reply_id } = body.data[0].reply;
+  assert.deepEqual({ mode, status, facebook_reply_id }, {
     mode: "LIVE",
     status: "SENT",
     facebook_reply_id: "fb-reply-9",
@@ -651,22 +652,33 @@ test("30. the response never exposes author_id or internal reply fields", async 
   const raw = await response.text();
   assert.ok(!raw.includes("author-secret-id"), "author_id leaked");
   assert.ok(!raw.includes("author_id"), "author_id key present");
-  assert.ok(!raw.includes("HERMES_TIMEOUT"), "internal error_message leaked");
+  // The raw column name never appears; the outcome category is exposed
+  // deliberately as reply.reason (a fixed, secret-free code).
   assert.ok(!raw.includes("error_message"), "error_message key present");
   assert.ok(!raw.includes("page_id"), "page_id key present");
 
   const row = JSON.parse(raw).data[0];
   assert.deepEqual(Object.keys(row).sort(), [
+    "ai_action",
     "ai_response",
     "author_name",
     "comment_text",
     "created_at",
     "facebook_comment_id",
+    "facebook_post_id",
     "id",
     "matched_product",
+    "product_source",
     "reply",
     "status",
     "updated_at",
+  ]);
+  assert.deepEqual(Object.keys(row.reply).sort(), [
+    "facebook_reply_id",
+    "mode",
+    "reason",
+    "response_text",
+    "status",
   ]);
 });
 

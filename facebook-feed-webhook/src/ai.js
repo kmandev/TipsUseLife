@@ -140,14 +140,40 @@ export function parseAgentResponse(raw) {
 }
 
 /**
+ * Anything that looks like a link, domain, e-mail or phone number. The AI
+ * must never write one: the only link a reply may carry is appended later
+ * by affiliate.js from the trusted database.
+ */
+const LINK_LIKE_PATTERNS = [
+  URL_PATTERN,
+  /\b[a-z0-9-]+(\.[a-z0-9-]+)*\.(com|net|org|co|th|ee|me|ly|io|app|shop|link|to|gl|page)\b/i,
+  /[^\s@]+@[^\s@]+\.[^\s@]+/,
+  /(\+?66|0)[\s-]?\d{1,2}[\s-]?\d{3}[\s-]?\d{4}/,
+];
+
+/** Signs the model was steered into echoing its instructions or internals. */
+const LEAK_PATTERNS = [
+  /system\s*prompt/i,
+  /\binstructions?\b/i,
+  /คำสั่งระบบ|พรอมต์|พร้อมต์|prompt/i,
+  /api[\s_-]?key|secret|token|password|รหัสผ่าน/i,
+  /\bjson\b/i,
+];
+
+/**
  * Deterministic validation of a parsed agent response.
  *
+ * Contract (see agent-prompt.js):
+ *   {"action":"REPLY","reply_text":"...","include_affiliate_cta":bool}
+ *   {"action":"SKIP","reason":"..."}
+ *
  * @param {any} parsed
- * @param {{maxLength?: number, trustedProduct?: any}} options
- * @returns {{ok: true, action: string, text: string} | {ok: false, reason: string}}
+ * @param {{maxLength?: number}} options
+ * @returns {{ok: true, action: string, text: string, includeCta: boolean, skipReason?: string}
+ *          | {ok: false, reason: string}}
  */
 export function validateAgentResponse(parsed, options = {}) {
-  const { maxLength = 600, trustedProduct = null } = options;
+  const { maxLength = 300 } = options;
 
   if (!parsed || typeof parsed !== "object") {
     return { ok: false, reason: "AI_RESPONSE_NOT_OBJECT" };
@@ -159,7 +185,8 @@ export function validateAgentResponse(parsed, options = {}) {
   }
 
   if (action === ACTIONS.SKIP) {
-    return { ok: true, action: ACTIONS.SKIP, text: "" };
+    const reason = typeof parsed.reason === "string" ? parsed.reason.slice(0, 60) : null;
+    return { ok: true, action: ACTIONS.SKIP, text: "", includeCta: false, skipReason: reason };
   }
 
   const rawText = parsed.reply_text ?? parsed.text ?? parsed.reply;
@@ -172,26 +199,23 @@ export function validateAgentResponse(parsed, options = {}) {
   if (!text) return { ok: false, reason: "AI_RESPONSE_EMPTY_TEXT" };
   if (text.length > maxLength) return { ok: false, reason: "AI_RESPONSE_TOO_LONG" };
 
-  // URLs: only the exact shopee_url of a matched, trusted product is allowed.
-  const urls = text.match(URL_PATTERN) || [];
-  if (urls.length > 0) {
-    const allowed = trustedProduct?.shopee_url
-      ? String(trustedProduct.shopee_url).trim()
-      : null;
-
-    if (!allowed) return { ok: false, reason: "AI_RESPONSE_INVENTED_URL" };
-
-    for (const url of urls) {
-      const cleaned = url.replace(/[)\].,;!?]+$/, "");
-      if (cleaned !== allowed) return { ok: false, reason: "AI_RESPONSE_INVENTED_URL" };
-    }
+  for (const pattern of LINK_LIKE_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(text)) return { ok: false, reason: "AI_RESPONSE_INVENTED_URL" };
   }
 
   for (const pattern of FORBIDDEN_CLAIM_PATTERNS) {
     if (pattern.test(text)) return { ok: false, reason: "AI_RESPONSE_UNVERIFIABLE_CLAIM" };
   }
 
-  return { ok: true, action: ACTIONS.REPLY, text };
+  for (const pattern of LEAK_PATTERNS) {
+    if (pattern.test(text)) return { ok: false, reason: "AI_RESPONSE_POLICY_LEAK" };
+  }
+
+  const cta = parsed.include_affiliate_cta;
+  const includeCta = cta === true || cta === "true";
+
+  return { ok: true, action: ACTIONS.REPLY, text, includeCta };
 }
 
 /** Convenience wrapper: parse + validate in one step. */

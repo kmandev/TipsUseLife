@@ -7,14 +7,14 @@ import { sendFacebookReply, LiveModeViolationError } from "../src/facebook-reply
 import {
   TEST_META_SECRET,
   TEST_VERIFY_TOKEN,
-  TEST_HERMES_SECRET,
+  TEST_HERMES_API_KEY,
   createFakeD1,
   createEnv,
   createCtx,
   commentPayload,
   signedRequest,
   installFetchMock,
-  jsonResponse,
+  hermesChat,
   captureConsole,
 } from "./helpers.js";
 
@@ -27,7 +27,7 @@ test("DRY_RUN never calls the Facebook mutation API", async () => {
     if (/graph\.facebook\.com/i.test(url)) {
       throw new Error("FACEBOOK MUTATION ATTEMPTED IN DRY_RUN");
     }
-    return jsonResponse({
+    return hermesChat({
       action: "REPLY",
       reply_text: "ขอบคุณที่สนใจครับ 😊",
       mode: "DRY_RUN",
@@ -52,7 +52,7 @@ test("DRY_RUN holds even when a PAGE_ACCESS_TOKEN is present", async () => {
 
   const mock = installFetchMock((url) => {
     if (/graph\.facebook\.com/i.test(url)) throw new Error("MUTATION ATTEMPTED");
-    return jsonResponse({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" });
+    return hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" });
   });
 
   try {
@@ -142,7 +142,7 @@ test("secrets never appear in logs", async () => {
   const capture = captureConsole();
 
   const mock = installFetchMock(() =>
-    jsonResponse({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
+    hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
   );
 
   try {
@@ -170,7 +170,7 @@ test("secrets never appear in logs", async () => {
   for (const secret of [
     TEST_META_SECRET,
     TEST_VERIFY_TOKEN,
-    TEST_HERMES_SECRET,
+    TEST_HERMES_API_KEY,
     "unit-test-page-access-token",
   ]) {
     assert.ok(!logged.includes(secret), `secret leaked into logs: ${secret}`);
@@ -188,7 +188,7 @@ test("comment text is truncated in logs rather than logged in full", async () =>
   const capture = captureConsole();
 
   const mock = installFetchMock(() =>
-    jsonResponse({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
+    hermesChat({ action: "REPLY", reply_text: "ขอบคุณครับ", mode: "DRY_RUN" })
   );
 
   try {
@@ -218,7 +218,7 @@ test("ai_response_rejected diagnostic metadata carries no content, only shape (N
   // An unrecognized, foreign-keyed envelope -- exactly the class of shape
   // this diagnostic logging exists to characterize without exposing it.
   const mock = installFetchMock(() =>
-    jsonResponse({ unexpected_upstream_field: secretishText, nested: { x: 1 } })
+    hermesChat({ unexpected_upstream_field: secretishText, nested: { x: 1 } })
   );
 
   try {
@@ -231,17 +231,14 @@ test("ai_response_rejected diagnostic metadata carries no content, only shape (N
 
   const logged = capture.text();
   assert.ok(logged.includes("ai_response_rejected"), "rejection was logged");
-  assert.ok(logged.includes("AI_RESPONSE_UNRECOGNIZED_SHAPE"));
+  assert.ok(logged.includes("AI_RESPONSE_UNKNOWN_ACTION"));
 
-  // The structural metadata itself must be present...
-  assert.ok(logged.includes('"raw_type":"object"'));
+  // Only structural metadata: the assistant content is a string.
+  assert.ok(logged.includes('"raw_type":"string"'));
   assert.ok(logged.includes('"is_array":false'));
-  assert.ok(logged.includes("unexpected_upstream_field"), "key name is safe to log");
 
-  // ...but never the value behind that key, and never a nested value.
-  // ("nested" itself is expected to appear -- it's a safe top-level KEY
-  // NAME -- what must never appear is the object's inner content.)
+  // ...never the content itself, nor any nested value.
   assert.ok(!logged.includes(secretishText), "an upstream field VALUE leaked into logs");
+  assert.ok(!logged.includes("unexpected_upstream_field"), "assistant content leaked into logs");
   assert.ok(!logged.includes('"x":1'), "a nested object's inner value was inlined into the log");
-  assert.ok(!/"nested":\s*\{/.test(logged), "a nested object was inlined into the log");
 });

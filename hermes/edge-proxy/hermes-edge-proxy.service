@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes edge proxy (path allow-list in front of Hermes api_server)
+After=network-online.target hermes-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/pi/.hermes/hermes-agent/venv/bin/python /home/pi/.hermes/edge-proxy/edge_proxy.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
