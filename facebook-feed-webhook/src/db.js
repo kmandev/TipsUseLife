@@ -55,26 +55,6 @@ export async function insertCommentIfNew(db, event) {
   return { id: null, duplicate: true };
 }
 
-/**
- * Active products used for matching. Bounded so a runaway table cannot
- * blow the Worker's memory or CPU budget.
- */
-export async function listActiveProducts(db, limit = 500) {
-  const result = await db
-    .prepare(
-      `SELECT id, name, description, keywords, shopee_url, affiliate_url,
-              platform, active, deleted_at
-         FROM products
-        WHERE active = 1
-          AND deleted_at IS NULL
-        LIMIT ?`
-    )
-    .bind(limit)
-    .all();
-
-  return result?.results ?? [];
-}
-
 export async function updateCommentResult(
   db,
   commentId,

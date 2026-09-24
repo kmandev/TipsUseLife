@@ -54,7 +54,7 @@
   function badge(text, kind) { return h("span", { class: "badge " + (kind || ""), text }); }
 
   const STATUS_KIND = { PROCESSED: "blue", REPLIED: "green", SKIPPED: "gray", ERROR: "red", RECEIVED: "gray", GENERATED: "blue", SENT: "green", FAILED: "red" };
-  const SOURCE_LABEL = { MAPPING: "ผูกกับโพสต์", KEYWORD: "คีย์เวิร์ด", NONE: "ไม่มี" };
+  const SOURCE_LABEL = { MAPPING: "ผูกกับโพสต์", KEYWORD: "คีย์เวิร์ด (ข้อมูลเก่า)", NONE: "ไม่มี" };
 
   /* ------------------------------ login ------------------------------ */
   function renderLogin(root) {
@@ -162,7 +162,7 @@
       row("ชื่อสินค้า *", f.name),
       row("Affiliate URL *", f.affiliate_url, "ระบบจะแนบลิงก์นี้เอง — AI ไม่เห็นและแก้ไขลิงก์ไม่ได้"),
       row("แพลตฟอร์ม", f.platform),
-      row("คีย์เวิร์ด", f.keywords, "ใช้จับคู่เมื่อโพสต์ยังไม่ได้ผูกสินค้า"),
+      row("คีย์เวิร์ด", f.keywords, "ข้อมูลประกอบให้ AI เท่านั้น — ระบบไม่ใช้คีย์เวิร์ดเลือกสินค้า ลิงก์ Affiliate ใช้ได้เฉพาะโพสต์/Reel ที่ผูกกับสินค้านี้"),
       row("คำอธิบาย (AI ใช้เป็นข้อมูลจริงเท่านั้น)", f.description),
       row("รูปภาพ", f.image_url),
       h("label", { class: "check" }, f.active, " เปิดใช้งาน"),
@@ -234,7 +234,7 @@
 
     main.replaceChildren(
       h("h2", { text: "โพสต์ / Reel ↔ สินค้า" }),
-      h("p", { class: "muted", text: "Facebook Graph API ไม่เปิดให้อ่านสินค้าที่แท็กในโพสต์/Reel ของเพจ จึงกำหนดสินค้าของแต่ละโพสต์ที่นี่ ระบบจะแนบลิงก์ Affiliate ของสินค้านั้นเมื่อ AI ตัดสินใจใส่ CTA" }),
+      h("p", { class: "muted", text: "Facebook Graph API ไม่เปิดให้อ่านสินค้าที่แท็กในโพสต์/Reel ของเพจ จึงกำหนดสินค้าของแต่ละโพสต์ที่นี่ ระบบจะแนบลิงก์ Affiliate ของสินค้านั้นเมื่อ AI ตัดสินใจใส่ CTA — การผูกโพสต์/Reel เป็นแหล่งเดียวที่กำหนดสินค้า ระบบไม่เลือกสินค้าจากคีย์เวิร์ดในคอมเมนต์" }),
       h("form", { class: "card form inline", onsubmit: add }, h("div", { class: "field" }, h("label", { text: "Post / Reel ID" }), postId), h("div", { class: "field" }, h("label", { text: "ประเภท" }), type), h("div", { class: "field" }, h("label", { text: "สินค้า" }), product), h("div", { class: "field" }, h("label", { text: "บันทึก" }), note), h("button", { class: "btn primary", type: "submit", text: "ผูกสินค้า" }), err),
       h("h3", { text: "โพสต์ที่ผูกสินค้าแล้ว" }),
       mappings.length ? h("table", null,
@@ -251,6 +251,7 @@
             h("td", null, h("button", { class: "btn small danger", text: "ยกเลิก", onclick: async () => { if (!window.confirm("ยกเลิกการผูกสินค้ากับโพสต์นี้?")) return; try { await api("/admin/api/content/" + m.id, { method: "DELETE" }); toast("ยกเลิกแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); } } })));
         }))) : h("p", { class: "muted", text: "ยังไม่มี mapping" }),
       h("h3", { text: "โพสต์ที่มีคอมเมนต์แต่ยังไม่ผูกสินค้า" }),
+      h("p", { class: "muted small", text: "โพสต์เหล่านี้จะไม่ได้รับลิงก์ Affiliate อัตโนมัติ ผูกโพสต์/Reel กับสินค้าก่อน จึงจะใช้ CTA และลิงก์ได้" }),
       unmapped.length ? h("table", null,
         h("thead", null, h("tr", null, ["โพสต์", "คอมเมนต์", "ล่าสุด", ""].map((t) => h("th", { text: t })))),
         h("tbody", null, unmapped.map((u) => h("tr", null,

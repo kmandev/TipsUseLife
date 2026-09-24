@@ -284,7 +284,51 @@ function mapRow(row) {
  * Route handlers
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * Login throttling
+ * ------------------------------------------------------------------ */
+
+/**
+ * Brute-force protection for POST /admin/login, using the Cloudflare
+ * Workers Rate Limiting binding (`ratelimits` in wrangler.jsonc, bound as
+ * ADMIN_LOGIN_LIMITER). Keyed by the client IP Cloudflare reports.
+ *
+ * The check runs BEFORE the body is parsed or the password compared, so a
+ * throttled client learns nothing about the password.
+ *
+ * Fail-open by design: if the binding is absent (local tests, a config
+ * rollback) or the limiter itself errors, login keeps working exactly as
+ * before -- throttling is defence in depth on top of a strong password,
+ * and it must never lock the owner out of the dashboard. The failure is
+ * logged as a fixed category; the IP and the password are never logged.
+ *
+ * @returns {Promise<boolean>} true when the attempt may proceed
+ */
+export async function loginAttemptAllowed(request, env) {
+  const limiter = env?.ADMIN_LOGIN_LIMITER;
+  if (!limiter || typeof limiter.limit !== "function") {
+    logEvent("admin_login_ratelimit_unavailable", { reason: "BINDING_MISSING" });
+    return true;
+  }
+
+  const ip = request.headers.get("cf-connecting-ip") || "unknown";
+  try {
+    const outcome = await limiter.limit({ key: `admin-login:${ip}` });
+    return outcome?.success !== false;
+  } catch {
+    logEvent("admin_login_ratelimit_unavailable", { reason: "LIMITER_ERROR" });
+    return true;
+  }
+}
+
 async function handleLogin(request, env) {
+  if (!(await loginAttemptAllowed(request, env))) {
+    logError("admin_login_rejected", "RATE_LIMITED");
+    return apiError(429, "RATE_LIMITED", "Too many login attempts. Try again later.", {
+      "retry-after": "60",
+    });
+  }
+
   let body;
   try {
     body = await request.json();

@@ -77,9 +77,12 @@ URL scraped from post text would let any link in a caption become a
    hand. If the mapped product is inactive/deleted/invalid, the reply gets
    **no link** — it never falls back to another product.
 2. **No mapping → no product, no link.** The AI may still answer in plain
-   text. The keyword matcher (`products.js`) is **not** used to pick a
-   product: it only sees the comment and the catalog, never what the post
-   is about, so it could attach product B's link to a post about product A.
+   text. Comment keywords are **never** used to pick a product (the old
+   keyword matcher `products.js` was removed in Phase 6): a matcher only sees
+   the comment and the catalog, never what the post is about, so it could
+   attach product B's link to a post about product A. A product's
+   `keywords` field is only background context for the AI on a post that
+   is already mapped to that product.
 
 Invariant (tested in `tests/high-blockers.test.js`): every affiliate URL
 that can reach Facebook comes from an active, non-deleted product that is

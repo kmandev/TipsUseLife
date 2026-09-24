@@ -10,7 +10,7 @@ live. The Mac is source + git only.
 Working directory for every command below:
 
 ```bash
-cd ~/TipsUseLife/facebook-feed-webhook   # adjust to the Pi's checkout path
+cd ~/TipsUseLife-AI/facebook-feed-webhook   # the Pi's checkout (repo kmandev/TipsUseLife)
 ```
 
 ---
@@ -30,7 +30,7 @@ npm install
 npm test
 ```
 
-Expected: `fail 0` (the suite has 140+ tests; it runs against a real in-memory SQLite with every migration applied).
+Expected: `fail 0` (the suite has 150+ tests; it runs against a real in-memory SQLite with every migration applied).
 
 ## 2. Inspect the remote D1 **before** touching it
 

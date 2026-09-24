@@ -2,7 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import worker from "../src/index.js";
-import { matchProduct } from "../src/products.js";
 import {
   parseAgentResponse,
   validateAgentResponse,
@@ -47,37 +46,10 @@ const PRODUCTS = [
   },
 ];
 
-// --------------------------------------------------------------- 14
-test("product match: a clear keyword hit selects the product", () => {
-  const matched = matchProduct("สนใจเครื่องดูดฝุ่นตัวนี้ครับ", PRODUCTS);
-  assert.ok(matched);
-  assert.equal(matched.id, 1);
-});
-
-test("product match ignores inactive products", () => {
-  assert.equal(matchProduct("อยากได้ที่ชาร์จครับ", PRODUCTS), null);
-});
-
-// --------------------------------------------------------------- 15
-test("no product match for a generic comment", () => {
-  assert.equal(matchProduct("สนใจครับ", PRODUCTS), null);
-  assert.equal(matchProduct("ราคาเท่าไหร่", PRODUCTS), null);
-  assert.equal(matchProduct("", PRODUCTS), null);
-  assert.equal(matchProduct("อะไรก็ได้", []), null);
-});
-
-test("ambiguous comments refuse to guess between two products", () => {
-  const ambiguous = [
-    { id: 1, name: "aaa", keywords: "combo", shopee_url: null, active: 1 },
-    { id: 2, name: "bbb", keywords: "combo", shopee_url: null, active: 1 },
-  ];
-  assert.equal(matchProduct("อยากได้ combo", ambiguous), null);
-});
-
-test("a single weak keyword is below the confidence threshold", () => {
-  const weak = [{ id: 9, name: "x", keywords: "ab", shopee_url: null, active: 1 }];
-  assert.equal(matchProduct("ab ab ab", weak), null);
-});
+// Tests 14/15 exercised the keyword matcher (src/products.js). The matcher
+// had no runtime caller since mapping became the only product source and
+// was removed in Phase 6; the no-keyword-attachment invariant is covered in
+// tests/high-blockers.test.js and tests/phase6-hardening.test.js.
 
 // --------------------------------------------------------------- 16
 test("agent response parsing accepts raw, fenced, embedded and enveloped JSON", () => {

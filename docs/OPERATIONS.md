@@ -20,7 +20,8 @@ or command lines; pipe them or use the interactive prompt.
 | `HERMES_API_KEY` | secret | = `API_SERVER_KEY` in the Pi's `~/.hermes/.env` |
 | `ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET` | secret | Dashboard login / session signing |
 | `PAGE_ACCESS_TOKEN` | secret, **LIVE only** | Page token with `pages_manage_engagement`; absent = hard DRY_RUN lock |
-| `HERMES_SECRET` | secret, legacy | only used by the retired webhook path; may be deleted later |
+| `HERMES_SECRET` | secret, **unused** | Not read by any Worker code (all repo references removed in Phase 6). It belonged to the retired `/webhooks/facebook-comments` path. Still present as a production Worker secret; safe to delete with `npx wrangler secret delete HERMES_SECRET` (creates a new Worker version — do it as a separate, audited change). Hermes auth uses `HERMES_API_KEY` only. |
+| `ADMIN_LOGIN_LIMITER` | rate-limit binding | `ratelimits` in `wrangler.jsonc`: 5 login attempts / 60 s per client IP → `429 RATE_LIMITED`. Per-location and approximate. If the binding is missing, login still works (logged as `admin_login_ratelimit_unavailable`). |
 
 ## Raspberry Pi services (systemd **user** units, user `pi`)
 

@@ -148,14 +148,27 @@ export function parseAgentResponse(raw) {
  * such as ".ไทย") of length >= 2, or a punycode TLD ("xn--..."). Requiring
  * an all-letter TLD is what keeps ordinary Thai text safe: "v1.2", "3.14",
  * "รุ่น 2.0", "99.90 บาท" end in digits, and "A.I." / "e.g." end in a
- * single letter, so none of them match. Dot look-alikes (U+3002, U+FF0E,
- * U+FF61), which IDNA treats as dots, count as dots.
+ * single letter, so none of them match. Dot look-alikes count as dots:
+ * U+3002 / U+FF0E / U+FF61 (which IDNA treats as dots) and U+2024 ONE DOT
+ * LEADER / U+FE52 SMALL FULL STOP (which NFKC folds to "."). The probe text
+ * is also NFKC-normalised before matching (see linkProbeVariants), so other
+ * compatibility forms such as full-width letters fold to ASCII first.
  */
 const DOMAIN_LABEL = "[\\p{L}\\p{M}\\p{N}](?:[\\p{L}\\p{M}\\p{N}-]*[\\p{L}\\p{M}\\p{N}])?";
-const DOMAIN_DOT = "[.\\u3002\\uFF0E\\uFF61]";
+const DOMAIN_DOT = "[.\\u2024\\u3002\\uFE52\\uFF0E\\uFF61]";
 const DOMAIN_TLD = "(?:[\\p{L}\\p{M}]{2,63}|xn--[a-z0-9-]{1,59})";
 export const DOMAIN_SHAPE_PATTERN = new RegExp(
   `(?<![\\p{L}\\p{M}\\p{N}-])(?:${DOMAIN_LABEL}${DOMAIN_DOT})+${DOMAIN_TLD}(?![\\p{L}\\p{M}\\p{N}-])`,
+  "iu"
+);
+
+/*
+ * "evil .xyz": whitespace smuggled in front of the dot. Only a LATIN TLD is
+ * accepted after the dot here, and no whitespace is allowed after it, so
+ * ordinary Thai sentences ("ดีครับ . แนะนำ", "ราคา .50") never match.
+ */
+export const SPACED_DOT_DOMAIN_PATTERN = new RegExp(
+  `(?<![\\p{L}\\p{M}\\p{N}-])${DOMAIN_LABEL}[ \\t]+${DOMAIN_DOT}(?:[a-z]{2,24}|xn--[a-z0-9-]{1,59})(?![\\p{L}\\p{M}\\p{N}-])`,
   "iu"
 );
 
@@ -167,6 +180,7 @@ export const DOMAIN_SHAPE_PATTERN = new RegExp(
 const LINK_LIKE_PATTERNS = [
   URL_PATTERN,
   DOMAIN_SHAPE_PATTERN,
+  SPACED_DOT_DOMAIN_PATTERN,
   /(^|[^\p{L}\p{N}])\/\/\S/u, // scheme-relative //host
   /\b(?:javascript|vbscript|data|file|blob|about|intent|mailto|tel|sms|ftp)\s*:/i,
   /\b\d{1,3}(?:\.\d{1,3}){3}\b/, // IPv4
@@ -175,11 +189,16 @@ const LINK_LIKE_PATTERNS = [
 ];
 
 /**
- * Invisible format characters (zero-width space/joiner, bidi controls) are
- * removed before link detection so "evil\u200B.xyz" cannot slip through.
+ * The texts link detection runs on. Invisible format characters (zero-width
+ * space/joiner, bidi controls) are removed so "evil\u200B.xyz" cannot slip
+ * through; the NFKC form is checked as well so compatibility characters
+ * ("ｅｖｉｌ．ｘｙｚ", "evil\u2024xyz", "evil\uFE52xyz") fold to what a
+ * reader sees. Both variants are checked: NFKC only ever ADDS matches.
  */
-function linkProbeText(text) {
-  return String(text).replace(/\p{Cf}/gu, "");
+export function linkProbeVariants(text) {
+  const stripped = String(text).replace(/\p{Cf}/gu, "");
+  const folded = stripped.normalize("NFKC").replace(/\p{Cf}/gu, "");
+  return folded === stripped ? [stripped] : [stripped, folded];
 }
 
 /** Signs the model was steered into echoing its instructions or internals. */
@@ -230,10 +249,11 @@ export function validateAgentResponse(parsed, options = {}) {
   if (!text) return { ok: false, reason: "AI_RESPONSE_EMPTY_TEXT" };
   if (text.length > maxLength) return { ok: false, reason: "AI_RESPONSE_TOO_LONG" };
 
-  const probe = linkProbeText(text);
-  for (const pattern of LINK_LIKE_PATTERNS) {
-    pattern.lastIndex = 0;
-    if (pattern.test(probe)) return { ok: false, reason: "AI_RESPONSE_INVENTED_URL" };
+  for (const probe of linkProbeVariants(text)) {
+    for (const pattern of LINK_LIKE_PATTERNS) {
+      pattern.lastIndex = 0;
+      if (pattern.test(probe)) return { ok: false, reason: "AI_RESPONSE_INVENTED_URL" };
+    }
   }
 
   for (const pattern of FORBIDDEN_CLAIM_PATTERNS) {

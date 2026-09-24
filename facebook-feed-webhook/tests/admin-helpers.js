@@ -18,7 +18,7 @@ export function createAdminEnv(overrides = {}) {
   return {
     META_APP_SECRET: "unit-test-meta-app-secret",
     META_VERIFY_TOKEN: "unit-test-verify-token",
-    HERMES_SECRET: "unit-test-hermes-secret",
+    HERMES_API_KEY: "unit-test-hermes-api-key",
     REPLY_MODE: "DRY_RUN",
     PAGE_ID: TEST_PAGE_ID,
     ADMIN_PASSWORD: TEST_ADMIN_PASSWORD,

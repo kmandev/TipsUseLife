@@ -16,10 +16,10 @@
  * INVARIANT: every affiliate URL that can reach Facebook originates from an
  * active, non-deleted product explicitly mapped to the current post/reel.
  *
- * The keyword matcher (products.js) is deliberately NOT consulted here: it
- * only sees the comment and the catalog, never what the post is about, so
- * on an unmapped post it could attach product B's link to a post about
- * product A. It remains available as a pure helper, with no authority.
+ * There is deliberately no keyword matcher: one only sees the comment and
+ * the catalog, never what the post is about, so on an unmapped post it
+ * could attach product B's link to a post about product A. The old helper
+ * (products.js / matchProduct) was removed in Phase 6.
  *
  * A product is only usable when it is active, not soft-deleted, and its
  * affiliate URL passes validateAffiliateUrl(). Anything else fails closed.
@@ -61,6 +61,11 @@ export function validateAffiliateUrl(value, allowedHosts = []) {
 
   if (parsed.protocol !== "https:") return { ok: false, reason: "URL_NOT_HTTPS" };
   if (parsed.username || parsed.password) return { ok: false, reason: "URL_HAS_CREDENTIALS" };
+  // Only the default HTTPS port. WHATWG URL parsing elides ":443" for
+  // https, so `port` is "" for both "https://h/x" and "https://h:443/x";
+  // any explicit other port (":80", ":8080", ":8443") is refused. Real
+  // Shopee / Lazada / TikTok affiliate links never carry a port.
+  if (parsed.port !== "") return { ok: false, reason: "URL_PORT_NOT_ALLOWED" };
 
   const host = parsed.hostname.toLowerCase();
   if (Array.isArray(allowedHosts) && allowedHosts.length > 0) {
