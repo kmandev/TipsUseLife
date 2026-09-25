@@ -24,7 +24,7 @@
 
 import { MODE_DRY_RUN, MODE_LIVE } from "./config.js";
 import { replyTargetId } from "./facebook.js";
-import { requestAgentReply, HermesError } from "./hermes.js";
+import { requestAgentReplyWithBackpressure, HermesError } from "./hermes.js";
 import { SYSTEM_PROMPT, buildUserMessage } from "./agent-prompt.js";
 import { evaluateAgentResponse, describeResponseShape, ACTIONS } from "./ai.js";
 import { resolveProduct, composeFinalReply, isUsableProduct, PRODUCT_SOURCES } from "./affiliate.js";
@@ -115,16 +115,23 @@ export async function processCommentEvent(event, { db, env, config }) {
   logEvent("product_resolved", { ...base, product_id: productId, product_source: productSource });
 
   // ---- 3. Ask Hermes (synchronous) -----------------------------------
+  // Hermes caps concurrent runs (429 + Retry-After when full). That single
+  // outcome gets bounded, jittered backoff inside the same overall
+  // HERMES_TIMEOUT_MS budget; every other failure still fails closed at once.
   let agentRaw;
   try {
-    agentRaw = await requestAgentReply(
+    ({ content: agentRaw } = await requestAgentReplyWithBackpressure(
       {
         systemPrompt: SYSTEM_PROMPT,
         userMessage: buildUserMessage({ event, contentType, product, linkAvailable }),
         idempotencyKey: `fbc:${event.comment_id}`,
       },
-      { url: config.hermesUrl, apiKey: env.HERMES_API_KEY, timeoutMs: config.hermesTimeoutMs }
-    );
+      { url: config.hermesUrl, apiKey: env.HERMES_API_KEY, timeoutMs: config.hermesTimeoutMs },
+      {
+        onRetry: ({ attempt, delayMs }) =>
+          logEvent("hermes_busy_backoff", { ...base, attempt, delay_ms: delayMs }),
+      }
+    ));
   } catch (error) {
     const category = error instanceof HermesError ? error.category : "HERMES_UNKNOWN_ERROR";
     logError("hermes_call_failed", category, {

@@ -12,6 +12,7 @@ or command lines; pipe them or use the interactive prompt.
 | `PAGE_ID` | var | `853313081388711` |
 | `HERMES_URL` | var | `https://hermes-feed.cloudnext.icu/v1/chat/completions` |
 | `HERMES_TIMEOUT_MS` | var | `25000` (must stay below the 30 s `waitUntil` window) |
+| Hermes concurrency | Pi config | Hermes `api_server` runs at most `gateway.api_server.max_concurrent_runs` (default **10**) agent runs at once and answers the rest `429 Retry-After: 1` before any run starts. The Worker retries **only** that 429: at most 4 attempts, 1–3 s backoff + up to 1 s jitter, all inside the single 25 s `HERMES_TIMEOUT_MS` budget (log event `hermes_busy_backoff`). Timeouts, network errors and 5xx are never retried. Measured (Phase 7.1): 1–10 concurrent comments → 0 errors; above 10 the excess used to fail as `HERMES_BUSY`. |
 | `GRAPH_API_VERSION` | var | `v21.0` (available until 2027-01-21) |
 | `MAX_REPLY_LENGTH` | var | `300` — max AI text length (link excluded) |
 | `AFFILIATE_ALLOWED_HOSTS` | var, optional | comma list; default Shopee/Lazada/TikTok short-link hosts |
