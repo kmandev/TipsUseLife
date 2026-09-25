@@ -11,6 +11,9 @@
  *   POST   /admin/api/content             (create or replace mapping for a post)
  *   PATCH  /admin/api/content/:id
  *   DELETE /admin/api/content/:id
+ *   GET    /admin/api/health              operational counts (Phase 8.2)
+ *   GET    /admin/api/recovery            rows needing operator attention
+ *   POST   /admin/api/comments/:id/retry  operator recovery of ONE comment
  *
  * Every write validates its input here, before D1, and never echoes
  * exception text. REPLY_MODE is deliberately NOT writable from here: moving
@@ -35,6 +38,7 @@ import {
   overviewStats,
 } from "./admin-db.js";
 import { logEvent, logError } from "./log.js";
+import { recoverComment, listRecoveryAttention, healthStats } from "./recovery.js";
 
 const PLATFORMS = ["shopee", "lazada", "tiktok", "other"];
 const CONTENT_TYPES = ["POST", "REEL"];
@@ -157,18 +161,33 @@ function parseId(segment) {
  * @param {any} env
  * @param {string} subpath path after "/admin/api", e.g. "/products/3"
  */
-export async function handleAdminApi(request, url, env, subpath) {
+export async function handleAdminApi(request, url, env, subpath, ctx) {
   if (!env?.DB) {
     logError("admin_api_failed", "D1_BINDING_MISSING");
     return apiError(500, "INTERNAL_ERROR", "Internal error");
   }
   const db = env.DB;
   const config = resolveConfig(env);
-  const [, resource, idSegment, extra] = subpath.split("/");
-  if (extra !== undefined) return apiError(404, "NOT_FOUND", "Not found");
+  const [, resource, idSegment, extra, tooDeep] = subpath.split("/");
   const method = request.method;
 
+  // POST /admin/api/comments/:id/retry -- the only 3-segment route.
+  if (resource === "comments" && extra === "retry" && tooDeep === undefined) {
+    return handleRetry(request, db, env, config, idSegment, ctx);
+  }
+  if (extra !== undefined) return apiError(404, "NOT_FOUND", "Not found");
+
   try {
+    if (resource === "health" && idSegment === undefined) {
+      if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+      return apiJson({ data: await healthStats(db, config.pageId), mode: config.mode });
+    }
+
+    if (resource === "recovery" && idSegment === undefined) {
+      if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+      return apiJson({ data: await listRecoveryAttention(db, config.pageId) });
+    }
+
     if (resource === "overview" && idSegment === undefined) {
       if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
       return apiJson({ data: await overviewStats(db, config.pageId), mode: config.mode });
@@ -311,4 +330,45 @@ export async function handleAdminApi(request, url, env, subpath) {
     logError("admin_api_failed", "UNHANDLED_EXCEPTION", { resource: resource ?? null });
     return apiError(500, "INTERNAL_ERROR", "Internal error");
   }
+}
+
+/* ------------------------------ recovery ------------------------------ */
+
+const RETRY_HTTP_STATUS = { RECOVERED: 200, NOT_FOUND: 404, NOT_ELIGIBLE: 409, ALREADY_CLAIMED: 409 };
+
+/**
+ * POST /admin/api/comments/:id/retry. Operator-triggered, one comment,
+ * never automatic, never a Graph retry. Session + same-origin/JSON CSRF
+ * checks already ran in admin.js. The body is ignored.
+ */
+async function handleRetry(request, db, env, config, idSegment, ctx) {
+  if (request.method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+  const id = parseId(idSegment);
+  if (!id) return apiError(400, "INVALID_ID", "Invalid comment id");
+
+  let result;
+  try {
+    const work = recoverComment(id, { db, env, config });
+    // Keep the run alive even if the operator closes the page.
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(work.catch(() => {}));
+    result = await work;
+  } catch {
+    logError("admin_retry_failed", "UNHANDLED_EXCEPTION", { comment_row_id: id });
+    return apiError(500, "INTERNAL_ERROR", "Internal error");
+  }
+
+  logEvent("admin_retry", { comment_row_id: id, status: result.status, reason: result.reason ?? null, outcome: result.outcome ?? null });
+  return apiJson(
+    {
+      data: {
+        id,
+        status: result.status,
+        reason: result.reason ?? null,
+        outcome: result.outcome ?? null,
+        outcome_reason: result.outcomeReason ?? null,
+        mode: config.mode,
+      },
+    },
+    RETRY_HTTP_STATUS[result.status] ?? 409
+  );
 }

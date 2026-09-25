@@ -101,21 +101,76 @@
 
   /* ----------------------------- overview ---------------------------- */
   async function viewOverview(main) {
-    const [ov, recent] = await Promise.all([api("/admin/api/overview"), api("/admin/comments?limit=10")]);
+    const [ov, recent, health, attention] = await Promise.all([api("/admin/api/overview"), api("/admin/comments?limit=10"), api("/admin/api/health"), api("/admin/api/recovery")]);
     state.mode = ov.mode;
     const d = ov.data || {};
     const tiles = [
       ["คอมเมนต์ที่รับ", d.comments_received], ["AI เลือกตอบ", d.ai_replies], ["AI ข้าม (SKIP)", d.ai_skipped],
-      ["ร่างคำตอบ (GENERATED)", d.replies_generated], ["ส่งจริง (SENT)", d.replies_sent], ["DRY_RUN", d.dry_run_replies],
+      ["ร่างคำตอบ DRY_RUN (GENERATED)", d.replies_generated_dry_run], ["LIVE ค้างสถานะ GENERATED", d.replies_generated_live], ["ส่งจริง (SENT)", d.replies_sent],
       ["คำตอบที่แนบลิงก์", d.replies_with_link], ["สินค้าเปิดใช้", (d.products_active ?? 0) + " / " + (d.products_total ?? 0)],
       ["Mapping เปิดใช้", (d.mappings_active ?? 0) + " / " + (d.mappings_total ?? 0)], ["ข้อผิดพลาด", d.errors],
     ];
     main.replaceChildren(
       h("h2", { text: "ภาพรวม" }),
       h("div", { class: "tiles" }, tiles.map(([label, value]) => h("div", { class: "tile" }, h("div", { class: "tile-value", text: value ?? 0 }), h("div", { class: "tile-label", text: label })))),
+      opsSection(health.data || {}, attention.data || [], () => viewOverview(main)),
       h("h3", { text: "กิจกรรมล่าสุด" }),
       activityTable(recent.data || []));
     renderModeInHeader();
+  }
+
+  /* ------------------------ operational status ----------------------- */
+  const CHECK_FACEBOOK_TEXT = "ตรวจสอบโพสต์บน Facebook ก่อน — ห้าม Retry";
+  const RECOVERY_REASON_TEXT = {
+    ELIGIBLE: "กู้คืนได้",
+    PROTECTED_AMBIGUOUS_SEND: CHECK_FACEBOOK_TEXT,
+    PROTECTED_SEND_IN_PROGRESS: CHECK_FACEBOOK_TEXT,
+    ALREADY_SENT: "ส่งแล้ว",
+    PROTECTED_GRAPH_FAILED: "Facebook ปฏิเสธ (4xx) — ตรวจสอบด้วยตนเอง",
+    EXISTING_REPLY: "มีคำตอบแล้ว",
+    UNEXPECTED_REPLY_STATE: "สถานะไม่ปกติ — ตรวจสอบด้วยตนเอง",
+    TOO_OLD: "เก่ากว่า 24 ชม. — ไม่กู้คืน",
+    RECENT_RECEIVED: "กำลังประมวลผล",
+    ALREADY_CLAIMED: "กำลังกู้คืนอยู่",
+    NOT_ELIGIBLE_STATUS: "-",
+  };
+
+  function opsSection(hd, rows, refresh) {
+    const tiles = [
+      ["ERROR ที่กู้คืนได้", hd.recoverable_errors], ["RECEIVED ค้างที่กู้คืนได้", hd.recoverable_stale_received],
+      ["LIVE ผลส่งไม่แน่นอน", hd.live_outcome_unknown], ["LIVE กำลังส่ง (ค้าง)", hd.live_send_in_progress],
+      ["LIVE Facebook 4xx", hd.live_failed_4xx], ["LIVE ส่งแล้ว (SENT)", hd.live_sent],
+      ["ERROR 1 ชม. / 24 ชม.", (hd.errors_1h ?? 0) + " / " + (hd.errors_24h ?? 0)],
+    ];
+    return h("div", null,
+      h("h3", { text: "สถานะการทำงาน" }),
+      h("div", { class: "tiles" }, tiles.map(([label, value]) => h("div", { class: "tile" }, h("div", { class: "tile-value", text: value ?? 0 }), h("div", { class: "tile-label", text: label })))),
+      rows.length ? h("table", null,
+        h("thead", null, h("tr", null, ["เวลา", "คอมเมนต์", "สถานะ", "คำตอบล่าสุด", "การกู้คืน"].map((t) => h("th", { text: t })))),
+        h("tbody", null, rows.map((r) => h("tr", null,
+          h("td", { class: "nowrap small", text: fmtTime(r.created_at) }),
+          h("td", { class: "mono small", text: r.facebook_comment_id || "" }),
+          h("td", null, badge(r.status, STATUS_KIND[r.status])),
+          h("td", { class: "small", text: r.reply ? r.reply.mode + " " + r.reply.status + (r.reply.reason ? " · " + r.reply.reason : "") : "-" }),
+          h("td", null, recoveryCell(r, refresh)))))) : h("p", { class: "muted", text: "ไม่มีรายการที่ต้องดูแล" }));
+  }
+
+  function recoveryCell(r, refresh) {
+    const action = r.recovery && r.recovery.action;
+    if (action === "RETRY") {
+      return h("button", { class: "btn small", text: "Retry", onclick: async (e) => {
+        e.target.disabled = true;
+        try {
+          const res = await fetch("/admin/api/comments/" + r.id + "/retry", { method: "POST", headers: { "content-type": "application/json" }, body: "{}", credentials: "same-origin" });
+          const data = await res.json().catch(() => null);
+          const d = (data && data.data) || {};
+          toast(res.ok ? "กู้คืนแล้ว: " + (d.outcome || "-") : "ไม่สามารถกู้คืน: " + (d.reason || (data && data.error && data.error.code) || res.status), res.ok ? "ok" : "err");
+        } catch (ex) { toast(ex.message, "err"); }
+        refresh();
+      } });
+    }
+    if (action === "CHECK_FACEBOOK_NO_RETRY") return h("span", { class: "error small", text: CHECK_FACEBOOK_TEXT });
+    return h("span", { class: "muted small", text: RECOVERY_REASON_TEXT[r.recovery && r.recovery.reason] || "-" });
   }
 
   function renderModeInHeader() {

@@ -479,7 +479,7 @@ function passesCsrfCheck(request, url) {
   return true;
 }
 
-export async function handleAdminRequest(request, url, env) {
+export async function handleAdminRequest(request, url, env, ctx) {
   try {
     const path = url.pathname;
 
@@ -530,7 +530,7 @@ export async function handleAdminRequest(request, url, env) {
         logError("admin_request_rejected", "CSRF_CHECK_FAILED", { path });
         return apiError(403, "FORBIDDEN", "Cross-site request rejected");
       }
-      return await handleAdminApi(request, url, env, path.slice("/admin/api".length));
+      return await handleAdminApi(request, url, env, path.slice("/admin/api".length), ctx);
     }
 
     return apiError(404, "NOT_FOUND", "Not found");

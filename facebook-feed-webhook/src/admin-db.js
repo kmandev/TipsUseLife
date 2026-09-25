@@ -212,6 +212,10 @@ export async function overviewStats(db, pageId) {
          (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id
             WHERE c.page_id = ?1 AND r.status = 'GENERATED') AS replies_generated,
          (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id
+            WHERE c.page_id = ?1 AND r.mode = 'LIVE' AND r.status = 'GENERATED') AS replies_generated_live,
+         (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id
+            WHERE c.page_id = ?1 AND r.mode = 'DRY_RUN' AND r.status = 'GENERATED') AS replies_generated_dry_run,
+         (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id
             WHERE c.page_id = ?1 AND r.status = 'SENT') AS replies_sent,
          (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id
             WHERE c.page_id = ?1 AND r.mode = 'DRY_RUN' AND r.status = 'GENERATED') AS dry_run_replies,

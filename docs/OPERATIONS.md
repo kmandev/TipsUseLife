@@ -26,6 +26,24 @@ or command lines; pipe them or use the interactive prompt.
 | `HERMES_SECRET` | secret, **unused** | Not read by any Worker code (all repo references removed in Phase 6). It belonged to the retired `/webhooks/facebook-comments` path. Still present as a production Worker secret; safe to delete with `npx wrangler secret delete HERMES_SECRET` (creates a new Worker version — do it as a separate, audited change). Hermes auth uses `HERMES_API_KEY` only. |
 | `ADMIN_LOGIN_LIMITER` | rate-limit binding | `ratelimits` in `wrangler.jsonc`: 5 login attempts / 60 s per client IP → `429 RATE_LIMITED`. Per-location and approximate. If the binding is missing, login still works (logged as `admin_login_ratelimit_unavailable`). |
 
+## Recovery and health (Phase 8.2)
+
+**Operator recovery only** — nothing retries automatically. Dashboard → ภาพรวม → "สถานะการทำงาน" lists comments needing attention; a **Retry** button appears only when the shared rule (`src/recovery.js recoveryReasonSql`) says `ELIGIBLE`:
+
+* comment younger than 24 h, **and**
+* no reply row at all — except exactly one LIVE `SKIPPED` `SEND_BUDGET_EXHAUSTED` row (nothing was sent), **and**
+* `status = ERROR`, or `status = RECEIVED` for > 2 min and untouched for 2 min.
+
+Retry = `POST /admin/api/comments/:id/retry` (session + same-origin JSON). It claims the row atomically (`UPDATE … WHERE <rule> = 'ELIGIBLE'`, one winner), then resumes the normal pipeline from the product lookup with the same `fbc:<comment_id>` Idempotency-Key, Hermes budget/backoff, validation, link guard, LIVE gates and send marker. Responses: `200 RECOVERED` (with the pipeline outcome), `409 NOT_ELIGIBLE`/`ALREADY_CLAIMED` (with a reason), `404`, `400 INVALID_ID`.
+
+**Never recoverable** (no button; the dashboard shows "ตรวจสอบโพสต์บน Facebook ก่อน — ห้าม Retry" for the first two): LIVE `GENERATED` + `GRAPH_OUTCOME_UNKNOWN:*`, LIVE `GENERATED` + `GRAPH_SEND_IN_PROGRESS`, LIVE `SENT`, LIVE `FAILED`, any DRY_RUN reply, any other reply state, anything older than 24 h (e.g. the historical test ERROR rows).
+
+`GET /admin/api/health` (session): ERROR 1 h / 24 h / total, recoverable ERROR and stale RECEIVED, stale RECEIVED (+ oldest), LIVE GENERATED / outcome-unknown / send-in-progress (+ oldest), LIVE FAILED 4xx / total (+ oldest), LIVE SENT, DRY_RUN GENERATED, totals. Counts and timestamps only — no text, URLs or secrets. Alerting is **not** implemented yet (channel is an operator decision); this endpoint is its data source.
+
+### Hermes concurrency evidence (W4 — no change made)
+
+`max_concurrent_runs` is the default **10** (not set in `~/.hermes/config.yaml`). Measured, DRY_RUN: bursts of 1–10 → 0 errors; 12/14/16 before the 429 backoff → 2/4/6 errors (exactly the excess); after the backoff 12/14/16 → 0 errors, 429s absorbed (up to 17 per burst); Phase 8.1 (20 s Hermes budget) 16 → 0 errors, slowest persist ~20 s; Pi ≥ 56 % CPU idle, ≥ 519 MB free. **No evidence yet** for bursts > 16 or with concurrent unrelated Hermes jobs (they share the same 10 slots). No recommendation to change the cap.
+
 ## Raspberry Pi services (systemd **user** units, user `pi`)
 
 | Unit | Listens | Role |

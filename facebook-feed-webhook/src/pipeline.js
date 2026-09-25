@@ -75,16 +75,7 @@ export async function processCommentEvent(event, { db, env, config }) {
   const authorRef = await shortHash(event.author_id);
 
   // ---- 0. Self-reply protection, layer 2 ------------------------------
-  // Runs before anything is stored or sent: an event that IS one of our own
-  // Facebook replies (or sits directly under one) is dropped. If the check
-  // itself fails we cannot prove it is not our own reply -> drop it.
-  let ownReply;
-  try {
-    ownReply = await isOwnReplyEvent(db, { commentId: event.comment_id, parentId: event.parent_id });
-  } catch {
-    ownReply = true;
-  }
-  if (ownReply) {
+  if (await isOwnReplyEventFailClosed(db, event)) {
     logEvent("event_ignored", { reason: "OWN_REPLY_EVENT", comment_id: event.comment_id });
     return { outcome: OUTCOMES.SKIPPED, reason: "OWN_REPLY_EVENT" };
   }
@@ -122,6 +113,36 @@ export async function processCommentEvent(event, { db, env, config }) {
     text_preview: safeText(event.comment_text),
     mode: config.mode,
   });
+
+  return runPersistedComment(event, commentRowId, { db, env, config, startedAt });
+}
+
+/**
+ * Self-reply protection, layer 2. Runs before anything is stored or sent:
+ * an event that IS one of our own Facebook replies (or sits directly under
+ * one) is dropped. If the check itself fails we cannot prove it is not our
+ * own reply -> treat it as ours.
+ */
+export async function isOwnReplyEventFailClosed(db, event) {
+  try {
+    return await isOwnReplyEvent(db, { commentId: event.comment_id, parentId: event.parent_id });
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Steps 2..6 for a comment that is ALREADY persisted (row `commentRowId`).
+ * Shared by the webhook path above and by operator recovery (recovery.js),
+ * so both use exactly the same product lookup, Hermes budget/backoff,
+ * validation, link guard, LIVE gates, send marker and outcome recording.
+ *
+ * @param {import("./facebook.js").NormalizedComment} event
+ * @param {number} commentRowId
+ * @param {{db: any, env: any, config: any, startedAt: number}} deps
+ */
+export async function runPersistedComment(event, commentRowId, { db, env, config, startedAt }) {
+  const base = { comment_row_id: commentRowId, comment_id: event.comment_id };
 
   // ---- 2. Trusted product context ------------------------------------
   let product = null;

@@ -32,7 +32,7 @@ export default {
     // the Meta webhook handling below so that every other path (the
     // webhook itself included) behaves exactly as it did before.
     if (isAdminPath(url.pathname)) {
-      return handleAdminRequest(request, url, env);
+      return handleAdminRequest(request, url, env, ctx);
     }
 
     if (request.method === "GET") {
