@@ -19,6 +19,16 @@ export const MODE_DRY_RUN = "DRY_RUN";
 export const MODE_LIVE = "LIVE";
 
 export const DEFAULT_PAGE_ID = "853313081388711";
+
+/**
+ * WORKER TIME BUDGET. The whole per-comment pipeline runs in
+ * ctx.waitUntil(), which Cloudflare ends ~30 s after the webhook response.
+ * Everything must finish inside PIPELINE_BUDGET_MS, and the LIVE Graph send
+ * always keeps its own reserved slice (graphTimeoutMs + GRAPH_FINALIZE_MS
+ * for recording the outcome), so Hermes can never starve it.
+ */
+export const PIPELINE_BUDGET_MS = 27000;
+export const GRAPH_FINALIZE_MS = 1000;
 /**
  * Hermes OpenAI-compatible synchronous endpoint (api_server platform),
  * reached through the Cloudflare Tunnel and the path-restricting edge
@@ -65,7 +75,8 @@ export function resolveConfig(env) {
     mode: resolveReplyMode(env),
     pageId: String(env?.PAGE_ID || DEFAULT_PAGE_ID),
     hermesUrl: String(env?.HERMES_URL || DEFAULT_HERMES_URL),
-    hermesTimeoutMs: Number(env?.HERMES_TIMEOUT_MS || 25000),
+    hermesTimeoutMs: Number(env?.HERMES_TIMEOUT_MS || 20000),
+    graphTimeoutMs: Number(env?.GRAPH_TIMEOUT_MS || 5000),
     graphApiVersion: String(env?.GRAPH_API_VERSION || "v21.0"),
     maxReplyLength: Number(env?.MAX_REPLY_LENGTH || 300),
     affiliateAllowedHosts: parseHostList(env?.AFFILIATE_ALLOWED_HOSTS),

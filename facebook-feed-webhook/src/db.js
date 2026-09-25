@@ -121,6 +121,89 @@ export async function hasSentReply(db, commentRowId) {
 }
 
 /**
+ * LIVE gate (defence in depth on top of the comment dedupe): has ANY LIVE
+ * send attempt ever been recorded for this comment? A LIVE row in
+ * GENERATED (attempt started / outcome unknown), SENT or FAILED state all
+ * count -- only a LIVE SKIPPED row (nothing was sent) does not.
+ */
+export async function hasLiveSendAttempt(db, commentRowId) {
+  const row = await db
+    .prepare(
+      `SELECT 1 AS hit FROM replies
+        WHERE comment_id = ? AND mode = 'LIVE' AND status IN ('GENERATED', 'SENT', 'FAILED')
+        LIMIT 1`
+    )
+    .bind(commentRowId)
+    .first();
+  return Boolean(row);
+}
+
+/**
+ * Self-reply protection, layer 2 (layer 1 is the author == Page check):
+ * is this webhook event one of OUR OWN replies, or nested directly under
+ * one? Our replies are known by the facebook_reply_id Graph returned.
+ */
+export async function isOwnReplyEvent(db, { commentId, parentId }) {
+  const ids = [commentId, parentId].filter((v) => typeof v === "string" && v.length > 0);
+  if (ids.length === 0) return false;
+  const row = await db
+    .prepare(
+      `SELECT 1 AS hit FROM replies
+        WHERE facebook_reply_id IS NOT NULL
+          AND facebook_reply_id IN (${ids.map(() => "?").join(", ")})
+        LIMIT 1`
+    )
+    .bind(...ids)
+    .first();
+  return Boolean(row);
+}
+
+/**
+ * LIVE send marker. Written BEFORE the Graph request so an attempt can
+ * never disappear silently. State model (no schema change -- the CHECK
+ * constraint allows GENERATED/SENT/FAILED/SKIPPED only):
+ *
+ *   mode=LIVE status=GENERATED error=GRAPH_SEND_IN_PROGRESS  attempt started
+ *   mode=LIVE status=SENT                                    confirmed success
+ *   mode=LIVE status=FAILED    error=GRAPH_REJECTED_<4xx>    confirmed NOT sent
+ *   mode=LIVE status=GENERATED error=GRAPH_OUTCOME_UNKNOWN:* ambiguous
+ *
+ * An attempt left at GENERATED is NEVER "unsent": it may exist on Facebook.
+ * @returns {Promise<number>} the reply row id
+ */
+export async function insertLiveSendMarker(db, { commentId, responseText, affiliateUrl = null }) {
+  const row = await db
+    .prepare(
+      `INSERT INTO replies (comment_id, response_text, mode, facebook_reply_id, status, error_message, affiliate_url)
+       VALUES (?, ?, 'LIVE', NULL, 'GENERATED', 'GRAPH_SEND_IN_PROGRESS', ?)
+       RETURNING id`
+    )
+    .bind(commentId, responseText ?? "", affiliateUrl)
+    .first();
+  if (!row || row.id === undefined || row.id === null) throw new Error("MARKER_NOT_WRITTEN");
+  return Number(row.id);
+}
+
+/**
+ * Move a LIVE marker to its final state. Only a row still in the
+ * "attempt started" state can move, so a finished outcome is never
+ * overwritten.
+ */
+export async function finalizeLiveSend(db, replyRowId, { status, facebookReplyId = null, errorMessage = null }) {
+  if (!["SENT", "FAILED", "GENERATED"].includes(status)) throw new Error("INVALID_FINAL_STATUS");
+  const result = await db
+    .prepare(
+      `UPDATE replies
+          SET status = ?, facebook_reply_id = ?, error_message = ?
+        WHERE id = ? AND mode = 'LIVE' AND status = 'GENERATED'
+          AND error_message = 'GRAPH_SEND_IN_PROGRESS'`
+    )
+    .bind(status, facebookReplyId, errorMessage, replyRowId)
+    .run();
+  if (!result?.meta || Number(result.meta.changes) !== 1) throw new Error("MARKER_NOT_FINALIZED");
+}
+
+/**
  * Link-spam guard: did the same author already get this exact affiliate
  * URL on the same post within the window (any mode)?
  */

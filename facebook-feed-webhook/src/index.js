@@ -122,10 +122,26 @@ async function handleWebhook(request, env, ctx) {
     return json({ status: "ignored", reason: "no_actionable_comment" });
   }
 
-  // SELF-REPLY LOOP PROTECTION -- drop anything authored by our own Page.
+  // PAGE CHECK -- only events for OUR configured Page are processed. The
+  // incoming id is compared, never replaced: a missing, malformed or
+  // different page id is dropped before storage, Hermes or Graph.
+  const ourPage = String(config.pageId || "");
+  const pageEvents = allEvents.filter(
+    (event) => ourPage.length > 0 && typeof event?.page_id === "string" && event.page_id === ourPage
+  );
+  const pageMismatch = allEvents.length - pageEvents.length;
+  if (pageMismatch > 0) {
+    logEvent("event_ignored", { reason: "PAGE_ID_MISMATCH", count: pageMismatch });
+  }
+  if (pageEvents.length === 0) {
+    return json({ status: "ignored", reason: "page_mismatch" });
+  }
+
+  // SELF-REPLY LOOP PROTECTION (layer 1) -- drop anything authored by our
+  // own Page. Layer 2 (our stored reply ids) runs in pipeline.js.
   const events = [];
   let selfSkipped = 0;
-  for (const event of allEvents) {
+  for (const event of pageEvents) {
     if (isSelfEvent(event, config.pageId)) {
       selfSkipped += 1;
       continue;

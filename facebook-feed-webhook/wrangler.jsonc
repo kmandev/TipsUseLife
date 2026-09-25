@@ -17,7 +17,7 @@
     "REPLY_MODE": "DRY_RUN",
     "PAGE_ID": "853313081388711",
     "HERMES_URL": "https://hermes-feed.cloudnext.icu/v1/chat/completions",
-    "HERMES_TIMEOUT_MS": "25000",
+    "HERMES_TIMEOUT_MS": "20000",
     "GRAPH_API_VERSION": "v21.0",
     "MAX_REPLY_LENGTH": "300"
   },

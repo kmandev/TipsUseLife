@@ -80,7 +80,9 @@ export function extractCommentEvents(payload) {
       if (!commentText || !commentText.trim()) continue;
 
       events.push({
-        page_id: str(entry.id) || str(value.page_id) || "",
+        // Kept exactly as Meta sent it (no trimming, no fallback to another
+        // field): index.js compares it strictly against the configured Page.
+        page_id: typeof entry.id === "string" || typeof entry.id === "number" ? String(entry.id) : "",
         comment_id: commentId,
         post_id: str(value.post_id),
         parent_id: str(value.parent_id),

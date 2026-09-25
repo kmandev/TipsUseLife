@@ -17,22 +17,39 @@
  * nothing. SKIP is always preferred to a reply with a wrong product, a
  * guessed link or an unverifiable claim.
  *
- * NO AUTOMATIC RETRIES: if Hermes times out, the model may still have run.
- * Retrying could double-bill or, in LIVE, risk a second reply, so a timed
- * out comment is recorded as ERROR and left for a human.
+ * RETRIES (bounded, and only where nothing can have happened yet):
+ *   - Hermes HTTP 429 (concurrency cap, rejected before any run starts) is
+ *     retried with bounded, jittered backoff inside the Hermes time budget
+ *     (hermes.js requestAgentReplyWithBackpressure).
+ *   - Every other Hermes failure (timeout, network, 5xx, bad body) is NOT
+ *     retried: the model may already have run. The comment becomes ERROR.
+ *   - Facebook Graph sends are NEVER retried. A timeout, network failure
+ *     or 5xx is an AMBIGUOUS outcome (the reply may exist on Facebook) and
+ *     is recorded as such, never as "unsent".
+ *
+ * TIME BUDGET: see config.js PIPELINE_BUDGET_MS. Hermes gets whatever is
+ * left after reserving the Graph slice; the Graph call has its own abort
+ * timeout; a send that cannot fit is not started.
+ *
+ * SELF-REPLY PROTECTION has two independent layers: author == Page
+ * (index.js) and "this event is one of our own stored replies, or nested
+ * directly under one" (isOwnReplyEvent, below).
  */
 
-import { MODE_DRY_RUN, MODE_LIVE } from "./config.js";
+import { MODE_DRY_RUN, MODE_LIVE, PIPELINE_BUDGET_MS, GRAPH_FINALIZE_MS } from "./config.js";
 import { replyTargetId } from "./facebook.js";
 import { requestAgentReplyWithBackpressure, HermesError } from "./hermes.js";
 import { SYSTEM_PROMPT, buildUserMessage } from "./agent-prompt.js";
 import { evaluateAgentResponse, describeResponseShape, ACTIONS } from "./ai.js";
 import { resolveProduct, composeFinalReply, isUsableProduct, PRODUCT_SOURCES } from "./affiliate.js";
-import { sendFacebookReply } from "./facebook-reply.js";
+import { sendFacebookReply, FacebookSendError } from "./facebook-reply.js";
 import {
   insertCommentIfNew,
   getMappedProduct,
-  hasSentReply,
+  hasLiveSendAttempt,
+  isOwnReplyEvent,
+  insertLiveSendMarker,
+  finalizeLiveSend,
   authorRecentlyGotLink,
   updateCommentResult,
   markCommentStatus,
@@ -56,6 +73,21 @@ export const OUTCOMES = Object.freeze({
 export async function processCommentEvent(event, { db, env, config }) {
   const startedAt = Date.now();
   const authorRef = await shortHash(event.author_id);
+
+  // ---- 0. Self-reply protection, layer 2 ------------------------------
+  // Runs before anything is stored or sent: an event that IS one of our own
+  // Facebook replies (or sits directly under one) is dropped. If the check
+  // itself fails we cannot prove it is not our own reply -> drop it.
+  let ownReply;
+  try {
+    ownReply = await isOwnReplyEvent(db, { commentId: event.comment_id, parentId: event.parent_id });
+  } catch {
+    ownReply = true;
+  }
+  if (ownReply) {
+    logEvent("event_ignored", { reason: "OWN_REPLY_EVENT", comment_id: event.comment_id });
+    return { outcome: OUTCOMES.SKIPPED, reason: "OWN_REPLY_EVENT" };
+  }
 
   // ---- 1. Idempotent persistence -------------------------------------
   let inserted;
@@ -126,7 +158,7 @@ export async function processCommentEvent(event, { db, env, config }) {
         userMessage: buildUserMessage({ event, contentType, product, linkAvailable }),
         idempotencyKey: `fbc:${event.comment_id}`,
       },
-      { url: config.hermesUrl, apiKey: env.HERMES_API_KEY, timeoutMs: config.hermesTimeoutMs },
+      { url: config.hermesUrl, apiKey: env.HERMES_API_KEY, timeoutMs: hermesBudgetMs(config, startedAt) },
       {
         onRetry: ({ attempt, delayMs }) =>
           logEvent("hermes_busy_backoff", { ...base, attempt, delay_ms: delayMs }),
@@ -246,15 +278,15 @@ export async function processCommentEvent(event, { db, env, config }) {
   }
 
   // ---- 6b. LIVE: every gate must pass before any mutation -------------
-  let alreadySent = true;
+  let attempted = true;
   try {
-    alreadySent = await hasSentReply(db, commentRowId);
+    attempted = await hasLiveSendAttempt(db, commentRowId);
   } catch {
-    alreadySent = true; // cannot prove it is safe -> do not send
+    attempted = true; // cannot prove it is safe -> do not send
   }
-  if (alreadySent) {
-    logError("live_gate_blocked", "REPLY_ALREADY_SENT_OR_UNKNOWN", base);
-    return { outcome: OUTCOMES.SKIPPED, reason: "REPLY_ALREADY_SENT_OR_UNKNOWN" };
+  if (attempted) {
+    logError("live_gate_blocked", "LIVE_SEND_ALREADY_ATTEMPTED_OR_UNKNOWN", base);
+    return { outcome: OUTCOMES.SKIPPED, reason: "LIVE_SEND_ALREADY_ATTEMPTED_OR_UNKNOWN" };
   }
   if (final.affiliateUrl && !linkAvailable) {
     logError("live_gate_blocked", "PRODUCT_CONTEXT_INVALID", base);
@@ -262,35 +294,12 @@ export async function processCommentEvent(event, { db, env, config }) {
     return { outcome: OUTCOMES.SKIPPED, reason: "PRODUCT_CONTEXT_INVALID" };
   }
 
-  try {
-    const result = await sendFacebookReply(
-      { commentId: replyTargetId(event), message: final.text },
-      { mode: config.mode, accessToken: env.PAGE_ACCESS_TOKEN, graphApiVersion: config.graphApiVersion }
-    );
-
-    await safeWriteOutcome(db, {
-      commentRowId,
-      commentStatus: "REPLIED",
-      aiResponse: final.text,
-      matchedProductId: productId,
-      productSource,
-      aiAction: ACTIONS.REPLY,
-      reply: {
-        responseText: final.text,
-        mode: MODE_LIVE,
-        status: "SENT",
-        facebookReplyId: result.id || null,
-        errorMessage: null,
-        affiliateUrl: final.affiliateUrl,
-      },
-    });
-
-    logEvent("reply_sent", { ...base, mode: MODE_LIVE, has_link: Boolean(final.affiliateUrl), duration_ms: Date.now() - startedAt });
-    return { outcome: OUTCOMES.REPLIED, mode: MODE_LIVE };
-  } catch (error) {
-    const category = error?.category || "FACEBOOK_REPLY_FAILED";
-    logError("reply_send_failed", category, { ...base, status_code: error?.statusCode ?? null });
-
+  // Time budget: never START a send that cannot finish (and be recorded)
+  // inside the Worker's lifetime. Not started == definitely not sent.
+  const remainingMs = PIPELINE_BUDGET_MS - (Date.now() - startedAt);
+  const graphTimeoutMs = Math.min(config.graphTimeoutMs, remainingMs - GRAPH_FINALIZE_MS);
+  if (graphTimeoutMs < Math.min(config.graphTimeoutMs, 2000)) {
+    logError("live_gate_blocked", "SEND_BUDGET_EXHAUSTED", { ...base, remaining_ms: remainingMs });
     await safeWriteOutcome(db, {
       commentRowId,
       commentStatus: "ERROR",
@@ -298,16 +307,79 @@ export async function processCommentEvent(event, { db, env, config }) {
       matchedProductId: productId,
       productSource,
       aiAction: ACTIONS.REPLY,
-      reply: {
-        responseText: final.text,
-        mode: MODE_LIVE,
-        status: "FAILED",
-        facebookReplyId: null,
-        errorMessage: category,
-        affiliateUrl: final.affiliateUrl,
-      },
+      reply: { responseText: "", mode: MODE_LIVE, status: "SKIPPED", facebookReplyId: null, errorMessage: "SEND_BUDGET_EXHAUSTED", affiliateUrl: null },
     });
-    return { outcome: OUTCOMES.ERROR, reason: category };
+    return { outcome: OUTCOMES.ERROR, reason: "SEND_BUDGET_EXHAUSTED" };
+  }
+
+  // Marker BEFORE the request: an attempt can never vanish silently. If
+  // the marker cannot be written, nothing is sent.
+  let markerId;
+  try {
+    markerId = await insertLiveSendMarker(db, { commentId: commentRowId, responseText: final.text, affiliateUrl: final.affiliateUrl });
+  } catch {
+    logError("live_gate_blocked", "SEND_MARKER_NOT_WRITTEN", base);
+    await markStatusQuietly(db, commentRowId, "ERROR");
+    return { outcome: OUTCOMES.ERROR, reason: "SEND_MARKER_NOT_WRITTEN" };
+  }
+
+  let sent;
+  try {
+    sent = await sendFacebookReply(
+      { commentId: replyTargetId(event), message: final.text },
+      { mode: config.mode, accessToken: env.PAGE_ACCESS_TOKEN, graphApiVersion: config.graphApiVersion, timeoutMs: graphTimeoutMs }
+    );
+  } catch (error) {
+    const ambiguous = !(error instanceof FacebookSendError) || error.ambiguous;
+    const category = error?.category || "GRAPH_UNKNOWN_ERROR";
+    // NO RETRY in either case. Ambiguous stays GENERATED (never FAILED):
+    // the reply may exist on Facebook.
+    const outcome = ambiguous
+      ? { status: "GENERATED", errorMessage: `GRAPH_OUTCOME_UNKNOWN:${category}` }
+      : { status: "FAILED", errorMessage: category };
+    logError(ambiguous ? "reply_send_ambiguous" : "reply_send_failed", category, { ...base, status_code: error?.statusCode ?? null });
+    await finalizeQuietly(db, markerId, outcome, base);
+    await updateOutcomeQuietly(db, commentRowId, { status: "ERROR", aiResponse: final.text, matchedProductId: productId, productSource, aiAction: ACTIONS.REPLY });
+    return { outcome: OUTCOMES.ERROR, reason: ambiguous ? "GRAPH_OUTCOME_UNKNOWN" : category };
+  }
+
+  // HTTP 2xx: the reply exists. Record it; the id is optional evidence.
+  await finalizeQuietly(db, markerId, { status: "SENT", facebookReplyId: sent.id || null, errorMessage: sent.id ? null : "SENT_ID_UNPARSEABLE" }, base);
+  await updateOutcomeQuietly(db, commentRowId, { status: "REPLIED", aiResponse: final.text, matchedProductId: productId, productSource, aiAction: ACTIONS.REPLY });
+  logEvent("reply_sent", { ...base, mode: MODE_LIVE, has_link: Boolean(final.affiliateUrl), has_reply_id: Boolean(sent.id), duration_ms: Date.now() - startedAt });
+  return { outcome: OUTCOMES.REPLIED, mode: MODE_LIVE };
+}
+
+/** Hermes gets what is left of the pipeline budget after the Graph slice. */
+export function hermesBudgetMs(config, startedAt, now = Date.now()) {
+  const left = PIPELINE_BUDGET_MS - (now - startedAt) - config.graphTimeoutMs - GRAPH_FINALIZE_MS;
+  return Math.max(1, Math.min(config.hermesTimeoutMs, left));
+}
+
+async function finalizeQuietly(db, markerId, outcome, base) {
+  try {
+    await finalizeLiveSend(db, markerId, outcome);
+  } catch {
+    // The marker stays "GRAPH_SEND_IN_PROGRESS" -- still an attempt on
+    // record, never mistaken for "unsent".
+    logError("reply_outcome_unrecorded", "D1_UPDATE_FAILED", { ...base, intended_status: outcome.status });
+  }
+}
+
+async function updateOutcomeQuietly(db, commentRowId, { status, aiResponse, matchedProductId, productSource, aiAction }) {
+  try {
+    await updateCommentResult(db, commentRowId, { status, aiResponse, matchedProductId, productSource, aiAction });
+  } catch {
+    logError("comment_result_update_failed", "D1_UPDATE_FAILED", { comment_row_id: commentRowId });
+    await markStatusQuietly(db, commentRowId, status);
+  }
+}
+
+async function markStatusQuietly(db, commentRowId, status) {
+  try {
+    await markCommentStatus(db, commentRowId, status);
+  } catch {
+    /* already logged by the caller */
   }
 }
 
