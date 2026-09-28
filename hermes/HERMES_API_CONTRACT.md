@@ -1,9 +1,20 @@
 # Hermes API Contract — Worker ↔ Hermes
 
-Replaces the former `/webhooks/facebook-comments` contract. That endpoint
-answers `202 Accepted` before the agent runs and can never return the
-agent's answer to the caller, so the Worker no longer uses it (see
-`docs/ARCHITECTURE.md`).
+> **CURRENT CONTRACT:** synchronous `POST /v1/chat/completions` on the
+> Hermes `api_server` platform, reached through the edge proxy. The Worker
+> awaits the response in the same HTTP request and reads the reply from
+> `choices[0].message.content`. There is no `delivery_id`, no callback and
+> no polling. Source: `facebook-feed-webhook/src/hermes.js`.
+
+> **HISTORICAL / RETIRED — do not use:** the former
+> `/webhooks/facebook-comments` contract. That endpoint answers
+> `202 Accepted` with an acknowledgement body such as
+> `{status, route, event, delivery_id}` *before* the agent runs, and can
+> never return the agent's answer to the caller, so the Worker no longer
+> uses it (see `docs/ARCHITECTURE.md`). The edge proxy does not forward
+> `/webhooks/*`. If such an acknowledgement body ever reached the Worker it
+> is rejected as `HERMES_RESPONSE_NO_CHOICES` (tested in
+> `tests/phase86-safe-scope.test.js`).
 
 ## Request
 
@@ -44,11 +55,12 @@ JSON is tolerated; anything else is `SKIPPED` by the validator.
 | Hermes | Worker category | Outcome |
 |---|---|---|
 | 401/403 | `HERMES_UNAUTHORIZED` | `ERROR`, nothing posted |
-| 429 | `HERMES_BUSY` | `ERROR` |
+| 429 | `HERMES_BUSY` | retried with bounded, jittered backoff (max 4 attempts, same `Idempotency-Key`, all inside the one Hermes time budget); `ERROR` if still busy |
 | other non-2xx | `HERMES_HTTP_ERROR` | `ERROR` |
 | body not JSON / no `choices` / empty content | `HERMES_RESPONSE_*` | `ERROR` |
+| retired async acknowledgement body (`{status, route, event, delivery_id}`, HTTP 202 or 200) | `HERMES_RESPONSE_NO_CHOICES` | `ERROR`, nothing posted, not retried |
 | `hermes.failed` or `completed:false` | `HERMES_RUN_INCOMPLETE` | `ERROR` |
-| > `HERMES_TIMEOUT_MS` | `HERMES_TIMEOUT` | `ERROR`, no retry |
+| > Hermes time budget: `min(HERMES_TIMEOUT_MS, what is left of the 27 s pipeline budget after reserving the Graph slice)` (`pipeline.js` `hermesBudgetMs`) | `HERMES_TIMEOUT` | `ERROR`, no retry |
 
 ## Hermes-side requirements
 

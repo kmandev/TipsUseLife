@@ -6,10 +6,15 @@
  * reply + trusted affiliate link -> D1 -> Facebook Graph reply (LIVE only).
  * The Dashboard (/admin) is served by the same Worker.
  *
- * The Worker acknowledges Meta as soon as the event is verified and
- * durably recorded; the model round-trip runs in ctx.waitUntil() so a
- * slow Gemini call can never cause Meta to retry (and therefore never
- * causes duplicate drafts).
+ * The Worker acknowledges Meta (HTTP 200) as soon as the event is
+ * verified (signature) and filtered (page id, self-authored). Everything
+ * after that -- the self-reply layer 2 check, persistence to D1, the model
+ * round-trip and any Graph send -- runs in ctx.waitUntil(), AFTER the
+ * response. So a slow model call can never make Meta retry, but the event
+ * is NOT yet durably recorded when Meta is acknowledged: if the Worker is
+ * evicted before the D1 insert, that event is lost (Meta will not
+ * redeliver it). Duplicate deliveries are still deduplicated by the D1
+ * insert in pipeline.js.
  */
 
 import { resolveConfig, MODE_DRY_RUN } from "./config.js";

@@ -32,12 +32,21 @@ Cloudflare Worker  facebook-feed-webhook.farkram.workers.dev
   ▼
 DRY_RUN (default): stop — nothing is posted.
 LIVE (explicit):   POST graph.facebook.com/{version}/{comment-id}/comments
+                   ({comment-id} = the top-level comment; see replyTargetId)
 ```
 
 The Meta request is acknowledged (`200 {"status":"accepted"}`) as soon as
-the signature is verified; steps 3–8 run in `ctx.waitUntil()`.
+the signature is verified and step 2 has filtered the events; steps 3–8 run
+in `ctx.waitUntil()` *after* the response. The event is therefore not yet
+durably recorded when Meta is acknowledged: if the Worker is evicted before
+step 3, that event is lost (Meta does not redeliver after a 200).
 
 ## Why synchronous Hermes (`/v1/chat/completions`)
+
+**Current contract:** `POST /v1/chat/completions` (Hermes `api_server`),
+awaited in the same request. The paragraph below is **HISTORICAL / RETIRED**
+background explaining why the webhook platform was abandoned; the Worker
+does not use it.
 
 Hermes' webhook platform (`POST /webhooks/{route}`) returns `202` *before*
 the agent runs and only writes the answer to its log (`deliver: log`,
@@ -60,7 +69,7 @@ agent runs with the webhook platform's default toolsets).
 | Link data readable? | Links in `message` / `attachments` of a Page post are readable with a Page access token, but they are arbitrary URLs, not a verified affiliate product. |
 | Webhook comment payload | `from{id,name}`, `comment_id`, `post_id`, `parent_id`, `message`, `created_time`, `post{status_type, permalink_url, …}`. No product data. |
 | Permissions | Read post: Page access token (`pages_read_engagement` / `pages_manage_posts`). Reply: Page token with the MODERATE task + `pages_manage_engagement`. |
-| Graph version | Project uses `v21.0` (released 2024-10-02, available until **2027-01-21**). Configurable via `GRAPH_API_VERSION`; newest at time of writing is v26.0. |
+| Graph version | Project uses `v21.0` (released 2024-10-02, available until **2027-01-21**). Configurable via `GRAPH_API_VERSION`. *Historical note:* when this table was written the newest version was v26.0; that has not been re-verified since and is **not** what production uses. |
 
 No Page access token is configured (DRY_RUN), so post content was not
 queried empirically; the decision below does not depend on it.
