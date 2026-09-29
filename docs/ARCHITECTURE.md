@@ -156,8 +156,13 @@ or its top-level parent for a nested reply (Facebook threads are one level
 deep). Requires a Page token of someone with the MODERATE task and the
 `pages_manage_engagement` permission. Gates, all mandatory: `REPLY_MODE ===
 "LIVE"` and token present (`config.js`), validated AI output, usable product
-if a link is attached, comment not previously `SENT`, and
-`sendFacebookReply()` re-checks the mode itself. Our own replies can come
+if a link is attached, no earlier LIVE send attempt for this comment
+(`db.js hasLiveSendAttempt`: any LIVE reply row in `GENERATED`, `SENT` or
+`FAILED` blocks; a read error blocks too), enough of the pipeline budget
+left for the send (else `SEND_BUDGET_EXHAUSTED`), and a send-started row
+(`GENERATED` + `GRAPH_SEND_IN_PROGRESS`) written **before** the request (if
+it cannot be written, nothing is sent). `sendFacebookReply()` re-checks the
+mode itself. Graph sends are never retried. Our own replies can come
 back as webhook events; see "Self-reply protection" below.
 
 ## Self-reply protection (three layers)
@@ -236,7 +241,7 @@ constraint.
 | Meta redelivers the same comment | `UNIQUE(facebook_comment_id)` + `ON CONFLICT DO NOTHING RETURNING id`; the loser logs `comment_duplicate` and stops before Hermes |
 | Hermes timeout (model may still have run) | recorded `ERROR`; **no automatic retry** (avoids double billing / double reply) |
 | Accidental re-request to Hermes | `Idempotency-Key` cache (5 min) |
-| Double Facebook post | LIVE gate `hasSentReply` + partial `UNIQUE INDEX replies(comment_id) WHERE status='SENT'` |
+| Double Facebook post | LIVE gate `hasLiveSendAttempt` (any LIVE `GENERATED`/`SENT`/`FAILED` row for the comment blocks a new send) + send-started row written before the Graph request + partial `UNIQUE INDEX replies(comment_id) WHERE status='SENT'`. (`db.js` still exports an older `hasSentReply` helper; the pipeline does not use it.) |
 | Graph API failure | recorded `FAILED`, never retried automatically |
 | Echo of our own reply answered again | self-reply layers 1, 2 and 2.5 (see "Self-reply protection") |
 | D1 unavailable at insert | model never invoked |
@@ -270,8 +275,36 @@ Dashboard.
 
 ## Observability
 
-Structured JSON logs (`log.js`) with ids and categories only:
-`comment_received → product_resolved → reply_drafted | ai_action_skip |
-ai_response_rejected | reply_composition_rejected | hermes_call_failed →
-reply_sent | reply_send_failed`. Comment text is truncated in logs; tokens,
-keys, signatures and authorization headers are never logged (tested).
+Structured JSON logs (`log.js`) with ids and categories only. `logEvent`
+writes `{event, …}`; `logError` writes `{event, error_category, …}`. Comment
+text is truncated in logs; tokens, keys, signatures and authorization
+headers are never logged (tested).
+
+Normal path: `comment_received → product_resolved → reply_drafted |
+ai_action_skip | ai_response_rejected | reply_composition_rejected |
+hermes_call_failed`, and in LIVE `→ reply_sent | reply_send_failed |
+reply_send_ambiguous`.
+
+| Event | Source | Meaning / values |
+|---|---|---|
+| `event_ignored` | `index.js`, `pipeline.js` | Event dropped before processing. `reason`: `NOT_PAGE_EVENT`, `NO_ACTIONABLE_COMMENT`, `PAGE_ID_MISMATCH` (+`count`), `SELF_AUTHORED` (+`count`, layer 1), `OWN_REPLY_EVENT` (layer 2), `POSSIBLE_OWN_ECHO` (layer 2.5, +`thread_id`, `guard_state`), `POSSIBLE_OWN_ECHO_GUARD_ERROR` (layer 2.5 lookup failed, fail closed) |
+| `comment_duplicate` | `pipeline.js` | Redelivery of an already stored comment; stops before Hermes |
+| `hermes_busy_backoff` | `pipeline.js` | Hermes answered 429; `attempt`, `delay_ms` before the next bounded retry |
+| `hermes_call_failed` | `pipeline.js` | `error_category`: `HERMES_*` (e.g. `HERMES_TIMEOUT`, `HERMES_BUSY`, `HERMES_HTTP_ERROR`, `HERMES_RESPONSE_NO_CHOICES`); comment → `ERROR` |
+| `ai_response_rejected` / `reply_composition_rejected` | `pipeline.js` | `error_category` is the validator reason from `ai.js` / `affiliate.js`; recorded as `SKIPPED` |
+| `live_gate_blocked` | `pipeline.js` (LIVE only) | `error_category`: `LIVE_SEND_ALREADY_ATTEMPTED_OR_UNKNOWN`, `PRODUCT_CONTEXT_INVALID`, `SEND_BUDGET_EXHAUSTED` (+`remaining_ms`), `SEND_MARKER_NOT_WRITTEN`; nothing is sent |
+| `reply_sent` | `pipeline.js` (LIVE only) | Graph 2xx; `has_reply_id: false` means `SENT_ID_UNPARSEABLE` |
+| `reply_send_failed` | `pipeline.js` (LIVE only) | Graph 4xx, `error_category` `GRAPH_REJECTED_<status>`; confirmed not sent |
+| `reply_send_ambiguous` | `pipeline.js` (LIVE only) | Timeout / network / 5xx (`GRAPH_TIMEOUT`, `GRAPH_NETWORK_ERROR`, `GRAPH_UNCERTAIN_<status>`, or a non-Graph error category); the reply may exist on Facebook; never retried |
+| `reply_outcome_unrecorded` | `pipeline.js` (LIVE only) | The send outcome could not be written (`D1_UPDATE_FAILED`, +`intended_status`); the row stays `GRAPH_SEND_IN_PROGRESS` |
+| `comment_persist_failed`, `comment_result_update_failed`, `reply_persist_failed`, `product_lookup_failed` | `pipeline.js` | D1 failures (`D1_INSERT_FAILED` / `D1_UPDATE_FAILED` / `D1_SELECT_FAILED`) |
+| `pipeline_unhandled` | `index.js` | Unexpected exception in background processing |
+| `recovery_started`, `recovery_finished`, `recovery_failed` | `recovery.js` | Operator retry of one comment (`finished` carries `outcome`, `reason`); `admin_retry` / `admin_retry_failed` from `admin-api.js` record the request |
+| `meta_signature_missing`, `meta_signature_invalid`, `meta_secret_missing`, `payload_parse_failed`, `webhook_verification_rejected`, `d1_binding_missing` | `index.js` | Request rejected before any processing |
+
+Admin/dashboard events (`admin_*`) are emitted by `admin.js` / `admin-api.js`
+for logins, rejected requests and product/mapping changes.
+
+Suppressed events are never stored, so they are visible only in these
+logs, not in `GET /admin/api/health`. There is no alerting; logs and the
+health endpoint are read by an operator.

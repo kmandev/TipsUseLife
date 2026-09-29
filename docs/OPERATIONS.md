@@ -98,7 +98,10 @@ systemctl --user restart hermes-gateway.service
 1. `npx wrangler tail --format json` in one terminal.
 2. Comment on a mapped post **from a personal account** (Page-authored
    comments are ignored by design), e.g. `ขอพิกัดครับ`.
-3. Expect `comment_received → product_resolved → reply_drafted`.
+3. Expect `comment_received → product_resolved → reply_drafted` (or
+   `ai_action_skip` if the model chooses not to reply). A Page-authored
+   comment shows `event_ignored` / `SELF_AUTHORED` instead. Full event list:
+   `docs/ARCHITECTURE.md` → "Observability".
 4. Dashboard → กิจกรรมคอมเมนต์: status `PROCESSED`, reply `GENERATED`,
    mode `DRY_RUN`, draft ending with the product's affiliate URL.
 5. Confirm **no reply appears on Facebook**.
