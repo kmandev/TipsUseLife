@@ -162,8 +162,20 @@ if a link is attached, no earlier LIVE send attempt for this comment
 left for the send (else `SEND_BUDGET_EXHAUSTED`), and a send-started row
 (`GENERATED` + `GRAPH_SEND_IN_PROGRESS`) written **before** the request (if
 it cannot be written, nothing is sent). `sendFacebookReply()` re-checks the
-mode itself. Graph sends are never retried. Our own replies can come
-back as webhook events; see "Self-reply protection" below.
+mode itself. Graph sends are never retried.
+
+If finalizing the reply row in D1 fails after the Graph send attempt, the
+row can remain `GENERATED` + `GRAPH_SEND_IN_PROGRESS`, so the actual
+Facebook outcome cannot be established from that row alone. The Worker logs
+`reply_outcome_unrecorded` (`D1_UPDATE_FAILED`, with `intended_status`) and
+does not retry; `hasLiveSendAttempt` and the recovery protections prevent
+another LIVE send. The comment status is written by a separate D1 update,
+so in this case the comment status and the reply row status are not
+guaranteed to represent the same final outcome (for example the comment can
+be `REPLIED` while the reply row is still `GRAPH_SEND_IN_PROGRESS`).
+
+Our own replies can come back as webhook events; see "Self-reply
+protection" below.
 
 ## Self-reply protection (three layers)
 
@@ -242,7 +254,8 @@ constraint.
 | Hermes timeout (model may still have run) | recorded `ERROR`; **no automatic retry** (avoids double billing / double reply) |
 | Accidental re-request to Hermes | `Idempotency-Key` cache (5 min) |
 | Double Facebook post | LIVE gate `hasLiveSendAttempt` (any LIVE `GENERATED`/`SENT`/`FAILED` row for the comment blocks a new send) + send-started row written before the Graph request + partial `UNIQUE INDEX replies(comment_id) WHERE status='SENT'`. (`db.js` still exports an older `hasSentReply` helper; the pipeline does not use it.) |
-| Graph API failure | recorded `FAILED`, never retried automatically |
+| Graph API failure | Never retried automatically, in any case. A confirmed Graph 4xx rejection (`GRAPH_REJECTED_<status>`) is recorded `FAILED` (confirmed not sent). A 5xx / other non-2xx status (`GRAPH_UNCERTAIN_<status>`), a timeout (`GRAPH_TIMEOUT`) or a network exception (`GRAPH_NETWORK_ERROR`) is ambiguous: recorded `GENERATED` + `GRAPH_OUTCOME_UNKNOWN:<category>`; the reply may already exist on Facebook |
+| D1 cannot record the send outcome | The reply row can stay `GENERATED` + `GRAPH_SEND_IN_PROGRESS`; `reply_outcome_unrecorded` is logged. Never retried; `hasLiveSendAttempt` and recovery protections block another send |
 | Echo of our own reply answered again | self-reply layers 1, 2 and 2.5 (see "Self-reply protection") |
 | D1 unavailable at insert | model never invoked |
 
