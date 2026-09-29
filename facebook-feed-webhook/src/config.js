@@ -28,6 +28,16 @@ export const DEFAULT_PAGE_ID = "853313081388711";
  * for recording the outcome), so Hermes can never starve it.
  */
 export const PIPELINE_BUDGET_MS = 27000;
+
+/**
+ * POSSIBLE-OWN-ECHO GUARD WINDOW (Phase 8.9, policy value). A webhook event
+ * with no `from.id` is suppressed if its thread received an unattributed LIVE
+ * send attempt (no stored facebook_reply_id) within the last N seconds.
+ * Inclusive: an attempt exactly N seconds old still matches. Optional
+ * override: env ECHO_GUARD_WINDOW_SECONDS (positive integer); anything else
+ * falls back to this default.
+ */
+export const DEFAULT_ECHO_GUARD_WINDOW_SECONDS = 600;
 export const GRAPH_FINALIZE_MS = 1000;
 /**
  * Hermes OpenAI-compatible synchronous endpoint (api_server platform),
@@ -79,8 +89,19 @@ export function resolveConfig(env) {
     graphTimeoutMs: Number(env?.GRAPH_TIMEOUT_MS || 5000),
     graphApiVersion: String(env?.GRAPH_API_VERSION || "v21.0"),
     maxReplyLength: Number(env?.MAX_REPLY_LENGTH || 300),
+    echoGuardWindowSeconds: parseWindowSeconds(env?.ECHO_GUARD_WINDOW_SECONDS),
     affiliateAllowedHosts: parseHostList(env?.AFFILIATE_ALLOWED_HOSTS),
   };
+}
+
+/**
+ * ECHO_GUARD_WINDOW_SECONDS -> positive integer seconds; anything missing,
+ * non-numeric, non-integer or <= 0 -> DEFAULT_ECHO_GUARD_WINDOW_SECONDS.
+ * @param {unknown} raw
+ */
+export function parseWindowSeconds(raw) {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_ECHO_GUARD_WINDOW_SECONDS;
 }
 
 /**

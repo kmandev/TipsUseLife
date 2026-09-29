@@ -159,6 +159,71 @@ export async function isOwnReplyEvent(db, { commentId, parentId }) {
 }
 
 /**
+ * Possible-own-echo guard (Phase 8.9, "layer 2.5"). Read-only.
+ *
+ * Finds a LIVE send attempt on this Page whose Facebook reply id is NOT
+ * known -- so layer 2 cannot recognise its echo -- posted into `threadId`
+ * within the last `windowSeconds`. Covered states (facebook_reply_id NULL):
+ *   GENERATED + GRAPH_SEND_IN_PROGRESS   (send started, outcome not recorded)
+ *   GENERATED + GRAPH_OUTCOME_UNKNOWN:*  (timeout / network / 5xx)
+ *   SENT      + SENT_ID_UNPARSEABLE      (reply exists, id unreadable)
+ * DRY_RUN, FAILED, SKIPPED and rows with a stored reply id never match.
+ *
+ * THREAD of a stored comment = where its reply was posted (replyTargetId):
+ * the parent when the parent is not the post itself (nested reply), else
+ * the comment's own id (top-level). Compared against the incoming event's
+ * thread, computed the same way. Deterministic ids only; no message text.
+ *
+ * WINDOW, inclusive on both ends: now - windowSeconds <= created_at <= now.
+ * Without `now` the D1 clock (datetime('now')) is used -- the same clock
+ * that wrote created_at, so Worker/D1 clock skew cannot hide a fresh row.
+ * Tests pass `now` ("YYYY-MM-DD HH:MM:SS", UTC) for exact boundaries.
+ *
+ * @param {any} db
+ * @param {{pageId: string, threadId: string, windowSeconds: number, now?: string|null}} args
+ * @returns {Promise<string|null>} the matched state, or null
+ */
+export async function findUnattributedLiveAttemptInThread(db, { pageId, threadId, windowSeconds, now = null }) {
+  if (typeof pageId !== "string" || !pageId || typeof threadId !== "string" || !threadId) return null;
+  const seconds = Number(windowSeconds);
+  if (!Number.isInteger(seconds) || seconds <= 0) throw new Error("INVALID_ECHO_GUARD_WINDOW");
+  const row = await db
+    .prepare(
+      `SELECT CASE
+                WHEN r.status = 'SENT' THEN 'SENT_ID_UNPARSEABLE'
+                WHEN r.error_message = 'GRAPH_SEND_IN_PROGRESS' THEN 'GRAPH_SEND_IN_PROGRESS'
+                ELSE 'GRAPH_OUTCOME_UNKNOWN'
+              END AS state
+         FROM replies r
+         JOIN comments c ON c.id = r.comment_id
+        WHERE c.page_id = ?1
+          AND r.mode = 'LIVE'
+          AND r.facebook_reply_id IS NULL
+          AND (   (r.status = 'GENERATED' AND r.error_message = 'GRAPH_SEND_IN_PROGRESS')
+               OR (r.status = 'GENERATED' AND r.error_message LIKE 'GRAPH_OUTCOME_UNKNOWN:%')
+               OR (r.status = 'SENT'      AND r.error_message = 'SENT_ID_UNPARSEABLE'))
+          AND (CASE
+                 WHEN c.facebook_parent_id IS NOT NULL
+                      AND (c.facebook_post_id IS NULL OR c.facebook_parent_id <> c.facebook_post_id)
+                   THEN c.facebook_parent_id
+                 ELSE c.facebook_comment_id
+               END) = ?2
+          AND r.created_at >= datetime(COALESCE(?3, datetime('now')), ?4)
+          AND r.created_at <= datetime(COALESCE(?3, datetime('now')))
+        ORDER BY r.created_at DESC, r.id DESC
+        LIMIT 1`
+    )
+    .bind(pageId, threadId, now, `-${seconds} seconds`)
+    .first();
+  return row?.state ?? null;
+}
+
+/** Boolean form of findUnattributedLiveAttemptInThread. */
+export async function hasUnattributedLiveAttemptInThread(db, args) {
+  return (await findUnattributedLiveAttemptInThread(db, args)) !== null;
+}
+
+/**
  * LIVE send marker. Written BEFORE the Graph request so an attempt can
  * never disappear silently. State model (no schema change -- the CHECK
  * constraint allows GENERATED/SENT/FAILED/SKIPPED only):

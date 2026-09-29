@@ -23,7 +23,7 @@
  * No schema change: everything is derived from existing columns.
  */
 
-import { runPersistedComment, isOwnReplyEventFailClosed, OUTCOMES } from "./pipeline.js";
+import { runPersistedComment, isOwnReplyEventFailClosed, isPossibleOwnEchoFailClosed, OUTCOMES } from "./pipeline.js";
 import { logEvent, logError } from "./log.js";
 
 export const RECOVERY_WINDOW = "-24 hours";
@@ -153,6 +153,9 @@ export async function recoverComment(commentRowId, { db, env, config }) {
   // Same checks the webhook path applies before any work.
   if (event.page_id !== config.pageId) return { status: "NOT_ELIGIBLE", reason: "PAGE_ID_MISMATCH" };
   if (await isOwnReplyEventFailClosed(db, event)) return { status: "NOT_ELIGIBLE", reason: "OWN_REPLY_EVENT" };
+  // Layer 2.5 (Phase 8.9): same helper and window as the webhook path.
+  const echo = await isPossibleOwnEchoFailClosed(db, event, config);
+  if (echo.suppress) return { status: "NOT_ELIGIBLE", reason: echo.reason };
 
   if (!(await claimForRecovery(db, commentRowId, config.pageId))) {
     const again = await getRecoveryState(db, commentRowId, config.pageId);
@@ -231,6 +234,7 @@ export async function healthStats(db, pageId) {
          (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id WHERE c.page_id = ?1 AND r.mode = 'LIVE' AND r.status = 'FAILED') AS live_failed_total,
          (SELECT MIN(r.created_at) FROM replies r JOIN comments c ON c.id = r.comment_id WHERE c.page_id = ?1 AND r.mode = 'LIVE' AND r.status = 'FAILED') AS live_failed_oldest,
          (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id WHERE c.page_id = ?1 AND r.mode = 'LIVE' AND r.status = 'SENT') AS live_sent,
+         (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id WHERE c.page_id = ?1 AND r.mode = 'LIVE' AND r.status = 'SENT' AND r.error_message = 'SENT_ID_UNPARSEABLE') AS live_sent_id_unparseable,
          (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id WHERE c.page_id = ?1 AND r.mode = 'DRY_RUN' AND r.status = 'GENERATED') AS dry_run_generated`
     )
     .bind(pageId)

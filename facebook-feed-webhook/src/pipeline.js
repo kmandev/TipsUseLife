@@ -31,12 +31,16 @@
  * left after reserving the Graph slice; the Graph call has its own abort
  * timeout; a send that cannot fit is not started.
  *
- * SELF-REPLY PROTECTION has two independent layers: author == Page
- * (index.js) and "this event is one of our own stored replies, or nested
- * directly under one" (isOwnReplyEvent, below).
+ * SELF-REPLY PROTECTION has three layers:
+ *   1   author == Page (index.js, isSelfEvent);
+ *   2   "this event is one of our own stored replies, or nested directly
+ *       under one" (isOwnReplyEvent, below);
+ *   2.5 POSSIBLE OWN ECHO (Phase 8.9): an event with NO author, in a thread
+ *       that got a LIVE send attempt whose reply id we do not know, within
+ *       the echo-guard window (isPossibleOwnEchoFailClosed, below).
  */
 
-import { MODE_DRY_RUN, MODE_LIVE, PIPELINE_BUDGET_MS, GRAPH_FINALIZE_MS } from "./config.js";
+import { MODE_DRY_RUN, MODE_LIVE, PIPELINE_BUDGET_MS, GRAPH_FINALIZE_MS, DEFAULT_ECHO_GUARD_WINDOW_SECONDS } from "./config.js";
 import { replyTargetId } from "./facebook.js";
 import { requestAgentReplyWithBackpressure, HermesError } from "./hermes.js";
 import { SYSTEM_PROMPT, buildUserMessage } from "./agent-prompt.js";
@@ -48,6 +52,7 @@ import {
   getMappedProduct,
   hasLiveSendAttempt,
   isOwnReplyEvent,
+  findUnattributedLiveAttemptInThread,
   insertLiveSendMarker,
   finalizeLiveSend,
   authorRecentlyGotLink,
@@ -78,6 +83,13 @@ export async function processCommentEvent(event, { db, env, config }) {
   if (await isOwnReplyEventFailClosed(db, event)) {
     logEvent("event_ignored", { reason: "OWN_REPLY_EVENT", comment_id: event.comment_id });
     return { outcome: OUTCOMES.SKIPPED, reason: "OWN_REPLY_EVENT" };
+  }
+
+  // ---- 0b. Possible own echo, layer 2.5 ------------------------------
+  // Before anything is stored, before Hermes, before any LIVE gate.
+  const echo = await isPossibleOwnEchoFailClosed(db, event, config);
+  if (echo.suppress) {
+    return { outcome: OUTCOMES.SKIPPED, reason: echo.reason };
   }
 
   // ---- 1. Idempotent persistence -------------------------------------
@@ -129,6 +141,43 @@ export async function isOwnReplyEventFailClosed(db, event) {
   } catch {
     return true;
   }
+}
+
+/**
+ * Self-reply protection, layer 2.5 (Phase 8.9). Applies ONLY to events with
+ * no author (`from.id` absent/empty): an event that carries an author is
+ * never touched here -- layer 1 already handles author == Page, and a real
+ * customer must not be suppressed just for commenting in a busy thread.
+ *
+ * Suppress when the event's thread (replyTargetId) received a LIVE send
+ * attempt with no known Facebook reply id within the echo-guard window
+ * (db.findUnattributedLiveAttemptInThread). FAIL CLOSED: if that lookup
+ * fails we cannot prove the event is not our own reply, so it is dropped.
+ *
+ * Logs `event_ignored` with reason POSSIBLE_OWN_ECHO or
+ * POSSIBLE_OWN_ECHO_GUARD_ERROR. Ids only -- never text or author data.
+ *
+ * @returns {Promise<{suppress: boolean, reason?: string, state?: string}>}
+ */
+export async function isPossibleOwnEchoFailClosed(db, event, config, { now = null } = {}) {
+  if (event?.author_id) return { suppress: false };
+
+  const threadId = replyTargetId(event);
+  const pageId = String(config?.pageId || "");
+  const windowSeconds = config?.echoGuardWindowSeconds ?? DEFAULT_ECHO_GUARD_WINDOW_SECONDS;
+  const base = { page_id: pageId, comment_id: event?.comment_id ?? null, thread_id: threadId ?? null };
+
+  let state;
+  try {
+    state = await findUnattributedLiveAttemptInThread(db, { pageId, threadId, windowSeconds, now });
+  } catch {
+    logEvent("event_ignored", { reason: "POSSIBLE_OWN_ECHO_GUARD_ERROR", ...base });
+    return { suppress: true, reason: "POSSIBLE_OWN_ECHO_GUARD_ERROR" };
+  }
+  if (!state) return { suppress: false };
+
+  logEvent("event_ignored", { reason: "POSSIBLE_OWN_ECHO", ...base, guard_state: state });
+  return { suppress: true, reason: "POSSIBLE_OWN_ECHO", state };
 }
 
 /**

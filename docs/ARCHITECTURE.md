@@ -157,8 +157,71 @@ deep). Requires a Page token of someone with the MODERATE task and the
 `pages_manage_engagement` permission. Gates, all mandatory: `REPLY_MODE ===
 "LIVE"` and token present (`config.js`), validated AI output, usable product
 if a link is attached, comment not previously `SENT`, and
-`sendFacebookReply()` re-checks the mode itself. Our own replies come back
-as Page-authored webhook events and are dropped (self-loop protection).
+`sendFacebookReply()` re-checks the mode itself. Our own replies can come
+back as webhook events; see "Self-reply protection" below.
+
+## Self-reply protection (three layers)
+
+A reply the Worker posts may come back from Meta as a new comment event (an
+*echo*). Processing it would make the AI answer itself. Three independent
+layers drop such events; none of them sends anything, and LIVE stays
+separately gated (`REPLY_MODE === "LIVE"` + token + all LIVE gates).
+
+| Layer | Where | Drops an event when | On lookup error |
+|---|---|---|---|
+| 1 | `index.js` → `facebook.js isSelfEvent` | `from.id` equals `PAGE_ID` (or `PAGE_ID` is unknown) | n/a (no lookup) |
+| 2 | `pipeline.js isOwnReplyEventFailClosed` → `db.js isOwnReplyEvent` | its comment id or parent id equals a **stored** `replies.facebook_reply_id` | drop (fail closed) |
+| 2.5 | `pipeline.js isPossibleOwnEchoFailClosed` → `db.js findUnattributedLiveAttemptInThread` (Phase 8.9) | it has **no author** (`from.id` absent/empty) **and** its thread received a LIVE send attempt whose reply id is unknown, within the echo-guard window | drop (fail closed) |
+
+**Why layer 2.5 exists.** Layer 1 needs `from.id`; layer 2 needs the reply
+id Graph returned. Three LIVE states leave `facebook_reply_id` NULL:
+`GENERATED`+`GRAPH_SEND_IN_PROGRESS` (send started, outcome not yet recorded
+— or recording failed), `GENERATED`+`GRAPH_OUTCOME_UNKNOWN:*` (timeout /
+network / 5xx; the reply may exist) and `SENT`+`SENT_ID_UNPARSEABLE` (the
+reply exists, its id was unreadable). An echo of such a reply that also
+arrives without `from` would pass layers 1 and 2 and be answered again
+(demonstrated by tests in Phases 8.6/8.7). Layer 2.5 closes that path.
+
+**Scope (policy P1).** Only events with **no author** are ever examined.
+An event with a real `from.id` is never suppressed by layer 2.5, even in a
+thread that just received a LIVE send. A missing `from.id` on its own is not
+treated as "self" — the event is dropped only when the thread condition
+below also holds.
+
+**Thread identity (deterministic ids only).** The thread is where a reply is
+posted (`facebook.js replyTargetId`): the parent comment when the parent is
+not the post itself (nested reply), otherwise the comment's own id
+(top-level; parent = post or NULL). The stored side is derived the same way
+from `comments.facebook_parent_id` / `facebook_post_id` /
+`facebook_comment_id` in SQL. Matching is thread-level on purpose: a nested
+customer reply N under T is answered **under T**, so its echo carries parent
+T, not N — a comment-level match would miss it. The lookup is also scoped to
+`comments.page_id`. **No message text, no similarity, no timestamps as
+identity.**
+
+**Window.** `ECHO_GUARD_WINDOW_SECONDS`, default **600 s**, inclusive on both
+ends: `now − window ≤ replies.created_at ≤ now`. An attempt exactly 600 s old
+still matches; 601 s does not; a row in the future does not. In production
+`now` is D1's own `datetime('now')` — the same clock that wrote
+`created_at` — so Worker/D1 clock skew cannot hide a fresh row. The value is
+a policy default, not derived from measured echo timing (no such timing was
+available; Phase 8.8.1).
+
+**Placement.** After layer 2 and **before** `insertCommentIfNew`: a
+suppressed event is never stored, never reaches Hermes, never reaches any
+LIVE gate or Graph. Operator recovery (`recovery.js recoverComment`) runs the
+same helper after its layer-2 check and refuses with `NOT_ELIGIBLE`.
+
+**Evidence limits.** Production evidence could **not** verify the raw shape
+of a real Page-reply echo (whether Meta includes `from.id`, and exactly
+which comment `parent_id` points to): the Worker does not store raw
+payloads, historical Workers Logs are not reachable through a documented
+path, and production D1 held no LIVE rows (Phase 8.8.1). Nothing here
+assumes Meta always sends or always omits `from.id`. The parent-id
+assumption rests on the repository's one-level threading model
+(`replyTargetId`).
+
+No schema change: layer 2.5 reads existing `comments` + `replies` rows.
 
 Link-spam guard: if the same author already received the same affiliate URL
 on the same post in the last 24 h, the new reply is skipped
@@ -175,6 +238,7 @@ constraint.
 | Accidental re-request to Hermes | `Idempotency-Key` cache (5 min) |
 | Double Facebook post | LIVE gate `hasSentReply` + partial `UNIQUE INDEX replies(comment_id) WHERE status='SENT'` |
 | Graph API failure | recorded `FAILED`, never retried automatically |
+| Echo of our own reply answered again | self-reply layers 1, 2 and 2.5 (see "Self-reply protection") |
 | D1 unavailable at insert | model never invoked |
 
 ## Data model (D1 `tipsuselife-ai`)

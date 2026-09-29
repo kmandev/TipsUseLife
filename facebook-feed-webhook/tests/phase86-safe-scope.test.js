@@ -2,10 +2,11 @@
  * Phase 8.6 -- safe-scope tests from the Facebook write readiness audit.
  *
  * These tests LOCK CURRENT BEHAVIOUR. They change no production code.
- * Two of them deliberately document KNOWN SAFETY GAPS that have not been
- * hardened yet (see "KNOWN GAP" in the test names). When the hardening is
- * approved and implemented, those assertions must be flipped on purpose --
- * a failure there is the signal that behaviour changed.
+ * Phase 8.9 update: the SENT_ID_UNPARSEABLE + missing-from echo gap they
+ * documented is now closed by the layer 2.5 possible-own-echo guard; that
+ * test was flipped on purpose. A missing `from` on its own (no matching
+ * unattributed LIVE attempt in the thread) is still processed -- that is
+ * the approved scope (policy P1), not a gap.
  *
  * No network: Hermes and Graph are fetch stubs (helpers.installFetchMock).
  * No real token: the LIVE runs use a unit-test placeholder.
@@ -85,10 +86,10 @@ test("missing from: the parser keeps the event with author_id = null", () => {
   assert.equal(events[0].author_name, null);
 });
 
-test("KNOWN GAP (not hardened): isSelfEvent() returns false when from is missing -- layer 1 does not treat it as self", () => {
-  // Current behaviour, locked on purpose. Layer 1 can only recognise the
-  // Page when Meta sends from.id; without it, only layer 2 (stored reply
-  // ids) can catch our own reply. Fail-closed hardening is NOT approved yet.
+test("by design (P1): isSelfEvent() returns false when from is missing -- layer 1 does not treat it as self", () => {
+  // Layer 1 recognises the Page only by from.id. A missing author is handled
+  // by layer 2 (stored reply ids) and layer 2.5 (thread + window guard), not
+  // by treating every author-less event as self (policy P1, Phase 8.9).
   assert.equal(isSelfEvent({ author_id: null }, TEST_PAGE_ID), false);
   assert.equal(isSelfEvent({ author_id: undefined }, TEST_PAGE_ID), false);
   // Contrast: the cases layer 1 does catch today.
@@ -96,7 +97,7 @@ test("KNOWN GAP (not hardened): isSelfEvent() returns false when from is missing
   assert.equal(isSelfEvent({ author_id: null }, ""), true, "unknown Page id still fails closed");
 });
 
-test("KNOWN GAP (not hardened): a webhook event without from is processed like a customer comment (DRY_RUN, no Graph)", async () => {
+test("by design (P1): an author-less event with no unattributed LIVE attempt in its thread is processed (DRY_RUN, no Graph)", async () => {
   const db = createFakeD1();
   const { mock, body } = await deliver(db, { comment_id: "853313081388711_8602", from: undefined });
   assert.equal(body.status, "accepted");
@@ -130,25 +131,20 @@ test("SENT_ID_UNPARSEABLE: the echo of our reply WITH from.id == Page is still i
   assert.equal(db._query("SELECT COUNT(*) n FROM replies WHERE mode = 'LIVE'")[0].n, 1);
 });
 
-test("KNOWN GAP (not hardened): after SENT_ID_UNPARSEABLE, an echo WITHOUT from is not recognised and gets a second LIVE reply", async () => {
-  // Current behaviour, locked on purpose so the gap stays visible:
-  //   layer 1 cannot match (no from.id), layer 2 cannot match (no stored
-  //   facebook_reply_id), and the echo is a NEW comment row, so
-  //   hasLiveSendAttempt() does not block it either. Each further echo with
-  //   the same two conditions would repeat this -- a potential loop.
-  // Both conditions must hold at once; the tests above show that either
-  // from.id or a parsed reply id is enough to stop it.
+test("FIXED in 8.9: after SENT_ID_UNPARSEABLE, an echo WITHOUT from is suppressed by layer 2.5 -- no second LIVE reply", async () => {
+  // Formerly a KNOWN GAP (layer 1: no from.id; layer 2: no stored reply id;
+  // the echo is a new row so hasLiveSendAttempt() does not block it).
+  // Layer 2.5 now matches the thread's unattributed SENT row.
   const db = createFakeD1();
   await sendWithUnparseableId(db);
   const echo = await deliver(
     db,
     { comment_id: "853313081388711_9702", parent_id: "853313081388711_8701", from: undefined, message: OK.reply_text },
-    { env: LIVE_ENV, graph: () => jsonResponse({ id: "853313081388711_9703" }) }
+    { env: LIVE_ENV, graph: () => assert.fail("no second send") }
   );
-  assert.equal(echo.mock.calls.length, 2, "one Hermes call + one Graph call for our own echo");
-  assert.equal(echo.mock.graphCalls().length, 1);
-  assert.equal(db._query("SELECT COUNT(*) n FROM comments")[0].n, 2, "echo stored as a new comment");
-  assert.equal(db._query("SELECT COUNT(*) n FROM replies WHERE mode = 'LIVE' AND status = 'SENT'")[0].n, 2, "second LIVE reply");
+  assert.equal(echo.mock.calls.length, 0, "no Hermes, no Graph");
+  assert.equal(db._query("SELECT COUNT(*) n FROM comments")[0].n, 1, "echo not stored");
+  assert.equal(db._query("SELECT COUNT(*) n FROM replies WHERE mode = 'LIVE'")[0].n, 1, "still exactly one LIVE row");
 });
 
 test("SENT_ID_UNPARSEABLE: redelivery of the ORIGINAL customer comment is still blocked (no second send)", async () => {

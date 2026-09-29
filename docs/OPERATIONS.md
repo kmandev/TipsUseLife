@@ -17,6 +17,7 @@ or command lines; pipe them or use the interactive prompt.
 | Hermes concurrency | Pi config | Hermes `api_server` runs at most `gateway.api_server.max_concurrent_runs` (default **10**) agent runs at once and answers the rest `429 Retry-After: 1` before any run starts. The Worker retries **only** that 429: at most 4 attempts, 1–3 s backoff + up to 1 s jitter, all inside the Hermes budget (`HERMES_TIMEOUT_MS`, 20 s) (log event `hermes_busy_backoff`). Timeouts, network errors and 5xx are never retried. Measured (Phase 7.1): 1–10 concurrent comments → 0 errors; above 10 the excess used to fail as `HERMES_BUSY`. |
 | `GRAPH_API_VERSION` | var | `v21.0` (available until 2027-01-21) |
 | `MAX_REPLY_LENGTH` | var | `300` — max AI text length (link excluded) |
+| `ECHO_GUARD_WINDOW_SECONDS` | var, optional | default `600` (not set in `wrangler.jsonc`). Self-reply layer 2.5: an event **with no author** is dropped (`event_ignored` `POSSIBLE_OWN_ECHO`, with `thread_id` and `guard_state`) if its thread got a LIVE send attempt with no known reply id (`GRAPH_SEND_IN_PROGRESS`, `GRAPH_OUTCOME_UNKNOWN:*`, `SENT_ID_UNPARSEABLE`) within this many seconds, inclusive. A D1 read error drops the event too (`POSSIBLE_OWN_ECHO_GUARD_ERROR`). Events with a `from.id` are never affected. Invalid values fall back to 600. See `docs/ARCHITECTURE.md` → "Self-reply protection". |
 | `AFFILIATE_ALLOWED_HOSTS` | var, optional | comma list; default Shopee/Lazada/TikTok short-link hosts |
 | `META_APP_SECRET` | secret | Meta webhook signature |
 | `META_VERIFY_TOKEN` | secret | Meta subscription handshake |
@@ -38,7 +39,9 @@ Retry = `POST /admin/api/comments/:id/retry` (session + same-origin JSON). It cl
 
 **Never recoverable** (no button; the dashboard shows "ตรวจสอบโพสต์บน Facebook ก่อน — ห้าม Retry" for the first two): LIVE `GENERATED` + `GRAPH_OUTCOME_UNKNOWN:*`, LIVE `GENERATED` + `GRAPH_SEND_IN_PROGRESS`, LIVE `SENT`, LIVE `FAILED`, any DRY_RUN reply, any other reply state, anything older than 24 h (e.g. the historical test ERROR rows).
 
-`GET /admin/api/health` (session): ERROR 1 h / 24 h / total, recoverable ERROR and stale RECEIVED, stale RECEIVED (+ oldest), LIVE GENERATED / outcome-unknown / send-in-progress (+ oldest), LIVE FAILED 4xx / total (+ oldest), LIVE SENT, DRY_RUN GENERATED, totals. Counts and timestamps only — no text, URLs or secrets. Alerting is **not** implemented yet (channel is an operator decision); this endpoint is its data source.
+Recovery also runs the self-reply layers 2 and 2.5: a stored comment that looks like our own echo is refused with `409 NOT_ELIGIBLE` and reason `OWN_REPLY_EVENT`, `POSSIBLE_OWN_ECHO` or `POSSIBLE_OWN_ECHO_GUARD_ERROR`.
+
+`GET /admin/api/health` (session): ERROR 1 h / 24 h / total, recoverable ERROR and stale RECEIVED, stale RECEIVED (+ oldest), LIVE GENERATED / outcome-unknown / send-in-progress (+ oldest), LIVE FAILED 4xx / total (+ oldest), LIVE SENT, LIVE SENT with unreadable reply id (`live_sent_id_unparseable`), DRY_RUN GENERATED, totals. Suppressed echoes are not stored, so they are not counted here — they appear only as `event_ignored` log lines (`POSSIBLE_OWN_ECHO`, `POSSIBLE_OWN_ECHO_GUARD_ERROR`). Counts and timestamps only — no text, URLs or secrets. Alerting is **not** implemented yet (channel is an operator decision); this endpoint is its data source.
 
 ### Hermes concurrency evidence (W4 — no change made)
 
