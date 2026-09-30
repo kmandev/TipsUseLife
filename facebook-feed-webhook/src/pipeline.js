@@ -267,7 +267,9 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
   }
 
   if (evaluation.action === ACTIONS.SKIP) {
-    logEvent("ai_action_skip", { ...base, duration_ms: Date.now() - startedAt });
+    // skip_reason: the validated model reason (already cut to 60 chars by
+    // validateAgentResponse), whitespace-normalised and bounded again here.
+    logEvent("ai_action_skip", { ...base, duration_ms: Date.now() - startedAt, skip_reason: safeText(evaluation.skipReason, 60) });
     await recordSkip(db, config, {
       commentRowId,
       productId,
@@ -393,6 +395,9 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
     return { outcome: OUTCOMES.ERROR, reason: "SEND_MARKER_NOT_WRITTEN" };
   }
 
+  // Telemetry only: graphTimeoutMs above is the single source of truth for
+  // the timeout actually passed to sendFacebookReply.
+  const graphStartedAt = monotonicNow();
   let sent;
   try {
     sent = await sendFacebookReply(
@@ -407,17 +412,34 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
     const outcome = ambiguous
       ? { status: "GENERATED", errorMessage: `GRAPH_OUTCOME_UNKNOWN:${category}` }
       : { status: "FAILED", errorMessage: category };
-    logError(ambiguous ? "reply_send_ambiguous" : "reply_send_failed", category, { ...base, status_code: error?.statusCode ?? null });
+    logError(ambiguous ? "reply_send_ambiguous" : "reply_send_failed", category, {
+      ...base,
+      status_code: error?.statusCode ?? null,
+      graph_elapsed_ms: elapsedMsSince(graphStartedAt),
+      effective_timeout_ms: graphTimeoutMs,
+    });
     await finalizeQuietly(db, markerId, outcome, base);
     await updateOutcomeQuietly(db, commentRowId, { status: "ERROR", aiResponse: final.text, matchedProductId: productId, productSource, aiAction: ACTIONS.REPLY });
     return { outcome: OUTCOMES.ERROR, reason: ambiguous ? "GRAPH_OUTCOME_UNKNOWN" : category };
   }
 
   // HTTP 2xx: the reply exists. Record it; the id is optional evidence.
+  const graphElapsedMs = elapsedMsSince(graphStartedAt);
   await finalizeQuietly(db, markerId, { status: "SENT", facebookReplyId: sent.id || null, errorMessage: sent.id ? null : "SENT_ID_UNPARSEABLE" }, base);
   await updateOutcomeQuietly(db, commentRowId, { status: "REPLIED", aiResponse: final.text, matchedProductId: productId, productSource, aiAction: ACTIONS.REPLY });
-  logEvent("reply_sent", { ...base, mode: MODE_LIVE, has_link: Boolean(final.affiliateUrl), has_reply_id: Boolean(sent.id), duration_ms: Date.now() - startedAt });
+  logEvent("reply_sent", { ...base, mode: MODE_LIVE, has_link: Boolean(final.affiliateUrl), has_reply_id: Boolean(sent.id), duration_ms: Date.now() - startedAt, graph_elapsed_ms: graphElapsedMs, effective_timeout_ms: graphTimeoutMs });
   return { outcome: OUTCOMES.REPLIED, mode: MODE_LIVE };
+}
+
+/** Monotonic clock for durations (performance.now when the runtime has it). */
+function monotonicNow() {
+  const perf = globalThis.performance;
+  return perf && typeof perf.now === "function" ? perf.now() : Date.now();
+}
+
+/** Whole milliseconds since a monotonicNow() reading; never negative. */
+function elapsedMsSince(start) {
+  return Math.max(0, Math.round(monotonicNow() - start));
 }
 
 /** Hermes gets what is left of the pipeline budget after the Graph slice. */
