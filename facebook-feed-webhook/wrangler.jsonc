@@ -19,7 +19,11 @@
     "HERMES_URL": "https://hermes-feed.cloudnext.icu/v1/chat/completions",
     "HERMES_TIMEOUT_MS": "20000",
     "GRAPH_API_VERSION": "v21.0",
-    "MAX_REPLY_LENGTH": "300"
+    "MAX_REPLY_LENGTH": "300",
+    // Graph send abort (ms). Phase 8.29: both real LIVE sends hit the 5000 ms
+    // default while Facebook still posted the reply. Hermes budget shrinks by
+    // the same amount (pipeline.js hermesBudgetMs).
+    "GRAPH_TIMEOUT_MS": "10000"
   },
 
   "d1_databases": [
