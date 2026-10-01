@@ -405,11 +405,22 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
   // left of the pipeline budget minus the late-finalize reserve.
   const observeUntilMs = lateObserveUntilMs(config, graphTimeoutMs, PIPELINE_BUDGET_MS - (Date.now() - startedAt));
   const graphStartedAt = monotonicNow();
+  // Phase 8.50: header timing + Facebook trace ids of an early response (telemetry only).
+  let responseMeta = null;
   let sent;
   try {
     sent = await sendFacebookReply(
       { commentId: replyTargetId(event), message: final.text },
-      { mode: config.mode, accessToken: env.PAGE_ACCESS_TOKEN, graphApiVersion: config.graphApiVersion, timeoutMs: graphTimeoutMs, observeUntilMs }
+      {
+        mode: config.mode,
+        accessToken: env.PAGE_ACCESS_TOKEN,
+        graphApiVersion: config.graphApiVersion,
+        timeoutMs: graphTimeoutMs,
+        observeUntilMs,
+        onResponseHeaders: (meta) => {
+          responseMeta = meta;
+        },
+      }
     );
   } catch (error) {
     const ambiguous = !(error instanceof FacebookSendError) || error.ambiguous;
@@ -440,7 +451,19 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
   const graphElapsedMs = elapsedMsSince(graphStartedAt);
   await finalizeQuietly(db, markerId, { status: "SENT", facebookReplyId: sent.id || null, errorMessage: sent.id ? null : "SENT_ID_UNPARSEABLE" }, base);
   await updateOutcomeQuietly(db, commentRowId, { status: "REPLIED", aiResponse: final.text, matchedProductId: productId, productSource, aiAction: ACTIONS.REPLY });
-  logEvent("reply_sent", { ...base, mode: MODE_LIVE, has_link: Boolean(final.affiliateUrl), has_reply_id: Boolean(sent.id), duration_ms: Date.now() - startedAt, graph_elapsed_ms: graphElapsedMs, effective_timeout_ms: graphTimeoutMs });
+  logEvent("reply_sent", {
+    ...base,
+    mode: MODE_LIVE,
+    has_link: Boolean(final.affiliateUrl),
+    has_reply_id: Boolean(sent.id),
+    duration_ms: Date.now() - startedAt,
+    graph_elapsed_ms: graphElapsedMs, // dispatch -> sendFacebookReply returned (includes body read)
+    effective_timeout_ms: graphTimeoutMs,
+    headers_ms: responseMeta?.headersMs ?? null, // dispatch -> response headers (Phase 8.50)
+    status_code: responseMeta?.statusCode ?? null,
+    fb_trace_id: responseMeta?.traceId ?? null,
+    fb_request_id: responseMeta?.requestId ?? null,
+  });
   return { outcome: OUTCOMES.REPLIED, mode: MODE_LIVE };
 }
 

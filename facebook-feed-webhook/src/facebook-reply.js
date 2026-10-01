@@ -63,9 +63,11 @@ export class FacebookSendError extends Error {
 
 /**
  * @param {{commentId: string, message: string}} input
- * @param {{mode: string, accessToken: string, graphApiVersion: string, timeoutMs?: number, observeUntilMs?: number, fetchImpl?: typeof fetch, clock?: () => number}} options
+ * @param {{mode: string, accessToken: string, graphApiVersion: string, timeoutMs?: number, observeUntilMs?: number, fetchImpl?: typeof fetch, clock?: () => number, onResponseHeaders?: (meta: {headersMs: number, statusCode: number|null, traceId: string|null, requestId: string|null}) => void}} options
  *        timeoutMs = ambiguity threshold; observeUntilMs (Phase 8.44) = hard
  *        deadline for the SAME request (<= timeoutMs: pre-8.44 behaviour).
+ *        onResponseHeaders (Phase 8.50, observability only) is called once
+ *        when headers arrive BEFORE the threshold, with sanitized metadata.
  * @returns {Promise<{id: string|null}>} resolves ONLY on HTTP 2xx; `id` is
  *          null when the body could not be parsed (the send still succeeded).
  * @throws {LiveModeViolationError} before any network activity outside LIVE
@@ -82,6 +84,7 @@ export async function sendFacebookReply(input, options) {
     observeUntilMs = 0,
     fetchImpl = fetch,
     clock = monotonicClock,
+    onResponseHeaders = null,
   } = options || {};
 
   // GUARD 2 -- refuse outright unless explicitly in LIVE mode.
@@ -178,6 +181,8 @@ export async function sendFacebookReply(input, options) {
     clearTimeout(timer);
     response = first.response;
   }
+  // Headers arrived before the threshold: elapsed since dispatch, before any body read.
+  reportResponseHeaders(onResponseHeaders, response, Math.max(0, Math.round(clock() - startedAt)));
 
   if (response.status >= 200 && response.status < 300) {
     // HTTP 2xx IS the success signal. The body is only read to capture the
@@ -219,6 +224,35 @@ function safeTraceHeader(response, name) {
   }
 }
 
+/** Fire-and-forget body release; never throws, never rejects unhandled. */
+function discardBody(response) {
+  try {
+    const pending = response?.body?.cancel?.();
+    if (pending && typeof pending.catch === "function") pending.catch(() => {});
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Phase 8.50 -- observability only. Report the early response's header
+ * timing and Facebook's opaque trace ids to the caller. Can never change the
+ * send outcome: any error in the callback is swallowed.
+ */
+function reportResponseHeaders(onResponseHeaders, response, headersMs) {
+  if (typeof onResponseHeaders !== "function") return;
+  try {
+    onResponseHeaders({
+      headersMs,
+      statusCode: Number(response?.status) || null,
+      traceId: safeTraceHeader(response, "x-fb-trace-id"),
+      requestId: safeTraceHeader(response, "x-fb-request-id"),
+    });
+  } catch {
+    /* observability must never affect the send */
+  }
+}
+
 /**
  * Phase 8.44 -- keep observing the ONE request after the ambiguity
  * threshold. Never issues a request, never rejects. Bounded by the hard
@@ -246,11 +280,9 @@ async function observeLateResponse(request, { controller, timer, startedAt, cloc
   };
   if (!(response.status >= 200 && response.status < 300)) {
     clearTimeout(timer);
-    try {
-      await response.body?.cancel?.();
-    } catch {
-      /* ignore */
-    }
+    // Phase 8.50 (L1): release the body WITHOUT awaiting it -- cleanup must
+    // never hold the late observation (and its log line) open.
+    discardBody(response);
     return { ...base, id: null, bodyError: null, totalMs: elapsed() };
   }
   let id = null;
