@@ -14,6 +14,8 @@
  *   GET    /admin/api/health              operational counts (Phase 8.2)
  *   GET    /admin/api/recovery            rows needing operator attention
  *   POST   /admin/api/comments/:id/retry  operator recovery of ONE comment
+ *   POST   /admin/api/comments/:id/reconcile  link an AMBIGUOUS LIVE send to the
+ *          reply Facebook already created (read-only Graph GET + CAS; no POST)
  *
  * Every write validates its input here, before D1, and never echoes
  * exception text. REPLY_MODE is deliberately NOT writable from here: moving
@@ -38,7 +40,7 @@ import {
   overviewStats,
 } from "./admin-db.js";
 import { logEvent, logError } from "./log.js";
-import { recoverComment, listRecoveryAttention, healthStats } from "./recovery.js";
+import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
 
 const PLATFORMS = ["shopee", "lazada", "tiktok", "other"];
 const CONTENT_TYPES = ["POST", "REEL"];
@@ -174,6 +176,10 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
   // POST /admin/api/comments/:id/retry -- the only 3-segment route.
   if (resource === "comments" && extra === "retry" && tooDeep === undefined) {
     return handleRetry(request, db, env, config, idSegment, ctx);
+  }
+  // POST /admin/api/comments/:id/reconcile -- read-only Graph lookup + CAS.
+  if (resource === "comments" && extra === "reconcile" && tooDeep === undefined) {
+    return handleReconcile(request, db, env, config, idSegment);
   }
   if (extra !== undefined) return apiError(404, "NOT_FOUND", "Not found");
 
@@ -370,5 +376,47 @@ async function handleRetry(request, db, env, config, idSegment, ctx) {
       },
     },
     RETRY_HTTP_STATUS[result.status] ?? 409
+  );
+}
+
+/**
+ * POST /admin/api/comments/:id/reconcile (Phase 8.36). Operator-triggered,
+ * one comment. Read-only Graph lookup + one compare-and-set; it never posts
+ * to Facebook and never retries a send. Session + same-origin/JSON CSRF
+ * checks already ran in admin.js. Safe to repeat: a reconciled row is SENT
+ * and answers NOT_ELIGIBLE. Response: ids and reasons only -- no text,
+ * no Graph body, no secrets.
+ */
+async function handleReconcile(request, db, env, config, idSegment) {
+  if (request.method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+  const id = parseId(idSegment);
+  if (!id) return apiError(400, "INVALID_ID", "Invalid comment id");
+
+  let result;
+  try {
+    result = await reconcileComment(id, { db, env, config });
+  } catch {
+    logError("admin_reconcile_failed", "UNHANDLED_EXCEPTION", { comment_row_id: id });
+    return apiError(500, "INTERNAL_ERROR", "Internal error");
+  }
+  if (!result.commentFound) return apiError(404, "NOT_FOUND", "Comment not found");
+
+  logEvent("admin_reconcile", { comment_row_id: id, reason: result.reason, detail: result.detail ?? null });
+  const status =
+    result.reason === RECONCILE_REASONS.RECONCILED ? 200 : String(result.reason).startsWith("GRAPH_READ_") ? 502 : 409;
+  return apiJson(
+    {
+      data: {
+        id,
+        reason: result.reason,
+        detail: result.detail ?? null,
+        reply_row_id: result.replyRowId ?? null,
+        facebook_reply_id: result.reason === RECONCILE_REASONS.RECONCILED ? result.facebookReplyId : null,
+        comment_status_updated: result.commentStatusUpdated ?? null,
+        candidates: result.candidates ?? null,
+        mode: config.mode,
+      },
+    },
+    status
   );
 }

@@ -25,6 +25,9 @@
 
 import { runPersistedComment, isOwnReplyEventFailClosed, isPossibleOwnEchoFailClosed, OUTCOMES } from "./pipeline.js";
 import { logEvent, logError } from "./log.js";
+import { replyTargetId } from "./facebook.js";
+import { fetchCommentReplies, FacebookReadError, DEFAULT_RECONCILE_TIMEOUT_MS } from "./facebook-reply.js";
+import { getReconcileCandidate, findLinkedFacebookReplyIds, reconcileAmbiguousSend, markCommentReconciled } from "./db.js";
 
 export const RECOVERY_WINDOW = "-24 hours";
 export const STALE_RECEIVED = "-2 minutes";
@@ -242,4 +245,205 @@ export async function healthStats(db, pageId) {
   const out = {};
   for (const [k, v] of Object.entries(row ?? {})) out[k] = k.endsWith("_oldest") ? (v ?? null) : Number(v ?? 0);
   return out;
+}
+
+/* ===================================================================
+ * Phase 8.36 -- operator reconciliation of an AMBIGUOUS LIVE send.
+ *
+ * GRAPH_OUTCOME_UNKNOWN means the HTTP outcome of the POST was not
+ * observed -- NOT that Facebook failed. Incident: row 245 (2026-10-01):
+ * POST started 05:53:35.5Z, Facebook created the Page reply at 05:53:36Z,
+ * the Worker timed out at 05:53:45.5Z.
+ *
+ *   AMBIGUOUS -> no automatic retry -> operator reconcile
+ *     -> read-only Graph GET of the thread -> strict match
+ *     -> compare-and-set -> SENT + facebook_reply_id
+ *   anything else -> row unchanged, still ambiguous, still never retried.
+ *
+ * This path contains NO Graph POST and never calls sendFacebookReply.
+ * =================================================================== */
+
+export const RECONCILE_REASONS = Object.freeze({
+  NOT_ELIGIBLE: "NOT_ELIGIBLE",
+  NOT_FOUND: "NOT_FOUND",
+  MULTIPLE_MATCHES: "MULTIPLE_MATCHES",
+  INCOMPLETE: "INCOMPLETE",
+  GRAPH_READ_4XX: "GRAPH_READ_4XX",
+  GRAPH_READ_5XX: "GRAPH_READ_5XX",
+  GRAPH_READ_TIMEOUT: "GRAPH_READ_TIMEOUT",
+  GRAPH_READ_NETWORK_ERROR: "GRAPH_READ_NETWORK_ERROR",
+  GRAPH_READ_MALFORMED: "GRAPH_READ_MALFORMED",
+  CAS_LOST: "CAS_LOST",
+  RECONCILED: "RECONCILED",
+});
+
+/**
+ * Match window around the send marker's created_at (the marker is written
+ * immediately before the POST). Asymmetric on purpose: a reply cannot be
+ * created BEFORE its request, so the lower bound only absorbs clock skew
+ * between Facebook and D1 (120 s); Facebook may still create the reply
+ * AFTER our timeout (slow processing), so the upper bound is wider (15 min).
+ */
+export const RECONCILE_WINDOW_BEFORE_S = 120;
+export const RECONCILE_WINDOW_AFTER_S = 15 * 60;
+
+/** Exact match after trim + whitespace/newline collapse. No fuzzing. */
+export function normalizeReplyText(text) {
+  return String(text ?? "").replace(/\s+/g, " ").trim();
+}
+
+/** D1 "YYYY-MM-DD HH:MM:SS" (UTC) or Graph "...+0000" -> epoch ms, or NaN. */
+export function parseTimestamp(value) {
+  if (typeof value !== "string" || !value) return NaN;
+  let s = value.trim();
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) s = `${s.replace(" ", "T")}Z`;
+  s = s.replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+  return Date.parse(s);
+}
+
+/**
+ * Pure matching (rules 1-4, 6). Rule 5 (global uniqueness) is applied by
+ * the caller with the `linkedIds` set.
+ * @returns {Array<any>} the candidates that pass every rule
+ */
+export function selectReconcileMatches(items, { pageId, targetId, markerCreatedAt, responseText, linkedIds = new Set() }) {
+  const marker = parseTimestamp(markerCreatedAt);
+  if (!Number.isFinite(marker)) return [];
+  const want = normalizeReplyText(responseText);
+  if (!want) return [];
+  return (items || []).filter((it) => {
+    if (!it || it.fromId !== String(pageId)) return false; // 1. Page author
+    if (it.parentId !== null && it.parentId !== targetId) return false; // 2. same thread
+    const t = parseTimestamp(it.createdTime); // 3. time window
+    if (!Number.isFinite(t)) return false;
+    if (t < marker - RECONCILE_WINDOW_BEFORE_S * 1000) return false;
+    if (t > marker + RECONCILE_WINDOW_AFTER_S * 1000) return false;
+    if (normalizeReplyText(it.message) !== want) return false; // 4. exact text
+    if (linkedIds.has(it.id)) return false; // 5. not linked elsewhere
+    return true;
+  });
+}
+
+function isReconcilableReply(r) {
+  return (
+    r &&
+    r.mode === "LIVE" &&
+    r.status === "GENERATED" &&
+    (r.facebook_reply_id === null || r.facebook_reply_id === undefined) &&
+    (r.error_message === "GRAPH_SEND_IN_PROGRESS" || String(r.error_message || "").startsWith("GRAPH_OUTCOME_UNKNOWN:"))
+  );
+}
+
+/**
+ * Operator reconciliation of ONE comment's ambiguous LIVE send.
+ * Safe to call repeatedly: once reconciled the row is SENT and therefore
+ * NOT_ELIGIBLE.
+ *
+ * @param {number} commentRowId
+ * @param {{db: any, env: any, config: any, reconcileTimeoutMs?: number}} deps
+ * @returns {Promise<{reason: string, detail?: string, commentFound: boolean, replyRowId?: number,
+ *   facebookReplyId?: string, candidates?: number, commentStatusUpdated?: boolean, statusCode?: number|null}>}
+ */
+export async function reconcileComment(commentRowId, { db, env, config, reconcileTimeoutMs = DEFAULT_RECONCILE_TIMEOUT_MS }) {
+  const base = { comment_row_id: commentRowId };
+  const done = (result) => {
+    if (result.reason === RECONCILE_REASONS.RECONCILED) {
+      logEvent("reply_reconciled", {
+        ...base,
+        reply_row_id: result.replyRowId,
+        facebook_reply_id: result.facebookReplyId,
+        created_delta_s: result.createdDeltaS ?? null,
+        comment_status_updated: result.commentStatusUpdated,
+      });
+    } else {
+      logEvent("reply_reconcile_skipped", {
+        ...base,
+        reason: result.reason,
+        detail: result.detail ?? null,
+        reply_row_id: result.replyRowId ?? null,
+        candidates: result.candidates ?? null,
+        status_code: result.statusCode ?? null,
+      });
+    }
+    return result;
+  };
+
+  const state = await getReconcileCandidate(db, commentRowId);
+  if (!state) return done({ reason: RECONCILE_REASONS.NOT_ELIGIBLE, detail: "COMMENT_NOT_FOUND", commentFound: false });
+  const { comment, replies } = state;
+  if (String(comment.page_id) !== String(config.pageId)) {
+    return done({ reason: RECONCILE_REASONS.NOT_ELIGIBLE, detail: "PAGE_MISMATCH", commentFound: true });
+  }
+  const eligible = replies.filter(isReconcilableReply);
+  if (eligible.length !== 1) {
+    return done({
+      reason: RECONCILE_REASONS.NOT_ELIGIBLE,
+      detail: eligible.length === 0 ? "NO_AMBIGUOUS_LIVE_SEND" : "MULTIPLE_AMBIGUOUS_ROWS",
+      commentFound: true,
+    });
+  }
+  const reply = eligible[0];
+  if (!env?.PAGE_ACCESS_TOKEN) {
+    return done({ reason: RECONCILE_REASONS.NOT_ELIGIBLE, detail: "NO_PAGE_ACCESS_TOKEN", commentFound: true, replyRowId: Number(reply.id) });
+  }
+
+  const targetId = replyTargetId({
+    comment_id: comment.facebook_comment_id,
+    post_id: comment.facebook_post_id ?? null,
+    parent_id: comment.facebook_parent_id ?? null,
+  });
+
+  let listing;
+  try {
+    // READ ONLY. No POST exists on this path.
+    listing = await fetchCommentReplies(targetId, {
+      accessToken: env.PAGE_ACCESS_TOKEN,
+      graphApiVersion: config.graphApiVersion,
+      timeoutMs: reconcileTimeoutMs,
+    });
+  } catch (error) {
+    const reason = error instanceof FacebookReadError && RECONCILE_REASONS[error.category] ? error.category : RECONCILE_REASONS.GRAPH_READ_NETWORK_ERROR;
+    return done({ reason, commentFound: true, replyRowId: Number(reply.id), statusCode: error?.statusCode ?? null });
+  }
+  if (!listing.complete) {
+    return done({ reason: RECONCILE_REASONS.INCOMPLETE, commentFound: true, replyRowId: Number(reply.id) });
+  }
+
+  const linkedIds = await findLinkedFacebookReplyIds(db, listing.items.map((it) => it.id));
+  const matches = selectReconcileMatches(listing.items, {
+    pageId: config.pageId,
+    targetId,
+    markerCreatedAt: reply.created_at,
+    responseText: reply.response_text,
+    linkedIds,
+  });
+  if (matches.length === 0) return done({ reason: RECONCILE_REASONS.NOT_FOUND, commentFound: true, replyRowId: Number(reply.id), candidates: 0 });
+  if (matches.length > 1) {
+    return done({ reason: RECONCILE_REASONS.MULTIPLE_MATCHES, commentFound: true, replyRowId: Number(reply.id), candidates: matches.length });
+  }
+
+  const match = matches[0];
+  const won = await reconcileAmbiguousSend(db, Number(reply.id), match.id);
+  if (!won) return done({ reason: RECONCILE_REASONS.CAS_LOST, commentFound: true, replyRowId: Number(reply.id), candidates: 1 });
+
+  // The reply row is now the source of truth (SENT + id). The comment
+  // status is display state; a failure here is reported, never hidden.
+  let commentStatusUpdated = false;
+  try {
+    commentStatusUpdated = (await markCommentReconciled(db, commentRowId)) === "REPLIED";
+  } catch {
+    commentStatusUpdated = false;
+  }
+  if (!commentStatusUpdated) logError("reconcile_comment_update_failed", "D1_UPDATE_FAILED", { ...base, reply_row_id: Number(reply.id) });
+
+  const delta = Math.round((parseTimestamp(match.createdTime) - parseTimestamp(reply.created_at)) / 1000);
+  return done({
+    reason: RECONCILE_REASONS.RECONCILED,
+    commentFound: true,
+    replyRowId: Number(reply.id),
+    facebookReplyId: match.id,
+    candidates: 1,
+    createdDeltaS: Number.isFinite(delta) ? delta : null,
+    commentStatusUpdated,
+  });
 }

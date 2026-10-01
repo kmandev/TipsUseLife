@@ -145,17 +145,32 @@ async function handleWebhook(request, env, ctx) {
   // SELF-REPLY LOOP PROTECTION (layer 1) -- drop anything authored by our
   // own Page. Layer 2 (our stored reply ids) runs in pipeline.js.
   const events = [];
-  let selfSkipped = 0;
+  const selfEvents = [];
   for (const event of pageEvents) {
     if (isSelfEvent(event, config.pageId)) {
-      selfSkipped += 1;
+      selfEvents.push(event);
       continue;
     }
     events.push(event);
   }
+  const selfSkipped = selfEvents.length;
 
   if (selfSkipped > 0) {
-    logEvent("event_ignored", { reason: "SELF_AUTHORED", count: selfSkipped });
+    // Observability only (Phase 8.36): ids + Facebook's created_time, so a
+    // Page reply can be correlated with an ambiguous send. Never text.
+    const ids = selfEvents.slice(0, 10).map((e) => ({
+      comment_id: e.comment_id ?? null,
+      parent_id: e.parent_id ?? null,
+      created_time: e.created_time ?? null,
+    }));
+    logEvent("event_ignored", {
+      reason: "SELF_AUTHORED",
+      count: selfSkipped,
+      comment_id: ids[0].comment_id,
+      parent_id: ids[0].parent_id,
+      created_time: ids[0].created_time,
+      self_events: ids,
+    });
   }
 
   if (events.length === 0) {

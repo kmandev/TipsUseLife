@@ -255,9 +255,41 @@ constraint.
 | Accidental re-request to Hermes | `Idempotency-Key` cache (5 min) |
 | Double Facebook post | LIVE gate `hasLiveSendAttempt` (any LIVE `GENERATED`/`SENT`/`FAILED` row for the comment blocks a new send) + send-started row written before the Graph request + partial `UNIQUE INDEX replies(comment_id) WHERE status='SENT'`. (`db.js` still exports an older `hasSentReply` helper; the pipeline does not use it.) |
 | Graph API failure | Never retried automatically, in any case. A confirmed Graph 4xx rejection (`GRAPH_REJECTED_<status>`) is recorded `FAILED` (confirmed not sent). A 5xx / other non-2xx status (`GRAPH_UNCERTAIN_<status>`), a timeout (`GRAPH_TIMEOUT`) or a network exception (`GRAPH_NETWORK_ERROR`) is ambiguous: recorded `GENERATED` + `GRAPH_OUTCOME_UNKNOWN:<category>`; the reply may already exist on Facebook |
+| Ambiguous send that Facebook did complete | `GRAPH_OUTCOME_UNKNOWN` means the HTTP outcome was **not observed**, not that Facebook failed (incident: row 245, 2026-10-01 — POST 05:53:35.5Z, reply created by Facebook 05:53:36Z, Worker timeout 05:53:45.5Z). Still never retried. An operator may run **reconciliation** (`POST /admin/api/comments/:id/reconcile`, `recovery.js reconcileComment`): read-only `GET /{reply target}/comments` (`facebook-reply.js fetchCommentReplies`, own 8 s deadline covering headers and body, ≤ 2 pages), strict match, one compare-and-set → `SENT` + `facebook_reply_id`, `error_message` `RECONCILED:<previous>`. Anything else leaves the row unchanged |
 | D1 cannot record the send outcome | The reply row can stay `GENERATED` + `GRAPH_SEND_IN_PROGRESS`; `reply_outcome_unrecorded` is logged. Never retried; `hasLiveSendAttempt` and recovery protections block another send |
 | Echo of our own reply answered again | self-reply layers 1, 2 and 2.5 (see "Self-reply protection") |
 | D1 unavailable at insert | model never invoked |
+
+### Ambiguous-send reconciliation (Phase 8.36)
+
+`AMBIGUOUS → no automatic retry → operator reconciliation → read-only Graph
+lookup → strict match → compare-and-set → SENT`. There is no POST on this path.
+
+* **Eligible:** exactly one reply row with `mode=LIVE`, `status=GENERATED`,
+  `facebook_reply_id IS NULL`, `error_message` = `GRAPH_SEND_IN_PROGRESS` or
+  `GRAPH_OUTCOME_UNKNOWN:*`, comment on the configured Page, and a
+  `PAGE_ACCESS_TOKEN` present. Everything else → `NOT_ELIGIBLE`, no network call.
+* **Lookup:** `GET /{GRAPH_API_VERSION}/{replyTargetId}/comments?fields=id,from,created_time,message,parent&order=chronological&limit=100`,
+  Bearer header (never in the URL). At most 2 pages via the `after` cursor; a
+  third page → `INCOMPLETE`. Failures are typed `GRAPH_READ_TIMEOUT` (headers
+  or body), `GRAPH_READ_4XX`, `GRAPH_READ_5XX`, `GRAPH_READ_NETWORK_ERROR`,
+  `GRAPH_READ_MALFORMED`.
+* **Match (all required):** author = Page; listed under the reply target and,
+  if `parent` is returned, parent = reply target; `created_time` within
+  `[marker − 120 s, marker + 15 min]` (a reply cannot precede its request, so
+  the lower side only absorbs clock skew; Facebook may finish late, so the
+  upper side is wider); text equal to the stored `response_text` after trim +
+  whitespace collapse only (no fuzzing, URL and punctuation kept); the Facebook
+  id not already linked to any reply row; **exactly one** candidate (0 →
+  `NOT_FOUND`, >1 → `MULTIPLE_MATCHES`).
+* **Write:** one compare-and-set that re-checks the eligible state and
+  `NOT EXISTS` another row with that `facebook_reply_id`; a loser gets
+  `CAS_LOST`. Then the comment `ERROR`/`RECEIVED` → `REPLIED`; if that second
+  update fails it is reported (`comment_status_updated:false`,
+  `reconcile_comment_update_failed`), never hidden.
+* After reconciliation the row is `SENT` with a known id: layer 2 recognises
+  its echo, recovery reports `ALREADY_SENT`, `hasLiveSendAttempt` still blocks
+  any send. Calling reconcile again answers `NOT_ELIGIBLE`.
 
 ## Data model (D1 `tipsuselife-ai`)
 
@@ -300,7 +332,7 @@ reply_send_ambiguous`.
 
 | Event | Source | Meaning / values |
 |---|---|---|
-| `event_ignored` | `index.js`, `pipeline.js` | Event dropped before processing. `reason`: `NOT_PAGE_EVENT`, `NO_ACTIONABLE_COMMENT`, `PAGE_ID_MISMATCH` (+`count`), `SELF_AUTHORED` (+`count`, layer 1), `OWN_REPLY_EVENT` (layer 2), `POSSIBLE_OWN_ECHO` (layer 2.5, +`thread_id`, `guard_state`), `POSSIBLE_OWN_ECHO_GUARD_ERROR` (layer 2.5 lookup failed, fail closed) |
+| `event_ignored` | `index.js`, `pipeline.js` | Event dropped before processing. `reason`: `NOT_PAGE_EVENT`, `NO_ACTIONABLE_COMMENT`, `PAGE_ID_MISMATCH` (+`count`), `SELF_AUTHORED` (+`count`, layer 1; since Phase 8.36 also `comment_id`, `parent_id`, `created_time` of the first and `self_events` (≤ 10) — ids and Facebook time only, never text), `OWN_REPLY_EVENT` (layer 2), `POSSIBLE_OWN_ECHO` (layer 2.5, +`thread_id`, `guard_state`), `POSSIBLE_OWN_ECHO_GUARD_ERROR` (layer 2.5 lookup failed, fail closed) |
 | `comment_duplicate` | `pipeline.js` | Redelivery of an already stored comment; stops before Hermes |
 | `hermes_busy_backoff` | `pipeline.js` | Hermes answered 429; `attempt`, `delay_ms` before the next bounded retry |
 | `hermes_call_failed` | `pipeline.js` | `error_category`: `HERMES_*` (e.g. `HERMES_TIMEOUT`, `HERMES_BUSY`, `HERMES_HTTP_ERROR`, `HERMES_RESPONSE_NO_CHOICES`); comment → `ERROR` |
@@ -309,6 +341,7 @@ reply_send_ambiguous`.
 | `reply_sent` | `pipeline.js` (LIVE only) | Graph 2xx; `has_reply_id: false` means `SENT_ID_UNPARSEABLE` |
 | `reply_send_failed` | `pipeline.js` (LIVE only) | Graph 4xx, `error_category` `GRAPH_REJECTED_<status>`; confirmed not sent |
 | `reply_send_ambiguous` | `pipeline.js` (LIVE only) | Timeout / network / 5xx (`GRAPH_TIMEOUT`, `GRAPH_NETWORK_ERROR`, `GRAPH_UNCERTAIN_<status>`, or a non-Graph error category); the reply may exist on Facebook; never retried |
+| `reply_reconciled` / `reply_reconcile_skipped` | `recovery.js` (operator) | Reconciliation result: ids, `reason` (`RECONCILED`, `NOT_ELIGIBLE`, `NOT_FOUND`, `MULTIPLE_MATCHES`, `INCOMPLETE`, `GRAPH_READ_*`, `CAS_LOST`), `created_delta_s` on success. No text |
 | `reply_outcome_unrecorded` | `pipeline.js` (LIVE only) | The send outcome could not be written (`D1_UPDATE_FAILED`, +`intended_status`); the row stays `GRAPH_SEND_IN_PROGRESS` |
 | `comment_persist_failed`, `comment_result_update_failed`, `reply_persist_failed`, `product_lookup_failed` | `pipeline.js` | D1 failures (`D1_INSERT_FAILED` / `D1_UPDATE_FAILED` / `D1_SELECT_FAILED`) |
 | `pipeline_unhandled` | `index.js` | Unexpected exception in background processing |

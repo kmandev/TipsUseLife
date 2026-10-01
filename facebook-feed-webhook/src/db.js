@@ -430,3 +430,91 @@ export async function listComments(db, { pageId, status = null, limit, cursor = 
 
   return result?.results ?? [];
 }
+
+/* ===================================================================
+ * Phase 8.36 -- ambiguous-send reconciliation (read model + one CAS).
+ * No schema change: provenance is recorded as error_message
+ * 'RECONCILED:<previous value>' on the existing replies row.
+ * =================================================================== */
+
+/**
+ * Everything reconciliation needs for one comment row: the comment and
+ * ALL of its reply rows (eligibility is decided by the caller).
+ * @returns {Promise<null | {comment: any, replies: any[]}>}
+ */
+export async function getReconcileCandidate(db, commentRowId) {
+  const comment = await db
+    .prepare(
+      `SELECT id, page_id, facebook_comment_id, facebook_post_id, facebook_parent_id,
+              author_id, status, created_at
+         FROM comments WHERE id = ?`
+    )
+    .bind(commentRowId)
+    .first();
+  if (!comment) return null;
+  const result = await db
+    .prepare(
+      `SELECT id, comment_id, mode, status, facebook_reply_id, error_message,
+              response_text, affiliate_url, created_at
+         FROM replies WHERE comment_id = ? ORDER BY id`
+    )
+    .bind(commentRowId)
+    .all();
+  return { comment, replies: result?.results ?? [] };
+}
+
+/** Which of `ids` are already stored as a facebook_reply_id on any reply row. */
+export async function findLinkedFacebookReplyIds(db, ids) {
+  const list = [...new Set((ids || []).filter((v) => typeof v === "string" && v.length > 0))];
+  if (list.length === 0) return new Set();
+  const result = await db
+    .prepare(`SELECT facebook_reply_id FROM replies WHERE facebook_reply_id IN (${list.map(() => "?").join(", ")})`)
+    .bind(...list)
+    .all();
+  return new Set((result?.results ?? []).map((r) => String(r.facebook_reply_id)));
+}
+
+/**
+ * The ONE reconciliation write: an ambiguous LIVE attempt becomes SENT with
+ * the Facebook reply id Facebook already created. Compare-and-set: only a
+ * row still ambiguous and unlinked can move, and never if that Facebook
+ * reply id is already linked to any other row. Exactly one concurrent
+ * caller can win.
+ * @returns {Promise<boolean>} true only if exactly this row changed
+ */
+export async function reconcileAmbiguousSend(db, replyRowId, facebookReplyId) {
+  if (typeof facebookReplyId !== "string" || !facebookReplyId) throw new Error("INVALID_FACEBOOK_REPLY_ID");
+  const result = await db
+    .prepare(
+      `UPDATE replies
+          SET status = 'SENT',
+              facebook_reply_id = ?1,
+              error_message = 'RECONCILED:' || error_message
+        WHERE id = ?2
+          AND mode = 'LIVE'
+          AND status = 'GENERATED'
+          AND facebook_reply_id IS NULL
+          AND (error_message = 'GRAPH_SEND_IN_PROGRESS' OR error_message LIKE 'GRAPH_OUTCOME_UNKNOWN:%')
+          AND NOT EXISTS (SELECT 1 FROM replies o WHERE o.facebook_reply_id = ?1 AND o.id != ?2)`
+    )
+    .bind(facebookReplyId, replyRowId)
+    .run();
+  return Number(result?.meta?.changes ?? 0) === 1;
+}
+
+/**
+ * After a successful reconciliation: ERROR/RECEIVED -> REPLIED. A comment
+ * that is already REPLIED (the 2xx-but-unrecorded case) is left as is.
+ * @returns {Promise<string|null>} the comment status afterwards
+ */
+export async function markCommentReconciled(db, commentRowId) {
+  await db
+    .prepare(
+      `UPDATE comments SET status = 'REPLIED', updated_at = datetime('now')
+        WHERE id = ? AND status IN ('ERROR', 'RECEIVED')`
+    )
+    .bind(commentRowId)
+    .run();
+  const row = await db.prepare(`SELECT status FROM comments WHERE id = ?`).bind(commentRowId).first();
+  return row?.status ?? null;
+}
