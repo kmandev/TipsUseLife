@@ -40,7 +40,7 @@
  *       the echo-guard window (isPossibleOwnEchoFailClosed, below).
  */
 
-import { MODE_DRY_RUN, MODE_LIVE, PIPELINE_BUDGET_MS, GRAPH_FINALIZE_MS, DEFAULT_ECHO_GUARD_WINDOW_SECONDS } from "./config.js";
+import { MODE_DRY_RUN, MODE_LIVE, PIPELINE_BUDGET_MS, GRAPH_FINALIZE_MS, GRAPH_LATE_FINALIZE_MS, DEFAULT_ECHO_GUARD_WINDOW_SECONDS } from "./config.js";
 import { replyTargetId } from "./facebook.js";
 import { requestAgentReplyWithBackpressure, HermesError } from "./hermes.js";
 import { SYSTEM_PROMPT, buildUserMessage } from "./agent-prompt.js";
@@ -55,6 +55,9 @@ import {
   findUnattributedLiveAttemptInThread,
   insertLiveSendMarker,
   finalizeLiveSend,
+  finalizeLateSend,
+  getReplyFinalState,
+  markCommentReconciled,
   authorRecentlyGotLink,
   updateCommentResult,
   markCommentStatus,
@@ -397,12 +400,16 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
 
   // Telemetry only: graphTimeoutMs above is the single source of truth for
   // the timeout actually passed to sendFacebookReply.
+  // Phase 8.44: how long the SAME request may still be observed after the
+  // ambiguity threshold -- capped by GRAPH_LATE_OBSERVE_MS and by what is
+  // left of the pipeline budget minus the late-finalize reserve.
+  const observeUntilMs = lateObserveUntilMs(config, graphTimeoutMs, PIPELINE_BUDGET_MS - (Date.now() - startedAt));
   const graphStartedAt = monotonicNow();
   let sent;
   try {
     sent = await sendFacebookReply(
       { commentId: replyTargetId(event), message: final.text },
-      { mode: config.mode, accessToken: env.PAGE_ACCESS_TOKEN, graphApiVersion: config.graphApiVersion, timeoutMs: graphTimeoutMs }
+      { mode: config.mode, accessToken: env.PAGE_ACCESS_TOKEN, graphApiVersion: config.graphApiVersion, timeoutMs: graphTimeoutMs, observeUntilMs }
     );
   } catch (error) {
     const ambiguous = !(error instanceof FacebookSendError) || error.ambiguous;
@@ -417,9 +424,15 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
       status_code: error?.statusCode ?? null,
       graph_elapsed_ms: elapsedMsSince(graphStartedAt),
       effective_timeout_ms: graphTimeoutMs,
+      late_observe_until_ms: error?.late ? error.observeUntilMs : null,
     });
     await finalizeQuietly(db, markerId, outcome, base);
     await updateOutcomeQuietly(db, commentRowId, { status: "ERROR", aiResponse: final.text, matchedProductId: productId, productSource, aiAction: ACTIONS.REPLY });
+    if (error?.late) {
+      // Still inside this pipeline's own promise (ctx.waitUntil), never detached.
+      const late = await settleLateResponse(db, error, { markerId, commentRowId, base, thresholdMs: graphTimeoutMs });
+      if (late === "SENT") return { outcome: OUTCOMES.REPLIED, mode: MODE_LIVE, late: true };
+    }
     return { outcome: OUTCOMES.ERROR, reason: ambiguous ? "GRAPH_OUTCOME_UNKNOWN" : category };
   }
 
@@ -429,6 +442,102 @@ export async function runPersistedComment(event, commentRowId, { db, env, config
   await updateOutcomeQuietly(db, commentRowId, { status: "REPLIED", aiResponse: final.text, matchedProductId: productId, productSource, aiAction: ACTIONS.REPLY });
   logEvent("reply_sent", { ...base, mode: MODE_LIVE, has_link: Boolean(final.affiliateUrl), has_reply_id: Boolean(sent.id), duration_ms: Date.now() - startedAt, graph_elapsed_ms: graphElapsedMs, effective_timeout_ms: graphTimeoutMs });
   return { outcome: OUTCOMES.REPLIED, mode: MODE_LIVE };
+}
+
+/**
+ * Phase 8.44 -- hard observation deadline (ms from the send start) for the
+ * one Graph request. Returns graphTimeoutMs (= late capture off) when
+ * disabled or when the budget leaves no room beyond the threshold.
+ */
+export function lateObserveUntilMs(config, graphTimeoutMs, remainingMs) {
+  const cap = Number(config?.graphLateObserveMs) || 0;
+  if (cap <= 0) return graphTimeoutMs;
+  const byBudget = Math.floor(remainingMs - GRAPH_LATE_FINALIZE_MS);
+  const until = Math.min(graphTimeoutMs + cap, byBudget);
+  return until > graphTimeoutMs ? until : graphTimeoutMs;
+}
+
+/**
+ * Phase 8.44 -- after the row is already recorded AMBIGUOUS: wait for the
+ * late observation of the SAME request (never rejects, bounded by its hard
+ * deadline) and act on it. Only a late 2xx with a valid Facebook id may
+ * change state, and only through the compare-and-set. Never a request.
+ * @returns {Promise<"SENT"|"AMBIGUOUS">}
+ */
+async function settleLateResponse(db, error, { markerId, commentRowId, base, thresholdMs }) {
+  let r;
+  try {
+    r = await error.late;
+  } catch {
+    r = { kind: "NETWORK_ERROR", totalMs: null };
+  }
+  const common = {
+    ...base,
+    reply_row_id: markerId,
+    threshold_ms: thresholdMs,
+    observe_until_ms: error.observeUntilMs ?? null,
+    total_elapsed_ms: r?.totalMs ?? null,
+  };
+  if (r?.kind === "PENDING_AT_DEADLINE") {
+    // We stopped observing at the hard deadline; Facebook may still answer.
+    logError("graph_response_never_arrived", "GRAPH_PENDING_AT_OBSERVATION_DEADLINE", { ...common, outcome: "KEPT_AMBIGUOUS" });
+    return "AMBIGUOUS";
+  }
+  if (r?.kind !== "RESPONSE") {
+    logError("graph_late_network_error", "GRAPH_LATE_NETWORK_ERROR", { ...common, outcome: "KEPT_AMBIGUOUS" });
+    return "AMBIGUOUS";
+  }
+  const late = {
+    ...common,
+    status_code: r.statusCode,
+    headers_ms: r.headersMs ?? null,
+    has_valid_id: Boolean(r.id),
+    body_error: r.bodyError ?? null,
+    fb_trace_id: r.traceId ?? null,
+    fb_request_id: r.requestId ?? null,
+  };
+  const is2xx = r.statusCode >= 200 && r.statusCode < 300;
+  if (!is2xx) {
+    // A late 4xx/5xx is NOT proof nothing was created: keep it ambiguous.
+    logError("graph_late_response", `GRAPH_LATE_HTTP_${r.statusCode ?? "UNKNOWN"}`, { ...late, cas_applied: false, outcome: "KEPT_AMBIGUOUS" });
+    return "AMBIGUOUS";
+  }
+  if (!r.id) {
+    logError("graph_late_response", r.bodyError || "BODY_ID_MISSING", { ...late, cas_applied: false, outcome: "KEPT_AMBIGUOUS" });
+    return "AMBIGUOUS";
+  }
+  let won = false;
+  try {
+    won = await finalizeLateSend(db, markerId, r.id);
+  } catch {
+    logError("graph_late_response", "D1_UPDATE_FAILED", { ...late, cas_applied: false, outcome: "KEPT_AMBIGUOUS" });
+    return "AMBIGUOUS";
+  }
+  if (!won) {
+    let current = null;
+    try {
+      current = await getReplyFinalState(db, markerId);
+    } catch {
+      current = null;
+    }
+    logError("graph_late_response", "LATE_CAS_REFUSED", {
+      ...late,
+      cas_applied: false,
+      outcome: "ALREADY_FINALIZED_OR_ID_LINKED",
+      current_status: current?.status ?? null,
+      current_provenance: current?.provenance ?? null,
+      current_linked: current?.linked ?? null,
+    });
+    return "AMBIGUOUS";
+  }
+  let commentStatus = null;
+  try {
+    commentStatus = await markCommentReconciled(db, commentRowId);
+  } catch {
+    logError("comment_result_update_failed", "D1_UPDATE_FAILED", { comment_row_id: commentRowId });
+  }
+  logEvent("graph_late_response", { ...late, cas_applied: true, outcome: "SENT", comment_status: commentStatus });
+  return "SENT";
 }
 
 /** Monotonic clock for durations (performance.now when the runtime has it). */

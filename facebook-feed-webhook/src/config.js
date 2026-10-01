@@ -40,6 +40,22 @@ export const PIPELINE_BUDGET_MS = 27000;
 export const DEFAULT_ECHO_GUARD_WINDOW_SECONDS = 600;
 export const GRAPH_FINALIZE_MS = 1000;
 /**
+ * LATE-RESPONSE CAPTURE (Phase 8.44). After GRAPH_TIMEOUT_MS without
+ * response headers the send is recorded as AMBIGUOUS exactly as before,
+ * but the SAME request is not aborted: the pipeline keeps awaiting it (inside
+ * the same ctx.waitUntil() promise -- never a detached promise) for at most
+ * GRAPH_LATE_OBSERVE_MS more, bounded by the pipeline budget minus
+ * GRAPH_LATE_FINALIZE_MS (reserved for the late D1 compare-and-set). A late
+ * 2xx with a valid id upgrades the same row to SENT; anything else leaves
+ * it ambiguous and protected. Never a second request.
+ * Env GRAPH_LATE_OBSERVE_MS: "0" disables (exact pre-8.44 behaviour); a
+ * positive integer <= GRAPH_LATE_OBSERVE_MAX_MS sets the cap; anything else
+ * -> DEFAULT_GRAPH_LATE_OBSERVE_MS.
+ */
+export const DEFAULT_GRAPH_LATE_OBSERVE_MS = 15000;
+export const GRAPH_LATE_OBSERVE_MAX_MS = 20000;
+export const GRAPH_LATE_FINALIZE_MS = 2000;
+/**
  * Hermes OpenAI-compatible synchronous endpoint (api_server platform),
  * reached through the Cloudflare Tunnel and the path-restricting edge
  * proxy on the Raspberry Pi. See docs/ARCHITECTURE.md.
@@ -88,10 +104,23 @@ export function resolveConfig(env) {
     hermesTimeoutMs: Number(env?.HERMES_TIMEOUT_MS || 20000),
     graphTimeoutMs: Number(env?.GRAPH_TIMEOUT_MS || 5000),
     graphApiVersion: String(env?.GRAPH_API_VERSION || "v21.0"),
+    graphLateObserveMs: parseLateObserveMs(env?.GRAPH_LATE_OBSERVE_MS),
     maxReplyLength: Number(env?.MAX_REPLY_LENGTH || 300),
     echoGuardWindowSeconds: parseWindowSeconds(env?.ECHO_GUARD_WINDOW_SECONDS),
     affiliateAllowedHosts: parseHostList(env?.AFFILIATE_ALLOWED_HOSTS),
   };
+}
+
+/**
+ * GRAPH_LATE_OBSERVE_MS -> 0 (disabled) or an integer in 1..GRAPH_LATE_OBSERVE_MAX_MS;
+ * missing or invalid -> DEFAULT_GRAPH_LATE_OBSERVE_MS.
+ * @param {unknown} raw
+ */
+export function parseLateObserveMs(raw) {
+  if (raw === undefined || raw === null || raw === "") return DEFAULT_GRAPH_LATE_OBSERVE_MS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > GRAPH_LATE_OBSERVE_MAX_MS) return DEFAULT_GRAPH_LATE_OBSERVE_MS;
+  return n;
 }
 
 /**

@@ -32,6 +32,12 @@ export class LiveModeViolationError extends Error {
 /** Default hard limit for one Graph send (ms). See pipeline.js time budget. */
 export const DEFAULT_GRAPH_TIMEOUT_MS = 5000;
 
+/** Monotonic clock (performance.now when the runtime has it). */
+function monotonicClock() {
+  const perf = globalThis.performance;
+  return perf && typeof perf.now === "function" ? perf.now() : Date.now();
+}
+
 /**
  * A Graph send that did not end in a confirmed success.
  *
@@ -42,22 +48,30 @@ export const DEFAULT_GRAPH_TIMEOUT_MS = 5000;
  *              treated as "unsent" and must never be retried automatically.
  */
 export class FacebookSendError extends Error {
-  constructor(category, { statusCode = null, ambiguous }) {
+  constructor(category, { statusCode = null, ambiguous, late = null, thresholdMs = null, observeUntilMs = null }) {
     super(category);
     this.name = "FacebookSendError";
     this.category = category;
     this.statusCode = statusCode;
     this.ambiguous = Boolean(ambiguous);
+    // Phase 8.44: only on GRAPH_TIMEOUT with late capture enabled.
+    this.late = late;
+    this.thresholdMs = thresholdMs;
+    this.observeUntilMs = observeUntilMs;
   }
 }
 
 /**
  * @param {{commentId: string, message: string}} input
- * @param {{mode: string, accessToken: string, graphApiVersion: string, timeoutMs?: number, fetchImpl?: typeof fetch}} options
+ * @param {{mode: string, accessToken: string, graphApiVersion: string, timeoutMs?: number, observeUntilMs?: number, fetchImpl?: typeof fetch, clock?: () => number}} options
+ *        timeoutMs = ambiguity threshold; observeUntilMs (Phase 8.44) = hard
+ *        deadline for the SAME request (<= timeoutMs: pre-8.44 behaviour).
  * @returns {Promise<{id: string|null}>} resolves ONLY on HTTP 2xx; `id` is
  *          null when the body could not be parsed (the send still succeeded).
  * @throws {LiveModeViolationError} before any network activity outside LIVE
- * @throws {FacebookSendError} on any non-2xx / timeout / network failure
+ * @throws {FacebookSendError} on any non-2xx / timeout / network failure.
+ *         A GRAPH_TIMEOUT with late capture carries `late`: a promise that
+ *         never rejects and resolves to the late observation.
  */
 export async function sendFacebookReply(input, options) {
   const {
@@ -65,7 +79,9 @@ export async function sendFacebookReply(input, options) {
     accessToken,
     graphApiVersion = "v21.0",
     timeoutMs = DEFAULT_GRAPH_TIMEOUT_MS,
+    observeUntilMs = 0,
     fetchImpl = fetch,
+    clock = monotonicClock,
   } = options || {};
 
   // GUARD 2 -- refuse outright unless explicitly in LIVE mode.
@@ -85,14 +101,29 @@ export async function sendFacebookReply(input, options) {
   form.set("message", input.message);
 
   // Bounded: a Graph call may never consume the rest of the Worker's
-  // waitUntil window. On abort the outcome is AMBIGUOUS (the request may
-  // already have been accepted), never "not sent".
+  // waitUntil window. On the threshold the outcome is AMBIGUOUS (the request
+  // may already have been accepted), never "not sent".
+  //
+  // Phase 8.44: `timeoutMs` is the AMBIGUITY THRESHOLD; `observeUntilMs`
+  // (>= timeoutMs) is the hard deadline at which the one request is
+  // aborted. With observeUntilMs <= timeoutMs this is exactly the pre-8.44
+  // single-timer behaviour.
+  const thresholdMs = Math.max(1, Number(timeoutMs) || DEFAULT_GRAPH_TIMEOUT_MS);
+  const hardMs = Math.max(thresholdMs, Math.floor(Number(observeUntilMs) || 0));
+  const lateCapture = hardMs > thresholdMs;
+  const startedAt = clock();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || DEFAULT_GRAPH_TIMEOUT_MS));
+  const timer = setTimeout(() => controller.abort(), hardMs);
 
-  let response;
+  // THE request. Created and dispatched exactly once; never re-created.
+  let request;
   try {
-    response = await fetchImpl(url, {
+    request = dispatch();
+  } catch (error) {
+    request = Promise.reject(error); // same classification as an async rejection
+  }
+  function dispatch() {
+    return fetchImpl(url, {
       method: "POST",
       headers: {
         // The token travels in the Authorization header rather than the
@@ -103,12 +134,49 @@ export async function sendFacebookReply(input, options) {
       body: form.toString(),
       signal: controller.signal,
     });
-  } catch (error) {
-    throw new FacebookSendError(error?.name === "AbortError" ? "GRAPH_TIMEOUT" : "GRAPH_NETWORK_ERROR", {
-      ambiguous: true,
-    });
-  } finally {
+  }
+  // A rejection after we stop racing must never be unhandled.
+  Promise.resolve(request).catch(() => {});
+
+  let response;
+  if (!lateCapture) {
+    try {
+      response = await request;
+    } catch (error) {
+      throw new FacebookSendError(error?.name === "AbortError" ? "GRAPH_TIMEOUT" : "GRAPH_NETWORK_ERROR", {
+        ambiguous: true,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  } else {
+    let thresholdTimer;
+    const THRESHOLD = Symbol("threshold");
+    let first;
+    try {
+      first = await Promise.race([
+        Promise.resolve(request).then((r) => ({ response: r })),
+        new Promise((resolve) => {
+          thresholdTimer = setTimeout(() => resolve(THRESHOLD), thresholdMs);
+        }),
+      ]);
+    } catch (error) {
+      // Rejected BEFORE the threshold (network failure, or the hard abort).
+      clearTimeout(thresholdTimer);
+      clearTimeout(timer);
+      throw new FacebookSendError(error?.name === "AbortError" ? "GRAPH_TIMEOUT" : "GRAPH_NETWORK_ERROR", {
+        ambiguous: true,
+      });
+    }
+    clearTimeout(thresholdTimer);
+    if (first === THRESHOLD) {
+      // No headers by the threshold: AMBIGUOUS now, but keep observing the
+      // SAME request until the hard deadline. `late` never rejects.
+      const late = observeLateResponse(request, { controller, timer, startedAt, clock });
+      throw new FacebookSendError("GRAPH_TIMEOUT", { ambiguous: true, late, thresholdMs, observeUntilMs: hardMs });
+    }
     clearTimeout(timer);
+    response = first.response;
   }
 
   if (response.status >= 200 && response.status < 300) {
@@ -134,6 +202,78 @@ export async function sendFacebookReply(input, options) {
 
   // 5xx / 1xx / 3xx: the request may or may not have been applied.
   throw new FacebookSendError(`GRAPH_UNCERTAIN_${response.status}`, { statusCode: response.status, ambiguous: true });
+}
+
+/** A Facebook object id we are willing to link: digits, optionally `_digits`. */
+const FACEBOOK_ID_PATTERN = /^[0-9]+(_[0-9]+)?$/;
+
+/** Opaque Facebook diagnostic header -> safe short token, or null. */
+function safeTraceHeader(response, name) {
+  try {
+    const v = response?.headers?.get?.(name);
+    if (typeof v !== "string") return null;
+    const t = v.trim();
+    return /^[A-Za-z0-9_+/=.-]{1,80}$/.test(t) ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Phase 8.44 -- keep observing the ONE request after the ambiguity
+ * threshold. Never issues a request, never rejects. Bounded by the hard
+ * abort timer, which also bounds the body read. Result kinds:
+ *   RESPONSE            headers arrived late (statusCode, id|null, bodyError|null)
+ *   PENDING_AT_DEADLINE no headers before the hard deadline (we stopped observing)
+ *   NETWORK_ERROR       the request failed after the threshold
+ */
+async function observeLateResponse(request, { controller, timer, startedAt, clock }) {
+  const elapsed = () => Math.max(0, Math.round(clock() - startedAt));
+  let response;
+  try {
+    response = await request;
+  } catch (error) {
+    clearTimeout(timer);
+    return { kind: error?.name === "AbortError" ? "PENDING_AT_DEADLINE" : "NETWORK_ERROR", totalMs: elapsed() };
+  }
+  const headersMs = elapsed();
+  const base = {
+    kind: "RESPONSE",
+    statusCode: Number(response.status) || null,
+    headersMs,
+    traceId: safeTraceHeader(response, "x-fb-trace-id"),
+    requestId: safeTraceHeader(response, "x-fb-request-id"),
+  };
+  if (!(response.status >= 200 && response.status < 300)) {
+    clearTimeout(timer);
+    try {
+      await response.body?.cancel?.();
+    } catch {
+      /* ignore */
+    }
+    return { ...base, id: null, bodyError: null, totalMs: elapsed() };
+  }
+  let id = null;
+  let bodyError = null;
+  try {
+    const text = await untilAborted(Promise.resolve().then(() => response.text()), controller.signal);
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      bodyError = "BODY_PARSE_ERROR";
+    }
+    if (!bodyError) {
+      const raw = data && (typeof data.id === "string" || typeof data.id === "number") ? String(data.id) : "";
+      if (FACEBOOK_ID_PATTERN.test(raw)) id = raw;
+      else bodyError = "BODY_ID_MISSING";
+    }
+  } catch (error) {
+    bodyError = error?.name === "AbortError" ? "BODY_TIMEOUT" : "BODY_READ_ERROR";
+  } finally {
+    clearTimeout(timer);
+  }
+  return { ...base, id, bodyError, totalMs: elapsed() };
 }
 
 /* ===================================================================

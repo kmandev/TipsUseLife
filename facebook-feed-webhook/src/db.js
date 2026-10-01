@@ -483,13 +483,32 @@ export async function findLinkedFacebookReplyIds(db, ids) {
  * @returns {Promise<boolean>} true only if exactly this row changed
  */
 export async function reconcileAmbiguousSend(db, replyRowId, facebookReplyId) {
+  return casAmbiguousToSent(db, replyRowId, facebookReplyId, "RECONCILED:");
+}
+
+/**
+ * Phase 8.44 -- the late-response write. The SAME compare-and-set as
+ * reconcileAmbiguousSend (same row conditions, same never-link-twice
+ * guard), with its own provenance prefix 'LATE_RESPONSE:' so the outcome
+ * stays distinguishable. Whichever of the two runs first wins; the other
+ * gets false.
+ * @returns {Promise<boolean>} true only if exactly this row changed
+ */
+export async function finalizeLateSend(db, replyRowId, facebookReplyId) {
+  return casAmbiguousToSent(db, replyRowId, facebookReplyId, "LATE_RESPONSE:");
+}
+
+const AMBIGUOUS_TO_SENT_PREFIXES = new Set(["RECONCILED:", "LATE_RESPONSE:"]);
+
+async function casAmbiguousToSent(db, replyRowId, facebookReplyId, prefix) {
+  if (!AMBIGUOUS_TO_SENT_PREFIXES.has(prefix)) throw new Error("INVALID_PROVENANCE");
   if (typeof facebookReplyId !== "string" || !facebookReplyId) throw new Error("INVALID_FACEBOOK_REPLY_ID");
   const result = await db
     .prepare(
       `UPDATE replies
           SET status = 'SENT',
               facebook_reply_id = ?1,
-              error_message = 'RECONCILED:' || error_message
+              error_message = ?3 || error_message
         WHERE id = ?2
           AND mode = 'LIVE'
           AND status = 'GENERATED'
@@ -497,9 +516,25 @@ export async function reconcileAmbiguousSend(db, replyRowId, facebookReplyId) {
           AND (error_message = 'GRAPH_SEND_IN_PROGRESS' OR error_message LIKE 'GRAPH_OUTCOME_UNKNOWN:%')
           AND NOT EXISTS (SELECT 1 FROM replies o WHERE o.facebook_reply_id = ?1 AND o.id != ?2)`
     )
-    .bind(facebookReplyId, replyRowId)
+    .bind(facebookReplyId, replyRowId, prefix)
     .run();
   return Number(result?.meta?.changes ?? 0) === 1;
+}
+
+/**
+ * Phase 8.44 -- after a refused late-response CAS: who finalized the row?
+ * Returns only the status and the provenance token (text before the first
+ * ':'), never the stored reply text.
+ * @returns {Promise<null | {status: string, provenance: string|null, linked: boolean}>}
+ */
+export async function getReplyFinalState(db, replyRowId) {
+  const row = await db
+    .prepare(`SELECT status, error_message, facebook_reply_id FROM replies WHERE id = ?`)
+    .bind(replyRowId)
+    .first();
+  if (!row) return null;
+  const em = typeof row.error_message === "string" ? row.error_message : null;
+  return { status: row.status, provenance: em ? em.split(":")[0] : null, linked: row.facebook_reply_id != null };
 }
 
 /**
