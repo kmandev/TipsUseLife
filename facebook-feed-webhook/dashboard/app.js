@@ -427,16 +427,24 @@
   const CONFIDENCE_KIND = { HIGH: "green", MEDIUM: "blue", LOW: "gray" };
 
   async function viewSuggestions(main) {
-    const status = h("select", null, h("option", { value: "PENDING", text: "รอตรวจสอบ" }), h("option", { value: "", text: "ทุกสถานะ" }), h("option", { value: "REJECTED", text: "ปฏิเสธแล้ว" }), h("option", { value: "SUPERSEDED", text: "ล้าสมัย" }));
+    const status = h("select", null, h("option", { value: "PENDING", text: "รอตรวจสอบ" }), h("option", { value: "", text: "ทุกสถานะ" }), h("option", { value: "REJECTED", text: "ปฏิเสธแล้ว" }), h("option", { value: "SUPERSEDED", text: "ล้าสมัย" }), h("option", { value: "APPROVED", text: "อนุมัติแล้ว" }));
     const summarySlot = h("div");
     const tableSlot = h("div");
     const more = h("button", { class: "btn ghost", text: "โหลดเพิ่ม" });
     let cursor = null; let rows = [];
 
-    const mapButton = (s) => s.mappable ? h("button", { class: "btn small", text: "ผูกสินค้า", onclick: () => {
-      state.prefill = { post_id: s.representative_post_id, product_id: s.product_id, type: s.content_type, suggestion_id: s.id };
-      state.tab = "content"; render();
-    } }) : h("span", { class: "muted small", text: s.status !== "PENDING" ? "-" : !s.product_id ? "ไม่มีสินค้าที่ตรง" : !s.product_usable ? "สินค้าถูกปิด/ลบ" : "ยังไม่มีรหัสโพสต์ของเพจ" });
+    // AM-2.4: explicit human approval (confirmation dialog) -> server creates ONE mapping.
+    const mapButton = (s) => s.mappable ? h("span", null,
+      h("button", { class: "btn small primary", text: "ผูกสินค้านี้", onclick: async (e) => {
+        if (!window.confirm("ยืนยันผูกสินค้า “" + (s.product_name || ("#" + s.product_id)) + "” กับโพสต์ " + s.representative_post_id + " ?\nระบบจะสร้าง mapping จริง และคำตอบคอมเมนต์ถัดไปของโพสต์นี้จะแนบลิงก์สินค้านี้")) return;
+        e.target.disabled = true;
+        try { await api("/admin/api/suggestions/" + s.id + "/approve", { method: "POST", body: {} }); toast("ผูกสินค้าแล้ว"); await load(true); }
+        catch (ex) { toast(ex.message, "err"); e.target.disabled = false; }
+      } }),
+      h("button", { class: "btn small ghost", text: "แก้ไขในฟอร์ม", onclick: () => {
+        state.prefill = { post_id: s.representative_post_id, product_id: s.product_id, type: s.content_type, suggestion_id: s.id };
+        state.tab = "content"; render();
+      } })) : h("span", { class: "muted small", text: s.status === "APPROVED" ? "ผูกสินค้าแล้ว" : s.status !== "PENDING" ? "-" : !s.product_id ? "ไม่มีสินค้าที่ตรง" : !s.product_usable ? "สินค้าถูกปิด/ลบ" : "ยังไม่มีรหัสโพสต์ของเพจ" });
 
     const rejectButton = (s) => s.status === "PENDING" ? h("button", { class: "btn small danger", text: "ปฏิเสธ", onclick: async (e) => {
       e.target.disabled = true;
@@ -483,7 +491,7 @@
     more.addEventListener("click", () => load(false));
     main.replaceChildren(
       h("div", { class: "row-between" }, h("h2", { text: "สินค้าแนะนำ" }), generate),
-      h("p", { class: "muted", text: "AI แนะนำสินค้าจากรายการที่ระบบคัดกรองแล้วเท่านั้น สำหรับโพสต์/Reel ที่ยังไม่ผูกสินค้า — เป็นคำแนะนำให้ตรวจสอบเท่านั้น ระบบไม่ผูกสินค้าเอง “ผูกสินค้า” จะเปิดฟอร์มเดิมให้คุณตรวจและกดบันทึกเอง" }),
+      h("p", { class: "muted", text: "AI แนะนำสินค้าจากรายการที่ระบบคัดกรองแล้วเท่านั้น สำหรับโพสต์/Reel ที่ยังไม่ผูกสินค้า — เป็นคำแนะนำให้ตรวจสอบเท่านั้น ระบบไม่ผูกสินค้าเอง “ผูกสินค้านี้” จะถามยืนยันก่อน แล้วจึงสร้าง mapping ให้ (หรือกด “แก้ไขในฟอร์ม” เพื่อเปิดฟอร์มเดิม)" }),
       summarySlot, h("div", { class: "toolbar" }, status), tableSlot, more);
     await load(true);
   }

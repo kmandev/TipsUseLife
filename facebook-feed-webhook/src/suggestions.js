@@ -12,8 +12,10 @@
  *
  * ISOLATION CONTRACT
  *   - Writes ONLY product_suggestions and suggestion_runs.
- *   - Never writes content_mappings, products, comments or replies; a human
- *     maps through the existing manual mapping form.
+ *   - The AI run never writes content_mappings, products, comments or
+ *     replies. The ONLY content_mappings write in this module is
+ *     approveSuggestion(), reachable solely from an explicit, authenticated
+ *     operator action (POST /admin/api/suggestions/:id/approve, AM-2.4).
  *   - Never calls Facebook, the reply pipeline, the reply sender, ai.js or
  *     affiliate.js. Not reachable from the webhook.
  *   - Serial, bounded (MAX_AI_CALLS_PER_RUN, per-call and total deadlines),
@@ -332,6 +334,141 @@ export async function rejectSuggestion(db, pageId, id) {
   if (Number(r?.meta?.changes ?? 0) > 0) return "REJECTED";
   const exists = await db.prepare(`SELECT 1 AS x FROM product_suggestions WHERE id = ? AND page_id = ?`).bind(id, pageId).first();
   return exists ? "NOT_PENDING" : "NOT_FOUND";
+}
+
+/* ------------------------------- approval ------------------------------- */
+
+/** Mapping note written by an approval; provenance only (the suggestion row holds the rest). */
+export const approvalNote = (suggestionId) => `จากสินค้าแนะนำ #${suggestionId}`;
+
+/**
+ * HUMAN APPROVAL (Phase AM-2.4): one authenticated operator action turns ONE
+ * PENDING suggestion into ONE content mapping. Nothing here is reachable from
+ * the AI run or the webhook.
+ *
+ * Trust: only the stored suggestion id is used. Product, page and post come
+ * from D1 (the suggestion row, the product row and the AM-2.2 representative),
+ * never from the browser.
+ *
+ * Guards (all must pass, otherwise nothing is written):
+ *   - suggestion exists for this page and is PENDING (APPROVED + its mapping
+ *     present -> idempotent success, no write);
+ *   - product_id is not NULL, the product exists, is active and not deleted;
+ *   - the logical subject still exists; its representative (AM-2.2 rule) is a
+ *     posts-edge `<page>_<n>` row of this page -- a bare reel id is never
+ *     mapped and no id is fabricated; for r:<id> subjects the representative
+ *     carries the same canonical_reel_id; its content type is POST or REEL;
+ *   - the representative's current text hash equals suggestion.content_hash
+ *     (otherwise SUGGESTION_STALE);
+ *   - NO mapping row (active or inactive) exists for any source id of the
+ *     subject. Stricter than POST /admin/api/content (which replaces): an
+ *     approval never overwrites or re-activates an existing mapping, matching
+ *     the AM-2.3 rule that an inactive mapping counts as mapped.
+ *
+ * Write: one D1 batch (a transaction) -- a conditional INSERT into
+ * content_mappings, then PENDING -> APPROVED for this suggestion and
+ * PENDING -> SUPERSEDED for the other suggestions of the same subject, both
+ * conditional on the just-inserted mapping. UNIQUE(page_id, post_id) plus the
+ * NOT EXISTS guards make a double click or retry unable to create a second
+ * mapping.
+ *
+ * @returns {Promise<{ok: true, idempotent?: boolean, mapping: object} | {ok: false, code: string}>}
+ */
+export async function approveSuggestion(db, pageId, id) {
+  const s = await db
+    .prepare(`SELECT * FROM product_suggestions WHERE id = ? AND page_id = ?`)
+    .bind(id, pageId)
+    .first();
+  if (!s) return { ok: false, code: "NOT_FOUND" };
+
+  if (s.status === "APPROVED") {
+    const existing = await db
+      .prepare(
+        `SELECT facebook_post_id, facebook_content_type, product_id FROM content_mappings
+          WHERE facebook_page_id = ? AND product_id = ? AND note = ? LIMIT 1`
+      )
+      .bind(pageId, s.product_id, approvalNote(s.id))
+      .first();
+    if (existing) {
+      return {
+        ok: true,
+        idempotent: true,
+        mapping: { page_id: pageId, post_id: existing.facebook_post_id, product_id: Number(existing.product_id), content_type: existing.facebook_content_type },
+      };
+    }
+    return { ok: false, code: "NOT_PENDING" };
+  }
+  if (s.status !== "PENDING") return { ok: false, code: "NOT_PENDING" };
+  if (s.product_id === null || s.product_id === undefined) return { ok: false, code: "NO_PRODUCT" };
+
+  const product = await db
+    .prepare(`SELECT id, active, deleted_at FROM products WHERE id = ?`)
+    .bind(s.product_id)
+    .first();
+  if (!product || Number(product.active) !== 1 || product.deleted_at) return { ok: false, code: "PRODUCT_UNAVAILABLE" };
+
+  const items = await listCandidates(db, pageId, { limit: 500 });
+  const item = items.find((i) => subjectKeyOf(i) === s.subject_key);
+  if (!item) return { ok: false, code: "SUBJECT_NOT_FOUND" };
+  const sourceIds = Array.isArray(item.source_post_ids) ? item.source_post_ids : [item.post_id];
+  if (item.mapping_state !== "NONE") return { ok: false, code: "MAPPING_EXISTS" };
+
+  const rep = item.representative_post_id;
+  const canonical = s.subject_key.startsWith("r:") ? s.subject_key.slice(2) : null;
+  if (
+    item.discovery_source !== "posts" ||
+    !isMappableRepresentative(rep) ||
+    !String(rep).startsWith(`${pageId}_`) ||
+    (canonical !== null && item.canonical_reel_id !== canonical)
+  ) {
+    return { ok: false, code: "NO_SAFE_REPRESENTATIVE" };
+  }
+  if (item.content_type !== "POST" && item.content_type !== "REEL") return { ok: false, code: "CONTENT_TYPE_UNKNOWN" };
+  if ((await sha256Hex(item.message ?? "")) !== s.content_hash) return { ok: false, code: "SUGGESTION_STALE" };
+
+  const note = approvalNote(s.id);
+  const marks = sourceIds.map(() => "?").join(",");
+  const mappingExists = `EXISTS (SELECT 1 FROM content_mappings WHERE facebook_page_id = ? AND facebook_post_id = ? AND product_id = ? AND note = ?)`;
+  const statements = [
+    db
+      .prepare(
+        `INSERT INTO content_mappings (facebook_page_id, facebook_post_id, facebook_content_type, product_id, active, note)
+         SELECT ?, ?, ?, ?, 1, ?
+          WHERE EXISTS (SELECT 1 FROM product_suggestions WHERE id = ? AND page_id = ? AND status = 'PENDING' AND content_hash = ?)
+            AND NOT EXISTS (SELECT 1 FROM content_mappings WHERE facebook_page_id = ? AND facebook_post_id IN (${marks}))`
+      )
+      .bind(pageId, rep, item.content_type, Number(s.product_id), note, s.id, pageId, s.content_hash, pageId, ...sourceIds),
+    db
+      .prepare(
+        `UPDATE product_suggestions SET status = 'APPROVED', decided_at = datetime('now'), updated_at = datetime('now')
+          WHERE id = ? AND page_id = ? AND status = 'PENDING' AND ${mappingExists}`
+      )
+      .bind(s.id, pageId, pageId, rep, Number(s.product_id), note),
+    db
+      .prepare(
+        `UPDATE product_suggestions SET status = 'SUPERSEDED', updated_at = datetime('now')
+          WHERE page_id = ? AND subject_key = ? AND status = 'PENDING' AND id <> ? AND ${mappingExists}`
+      )
+      .bind(pageId, s.subject_key, s.id, pageId, rep, Number(s.product_id), note),
+  ];
+
+  let results;
+  try {
+    results = await db.batch(statements);
+  } catch {
+    // The batch is a transaction: nothing was applied. A UNIQUE race lands here too.
+    return { ok: false, code: "MAPPING_WRITE_FAILED" };
+  }
+  const inserted = Number(results?.[0]?.meta?.changes ?? 0);
+  const approved = Number(results?.[1]?.meta?.changes ?? 0);
+  if (inserted !== 1 || approved !== 1) {
+    // A concurrent request changed the state between the checks and the batch.
+    // If that request was the same approval (double click), answer like a retry.
+    const now = await db.prepare(`SELECT status FROM product_suggestions WHERE id = ? AND page_id = ?`).bind(s.id, pageId).first();
+    if (now?.status === "APPROVED") return approveSuggestion(db, pageId, id);
+    return { ok: false, code: "CONFLICT" };
+  }
+  return { ok: true, mapping: { page_id: pageId, post_id: rep, product_id: Number(s.product_id), content_type: item.content_type } };
 }
 
 export async function listSuggestionRuns(db, pageId, limit = 10) {

@@ -43,6 +43,8 @@ export function createSqliteD1({ failOn = null } = {}) {
       if (failOn && failOn.test(sql)) throw new Error("d1 unavailable (simulated)");
     };
     const bound = (args) => ({
+      _sql: sql,
+      _args: args,
       async first() {
         guard();
         const row = sqlite.prepare(sql).get(...normalizeArgs(args));
@@ -64,8 +66,30 @@ export function createSqliteD1({ failOn = null } = {}) {
 
   const query = (sql, ...args) => sqlite.prepare(sql).all(...normalizeArgs(args)).map((r) => ({ ...r }));
 
+  /**
+   * D1 batch(): the statements run as one transaction -- if any fails,
+   * none is applied (mirrors Cloudflare D1 semantics).
+   */
+  async function batch(list) {
+    sqlite.exec("BEGIN");
+    try {
+      const out = list.map((st) => {
+        // A simulated failure mid-transaction: earlier statements already ran and are rolled back.
+        if (failOn && failOn.test(st._sql)) throw new Error("d1 unavailable (simulated)");
+        const info = sqlite.prepare(st._sql).run(...normalizeArgs(st._args ?? []));
+        return { success: true, results: [], meta: { changes: Number(info.changes), last_row_id: Number(info.lastInsertRowid) } };
+      });
+      sqlite.exec("COMMIT");
+      return out;
+    } catch (error) {
+      sqlite.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   return {
     prepare,
+    batch,
     _sqlite: sqlite,
     _query: query,
     _statements: statements,

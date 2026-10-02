@@ -312,7 +312,8 @@ previous Worker version still works with the tables present.
 ## Product mapping suggestions (Phase AM-2.3 — review only, manual)
 
 AI **suggests** which catalog product an unmapped discovered post/Reel
-promotes. **It never creates or changes a mapping**, never calls Facebook,
+promotes. **The AI run never creates or changes a mapping** (only an explicit, confirmed
+human approval does — see below), never calls Facebook,
 is not connected to the webhook or the reply pipeline, and runs only when an
 operator presses the button. Mapping stays the existing manual action.
 
@@ -351,13 +352,35 @@ over the 5-call cap, budget exhausted, Hermes busy), `failed`, `superseded`;
 or `SELECT * FROM suggestion_runs ORDER BY id DESC LIMIT 5;`.
 
 **Review.** Each row shows post text, suggested product, confidence, reason,
-prefilter score and status. **ผูกสินค้า** only opens the existing
-"โพสต์ / Reel" mapping form pre-filled — the operator checks and presses
-the existing save. It is offered only for a `PENDING` suggestion with a usable
-product and a `<page>_<n>` representative (a Reel seen only on the reels edge
-cannot be mapped until its posts-edge id is discovered). **ปฏิเสธ** sets
-`REJECTED` (`POST /admin/api/suggestions/:id/reject`). There is no approve
-route in AM-2.3; `APPROVED` is reserved for a later phase.
+prefilter score and status. **ปฏิเสธ** sets `REJECTED`
+(`POST /admin/api/suggestions/:id/reject`). **แก้ไขในฟอร์ม** opens the existing
+"โพสต์ / Reel" mapping form pre-filled; the operator saves it there.
+
+**Human approval (AM-2.4).** **ผูกสินค้านี้** asks for confirmation, then calls
+`POST /admin/api/suggestions/:id/approve` (session + same-origin JSON). The
+server ignores the request body and uses only the stored suggestion:
+- it must be `PENDING`, with a non-NULL product that exists, is active and not
+  deleted;
+- the logical subject must still exist and its AM-2.2 representative must be a
+  posts-edge `<page>_<n>` row of this Page (a bare reel id is never mapped;
+  nothing is fabricated), with content type POST or REEL;
+- the representative's current text hash must equal the suggestion's
+  (otherwise `SUGGESTION_STALE` — generate again);
+- **no mapping row, active or inactive, may exist for any source id of the
+  subject** (`MAPPING_EXISTS`). This is stricter than the manual form, which
+  replaces: an approval never overwrites or re-activates a mapping.
+The write is one D1 batch (transaction): a conditional INSERT into
+`content_mappings` (`active = 1`, note `จากสินค้าแนะนำ #<id>`), the suggestion
+`PENDING → APPROVED` (`decided_at` set), and the other `PENDING` suggestions of
+the same subject `→ SUPERSEDED`. If any part fails nothing is applied. A double
+click or retry returns `200` with `idempotent: true` and never creates a second
+mapping. No Facebook, Hermes or other network call. From the next comment on
+that post the reply pipeline resolves the product through its existing mapping
+lookup — the reply path itself is unchanged. Errors (409 unless noted):
+`NOT_FOUND` (404), `NOT_PENDING`, `NO_PRODUCT`, `PRODUCT_UNAVAILABLE`,
+`SUBJECT_NOT_FOUND`, `MAPPING_EXISTS`, `NO_SAFE_REPRESENTATIVE`,
+`CONTENT_TYPE_UNKNOWN`, `SUGGESTION_STALE`, `CONFLICT`, `MAPPING_WRITE_FAILED`.
+There is no automatic approval of any kind.
 
 **Hermes contention.** Suggestions share Hermes' concurrency cap with live
 comment replies. Runs are serial and capped at 5 calls; run them at a quiet

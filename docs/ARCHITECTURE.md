@@ -377,9 +377,12 @@ Hermes (`hermes.js`, reused unchanged, separate prompt
 `src/suggestion-prompt.js`) to choose **only** among those candidate ids. The
 caption is untrusted JSON data; no URL, token or secret is sent.
 `src/suggestions.js` rejects any id outside that exact set and stores valid
-answers in `product_suggestions`. Nothing writes `content_mappings`: the
-Dashboard only pre-fills the existing manual mapping form, which a human
-saves. Serial, at most 5 calls / 15 s each / 60 s per run, no retry, one run
+answers in `product_suggestions`. The AI run never writes `content_mappings`.
+AM-2.4 adds one explicit, confirmed human action
+(`POST /admin/api/suggestions/:id/approve`, `approveSuggestion`) that creates
+exactly one mapping from the stored suggestion after re-validating product,
+representative `<page>_<n>` id, text hash and absence of any existing mapping,
+in one D1 batch; it never overwrites a mapping and calls nothing external. Serial, at most 5 calls / 15 s each / 60 s per run, no retry, one run
 at a time; not reachable from the webhook. Option B above (manual mapping)
 remains the only source of a reply's product.
 

@@ -431,7 +431,7 @@ test("list: a deactivated product or a bare-reel-only subject is never offered f
 
 /* --------------------------------- API ----------------------------------- */
 
-test("API: auth, CSRF, methods, validation; there is no approve route", async () => {
+test("API: auth, CSRF, methods, validation; unknown approve target is 404", async () => {
   const db = db0();
   const mock = hermesMock();
   try {
@@ -446,7 +446,9 @@ test("API: auth, CSRF, methods, validation; there is no approve route", async ()
     assert.equal((await req(db, "GET", "/admin/api/suggestions/generate")).status, 405);
     assert.equal((await req(db, "POST", "/admin/api/suggestions", { body: {} })).status, 405);
     assert.equal((await req(db, "GET", "/admin/api/suggestions/1/reject")).status, 405);
+    // AM-2.4 added an explicit approve route; an unknown suggestion is still 404 and nothing is written.
     assert.equal((await req(db, "POST", "/admin/api/suggestions/1/approve", { body: {} })).status, 404);
+    assert.equal(count(db, "content_mappings"), 0);
     assert.equal((await req(db, "POST", "/admin/api/suggestions/abc/reject", { body: {} })).status, 400);
     assert.equal((await req(db, "POST", "/admin/api/suggestions/99/reject", { body: {} })).status, 404);
     for (const q of ["status=BOGUS", "limit=0", "limit=101", "cursor=x"]) assert.equal((await req(db, "GET", `/admin/api/suggestions?${q}`)).status, 400, q);
@@ -504,7 +506,7 @@ test("API: untrusted text stays JSON data; responses and logs carry no secrets",
   } finally { log.restore(); mock.restore(); }
 });
 
-test("dashboard: suggestions view renders text safely and only PRE-FILLS the existing mapping form", () => {
+test("dashboard: suggestions view renders text safely; mapping only via the existing form or a confirmed approval", () => {
   assert.equal(readFileSync(join(SRC, "dashboard.js"), "utf8"), renderDashboardModule(), "run: npm run build:dashboard");
   const app = readFileSync(join(ROOT, "dashboard", "app.js"), "utf8");
   assert.doesNotMatch(app, /innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|new Function/);
@@ -513,7 +515,9 @@ test("dashboard: suggestions view renders text safely and only PRE-FILLS the exi
   assert.match(view, /text: preview\(s\.message\)/);
   assert.match(view, /isFacebookUrl\(s\.permalink\)/);
   assert.match(view, /s\.mappable \?/);
-  assert.doesNotMatch(view, /\/admin\/api\/content|approve/i, "the view never writes a mapping itself");
+  assert.doesNotMatch(view, /\/admin\/api\/content/, "the view never writes a mapping through the content API");
+  // AM-2.4: the only mapping write is the explicit, confirmed approve call (tests/am24-approval.test.js).
+  assert.ok(view.indexOf("window.confirm(") > 0 && view.indexOf('"/approve"') > view.indexOf("window.confirm("));
   assert.match(app, /if \(state\.prefill\)/);
   assert.match(app, /\["suggestions", "สินค้าแนะนำ"\]/);
 });
@@ -525,7 +529,17 @@ test("isolation: suggestion code never reaches the reply path, Facebook or mappi
     const src = readFileSync(join(SRC, f), "utf8");
     assert.doesNotMatch(src, /from "\.\/(pipeline|facebook-reply|affiliate|ai|agent-prompt|db|recovery|facebook|facebook-posts)\.js"/, f);
     assert.doesNotMatch(src, /graph\.facebook\.com/, f);
-    assert.doesNotMatch(src, /(INSERT INTO|UPDATE|DELETE FROM|REPLACE INTO)\s+(content_mappings|products|comments|replies|post_candidates)\b/i, f);
+    assert.doesNotMatch(src, /(INSERT INTO|UPDATE|DELETE FROM|REPLACE INTO)\s+(products|comments|replies|post_candidates)\b/i, f);
+    // AM-2.4: the ONLY content_mappings write is inside approveSuggestion (explicit human approval);
+    // the AI run (generateSuggestions) and everything else in these modules never writes it.
+    const writes = [...src.matchAll(/(INSERT INTO|UPDATE|DELETE FROM|REPLACE INTO)\s+content_mappings\b/gi)].map((m) => m.index);
+    const start = src.indexOf("export async function approveSuggestion");
+    const end = src.indexOf("export async function listSuggestionRuns");
+    assert.ok(writes.every((i) => start >= 0 && i > start && i < end), `${f}: content_mappings write outside approveSuggestion`);
+    if (f === "suggestions.js") {
+      const gen = src.slice(src.indexOf("export async function generateSuggestions"), src.indexOf("/* ------------------------------- queries"));
+      assert.doesNotMatch(gen, /content_mappings\s*\(|INSERT INTO content_mappings|approveSuggestion/, "the AI run never maps");
+    }
   }
   for (const f of ["pipeline.js", "db.js", "affiliate.js", "facebook-reply.js", "recovery.js", "ai.js", "hermes.js", "agent-prompt.js", "facebook.js", "config.js", "index.js"]) {
     const src = readFileSync(join(SRC, f), "utf8");

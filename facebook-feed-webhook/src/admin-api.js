@@ -17,7 +17,8 @@
  *   GET    /admin/api/suggestions         ?status=&limit=&cursor= product suggestions (AM-2.3)
  *   POST   /admin/api/suggestions/generate  one manual, bounded AI suggestion run (AM-2.3)
  *   GET    /admin/api/suggestions/runs    recent suggestion runs (AM-2.3)
- *   POST   /admin/api/suggestions/:id/reject  PENDING -> REJECTED (AM-2.3; no approve route)
+ *   POST   /admin/api/suggestions/:id/reject  PENDING -> REJECTED (AM-2.3)
+ *   POST   /admin/api/suggestions/:id/approve HUMAN approval -> one content mapping (AM-2.4)
  *   GET    /admin/api/health              operational counts (Phase 8.2)
  *   GET    /admin/api/recovery            rows needing operator attention
  *   POST   /admin/api/comments/:id/retry  operator recovery of ONE comment
@@ -47,7 +48,7 @@ import {
   overviewStats,
 } from "./admin-db.js";
 import { runDiscovery, listCandidates, listRuns, CANDIDATE_STATUSES, MAPPING_FILTERS } from "./discovery.js";
-import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, SUGGESTION_STATUSES } from "./suggestions.js";
+import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, approveSuggestion, SUGGESTION_STATUSES } from "./suggestions.js";
 import { logEvent, logError } from "./log.js";
 import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
 
@@ -193,6 +194,10 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
   // POST /admin/api/suggestions/:id/reject -- review state only (AM-2.3).
   if (resource === "suggestions" && extra === "reject" && tooDeep === undefined) {
     return handleSuggestionReject(request, db, config, idSegment);
+  }
+  // POST /admin/api/suggestions/:id/approve -- explicit human approval (AM-2.4).
+  if (resource === "suggestions" && extra === "approve" && tooDeep === undefined) {
+    return handleSuggestionApprove(request, db, config, idSegment);
   }
   if (extra !== undefined) return apiError(404, "NOT_FOUND", "Not found");
 
@@ -487,6 +492,47 @@ async function handleSuggestionReject(request, db, config, idSegment) {
   if (outcome === "NOT_PENDING") return apiError(409, "NOT_PENDING", "Only a pending suggestion can be rejected");
   logEvent("admin_suggestion_rejected", { suggestion_id: id });
   return apiJson({ data: { id, status: "REJECTED" } });
+}
+
+const APPROVE_FAILURE = {
+  NOT_FOUND: [404, "Suggestion not found"],
+  NOT_PENDING: [409, "Only a pending suggestion can be approved"],
+  NO_PRODUCT: [409, "This suggestion has no product to map"],
+  PRODUCT_UNAVAILABLE: [409, "The suggested product is inactive or deleted"],
+  SUBJECT_NOT_FOUND: [409, "The post for this suggestion is no longer in the discovered list"],
+  MAPPING_EXISTS: [409, "This post/Reel already has a mapping"],
+  NO_SAFE_REPRESENTATIVE: [409, "No Page post id is known for this Reel yet; run discovery first"],
+  CONTENT_TYPE_UNKNOWN: [409, "The post type is unknown; map it manually"],
+  SUGGESTION_STALE: [409, "The post text changed after this suggestion; generate a new suggestion"],
+  CONFLICT: [409, "The state changed during approval; reload and try again"],
+  MAPPING_WRITE_FAILED: [409, "The mapping could not be written; nothing was changed"],
+};
+
+/**
+ * POST /admin/api/suggestions/:id/approve (AM-2.4). Explicit operator action
+ * only. The request body is ignored: product, page and post come from the
+ * stored suggestion and D1 (suggestions.js approveSuggestion). No Facebook,
+ * no Hermes, no network. Session + same-origin/JSON CSRF already ran in
+ * admin.js.
+ */
+async function handleSuggestionApprove(request, db, config, idSegment) {
+  if (request.method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+  const id = parseId(idSegment);
+  if (!id) return apiError(400, "INVALID_ID", "Invalid suggestion id");
+  let result;
+  try {
+    result = await approveSuggestion(db, config.pageId, id);
+  } catch {
+    logError("admin_suggestion_approve_failed", "UNHANDLED_EXCEPTION", { suggestion_id: id });
+    return apiError(500, "INTERNAL_ERROR", "Internal error");
+  }
+  if (!result.ok) {
+    const [status, message] = APPROVE_FAILURE[result.code] ?? [409, "Approval rejected"];
+    logEvent("admin_suggestion_approve_rejected", { suggestion_id: id, reason: result.code });
+    return apiError(status, result.code, message);
+  }
+  logEvent("admin_suggestion_approved", { suggestion_id: id, product_id: result.mapping.product_id, idempotent: Boolean(result.idempotent) });
+  return apiJson({ ok: true, suggestion_id: id, idempotent: Boolean(result.idempotent), mapping: result.mapping });
 }
 
 /* ------------------------------ recovery ------------------------------ */
