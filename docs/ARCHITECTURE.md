@@ -330,7 +330,7 @@ valid id → compare-and-set → SENT (LATE_RESPONSE:)`. There is never a second
 
 Migrations are additive (`database/migrations`): `0001` initial, `0002`
 comment metadata, `0003` affiliate catalog, `0004` post candidates, `0005`
-canonical reel id:
+canonical reel id, `0006` product suggestions:
 
 - `products` + `affiliate_url`, `platform`, `image_url`, `deleted_at`
   (soft delete). `shopee_url` kept in sync for backward compatibility.
@@ -346,6 +346,9 @@ canonical reel id:
   edits; `canonical_reel_id` (`0005`, derived from an explicit Reel permalink,
   not unique) groups the two source ids of one Reel for display only.
   **The reply pipeline never reads or writes these tables.**
+- `product_suggestions` / `suggestion_runs` (`0006`, AM-2.3): AI product
+  suggestions for human review and one row per manual run. Never read by the
+  reply pipeline; never written into `content_mappings`.
 
 D1 has no row-level security. It is reachable only through the Worker's
 `DB` binding; every Dashboard route is session-authenticated.
@@ -365,13 +368,29 @@ Failures fail closed (`FAILED` / `PARTIAL`, never an empty success). See
 `docs/OPERATIONS.md` → "Post discovery" for limits, error codes and the
 unverified Meta capabilities.
 
+## Product mapping suggestions (Phase AM-2.3)
+
+Review-only. A manual admin action (`POST /admin/api/suggestions/generate`)
+takes unmapped logical posts/Reels, narrows the catalog with a deterministic
+prefilter (`src/suggestion-prefilter.js`; not a reply-time matcher), and asks
+Hermes (`hermes.js`, reused unchanged, separate prompt
+`src/suggestion-prompt.js`) to choose **only** among those candidate ids. The
+caption is untrusted JSON data; no URL, token or secret is sent.
+`src/suggestions.js` rejects any id outside that exact set and stores valid
+answers in `product_suggestions`. Nothing writes `content_mappings`: the
+Dashboard only pre-fills the existing manual mapping form, which a human
+saves. Serial, at most 5 calls / 15 s each / 60 s per run, no retry, one run
+at a time; not reachable from the webhook. Option B above (manual mapping)
+remains the only source of a reply's product.
+
 ## Dashboard
 
 Served by the same Worker at `/admin` (vanilla JS, no framework, strict
 CSP, data rendered via `textContent` only). Screens: Overview, Products
 (search, filter, create, edit, enable/disable, soft delete, test link),
 Posts/Reels (mapping CRUD + unmapped posts), Discovered Posts (AM-2,
-read-only list + manual discovery run), Comment Activity, Settings
+read-only list + manual discovery run), Product Suggestions (AM-2.3, review
+only), Comment Activity, Settings
 (read-only; secret presence only). Auth: `ADMIN_PASSWORD` → HMAC-signed
 HttpOnly `SameSite=Strict` cookie (24 h). Writes additionally require a
 same-origin `Origin` and a JSON body. REPLY_MODE cannot be changed from the

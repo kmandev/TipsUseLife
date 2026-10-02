@@ -464,7 +464,7 @@ test("dashboard: bundle is current, text is rendered with textContent, links are
   assert.equal(bundle, renderDashboardModule(), "run: npm run build:dashboard");
   const app = readFileSync(join(SRC, "..", "dashboard", "app.js"), "utf8");
   assert.doesNotMatch(app, /innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(|new Function/);
-  const view = app.slice(app.indexOf("async function viewDiscovered"), app.indexOf("/* ----------------------------- activity"));
+  const view = app.slice(app.indexOf("async function viewDiscovered"), app.indexOf("/* --------------------------- suggestions (AM-2.3)"));
   assert.match(view, /isFacebookUrl\(c\.permalink\)/);
   assert.match(view, /text: preview\(c\.message\)/);
   assert.match(app, /\["discovered", "โพสต์ที่ค้นพบ"\]/);

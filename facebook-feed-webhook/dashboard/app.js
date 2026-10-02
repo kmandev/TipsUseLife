@@ -80,6 +80,7 @@
     ["products", "สินค้า Affiliate"],
     ["content", "โพสต์ / Reel"],
     ["discovered", "โพสต์ที่ค้นพบ"],
+    ["suggestions", "สินค้าแนะนำ"],
     ["activity", "กิจกรรมคอมเมนต์"],
     ["settings", "ตั้งค่า"],
   ];
@@ -96,7 +97,7 @@
     const main = h("main", { id: "view" }, h("p", { class: "muted", text: "กำลังโหลด…" }));
     root.appendChild(main);
     root.appendChild(h("div", { id: "toast", class: "toast" }));
-    const views = { overview: viewOverview, products: viewProducts, content: viewContent, discovered: viewDiscovered, activity: viewActivity, settings: viewSettings };
+    const views = { overview: viewOverview, products: viewProducts, content: viewContent, discovered: viewDiscovered, suggestions: viewSuggestions, activity: viewActivity, settings: viewSettings };
     views[state.tab](main).catch((e) => { main.replaceChildren(h("p", { class: "error", text: e.message })); });
   }
 
@@ -280,6 +281,14 @@
     const type = h("select", null, h("option", { value: "POST", text: "โพสต์" }), h("option", { value: "REEL", text: "Reel" }));
     const product = h("select", null, productOptions(null));
     const note = h("input", { placeholder: "บันทึก (ไม่บังคับ)" });
+    // AM-2.3: "ผูกสินค้า" from a suggestion only PRE-FILLS this form; the operator still saves.
+    if (state.prefill) {
+      postId.value = state.prefill.post_id;
+      type.value = state.prefill.type === "POST" ? "POST" : "REEL";
+      product.value = String(state.prefill.product_id);
+      note.value = "จากสินค้าแนะนำ #" + state.prefill.suggestion_id;
+      state.prefill = null;
+    }
     const err = h("p", { class: "error" });
     const refresh = () => viewContent(main);
     const add = async (e) => {
@@ -411,6 +420,72 @@
       tableSlot, more,
       h("h3", { text: "ประวัติการค้นหา" }), runsSlot);
     await Promise.all([load(true), loadRuns()]);
+  }
+
+  /* --------------------------- suggestions (AM-2.3) --------------------------- */
+  const SUGGESTION_STATUS_LABEL = { PENDING: "รอตรวจสอบ", REJECTED: "ปฏิเสธแล้ว", SUPERSEDED: "ล้าสมัย", APPROVED: "อนุมัติแล้ว" };
+  const CONFIDENCE_KIND = { HIGH: "green", MEDIUM: "blue", LOW: "gray" };
+
+  async function viewSuggestions(main) {
+    const status = h("select", null, h("option", { value: "PENDING", text: "รอตรวจสอบ" }), h("option", { value: "", text: "ทุกสถานะ" }), h("option", { value: "REJECTED", text: "ปฏิเสธแล้ว" }), h("option", { value: "SUPERSEDED", text: "ล้าสมัย" }));
+    const summarySlot = h("div");
+    const tableSlot = h("div");
+    const more = h("button", { class: "btn ghost", text: "โหลดเพิ่ม" });
+    let cursor = null; let rows = [];
+
+    const mapButton = (s) => s.mappable ? h("button", { class: "btn small", text: "ผูกสินค้า", onclick: () => {
+      state.prefill = { post_id: s.representative_post_id, product_id: s.product_id, type: s.content_type, suggestion_id: s.id };
+      state.tab = "content"; render();
+    } }) : h("span", { class: "muted small", text: s.status !== "PENDING" ? "-" : !s.product_id ? "ไม่มีสินค้าที่ตรง" : !s.product_usable ? "สินค้าถูกปิด/ลบ" : "ยังไม่มีรหัสโพสต์ของเพจ" });
+
+    const rejectButton = (s) => s.status === "PENDING" ? h("button", { class: "btn small danger", text: "ปฏิเสธ", onclick: async (e) => {
+      e.target.disabled = true;
+      try { await api("/admin/api/suggestions/" + s.id + "/reject", { method: "POST", body: {} }); toast("ปฏิเสธแล้ว"); await load(true); } catch (ex) { toast(ex.message, "err"); e.target.disabled = false; }
+    } }) : null;
+
+    const table = () => !rows.length ? h("p", { class: "muted", text: "ยังไม่มีสินค้าแนะนำ — กด “สร้างคำแนะนำ”" }) : h("table", null,
+      h("thead", null, h("tr", null, ["โพสต์", "สินค้าแนะนำ", "ความมั่นใจ", "เหตุผล", "คะแนนคัดกรอง", "สถานะ", "เวลา", ""].map((t) => h("th", { text: t })))),
+      h("tbody", null, rows.map((s) => h("tr", null,
+        h("td", null, h("div", { text: preview(s.message) || "(ไม่มีข้อความ)" }), isFacebookUrl(s.permalink) ? h("a", { href: s.permalink, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: s.representative_post_id }) : h("div", { class: "mono small muted", text: s.representative_post_id })),
+        h("td", null, s.product_id ? h("span", { text: s.product_name || ("#" + s.product_id) }) : h("span", { class: "muted", text: "ไม่มีสินค้าที่ตรง" })),
+        h("td", null, badge(s.confidence, CONFIDENCE_KIND[s.confidence])),
+        h("td", { class: "small", text: s.reason || "" }),
+        h("td", { text: s.prefilter_score }),
+        h("td", null, badge(SUGGESTION_STATUS_LABEL[s.status] || s.status, s.status === "PENDING" ? "blue" : "gray")),
+        h("td", { class: "nowrap small", text: fmtTime(s.created_at) }),
+        h("td", { class: "nowrap" }, mapButton(s), rejectButton(s))))));
+
+    const load = async (reset) => {
+      if (reset) { cursor = null; rows = []; }
+      const qs = new URLSearchParams({ limit: "25" });
+      if (status.value) qs.set("status", status.value);
+      if (cursor) qs.set("cursor", cursor);
+      const res = await api("/admin/api/suggestions?" + qs);
+      rows = rows.concat(res.data || []); cursor = res.next_cursor;
+      tableSlot.replaceChildren(table());
+      more.style.display = res.has_more ? "" : "none";
+    };
+
+    const generate = h("button", { class: "btn primary", text: "สร้างคำแนะนำ", onclick: async (e) => {
+      e.target.disabled = true; summarySlot.replaceChildren(h("p", { class: "muted", text: "กำลังวิเคราะห์ (สูงสุด 5 โพสต์ต่อครั้ง)…" }));
+      try {
+        const res = await fetch("/admin/api/suggestions/generate", { method: "POST", headers: { "content-type": "application/json" }, body: "{}", credentials: "same-origin" });
+        const data = await res.json().catch(() => null);
+        const d = data && data.data;
+        if (d) summarySlot.replaceChildren(h("p", { class: d.status === "OK" ? "" : "error", text: "ผล: " + d.status + " · เข้าเกณฑ์ " + d.eligible + " · วิเคราะห์ " + d.processed + " · แนะนำ " + d.suggested + " · ไม่ตรง " + d.no_match + " · ข้าม " + d.skipped + " · ล้มเหลว " + d.failed + " · ล้าสมัย " + d.superseded + (d.error_code ? " · " + d.error_code : "") }));
+        else summarySlot.replaceChildren(h("p", { class: "error", text: "สร้างคำแนะนำไม่สำเร็จ: " + ((data && data.error && data.error.code) || res.status) }));
+      } catch (ex) { summarySlot.replaceChildren(h("p", { class: "error", text: ex.message })); }
+      e.target.disabled = false;
+      try { await load(true); } catch (ex) { toast(ex.message, "err"); }
+    } });
+
+    status.addEventListener("change", () => load(true));
+    more.addEventListener("click", () => load(false));
+    main.replaceChildren(
+      h("div", { class: "row-between" }, h("h2", { text: "สินค้าแนะนำ" }), generate),
+      h("p", { class: "muted", text: "AI แนะนำสินค้าจากรายการที่ระบบคัดกรองแล้วเท่านั้น สำหรับโพสต์/Reel ที่ยังไม่ผูกสินค้า — เป็นคำแนะนำให้ตรวจสอบเท่านั้น ระบบไม่ผูกสินค้าเอง “ผูกสินค้า” จะเปิดฟอร์มเดิมให้คุณตรวจและกดบันทึกเอง" }),
+      summarySlot, h("div", { class: "toolbar" }, status), tableSlot, more);
+    await load(true);
   }
 
   /* ----------------------------- activity ---------------------------- */

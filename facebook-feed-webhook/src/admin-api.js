@@ -14,6 +14,10 @@
  *   POST   /admin/api/discovery/run      one bounded, READ-ONLY post discovery run (AM-2)
  *   GET    /admin/api/discovery/runs      recent runs with safe error categories (AM-2)
  *   GET    /admin/api/post-candidates     ?status=&mapping=&limit=&cursor= (AM-2)
+ *   GET    /admin/api/suggestions         ?status=&limit=&cursor= product suggestions (AM-2.3)
+ *   POST   /admin/api/suggestions/generate  one manual, bounded AI suggestion run (AM-2.3)
+ *   GET    /admin/api/suggestions/runs    recent suggestion runs (AM-2.3)
+ *   POST   /admin/api/suggestions/:id/reject  PENDING -> REJECTED (AM-2.3; no approve route)
  *   GET    /admin/api/health              operational counts (Phase 8.2)
  *   GET    /admin/api/recovery            rows needing operator attention
  *   POST   /admin/api/comments/:id/retry  operator recovery of ONE comment
@@ -43,6 +47,7 @@ import {
   overviewStats,
 } from "./admin-db.js";
 import { runDiscovery, listCandidates, listRuns, CANDIDATE_STATUSES, MAPPING_FILTERS } from "./discovery.js";
+import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, SUGGESTION_STATUSES } from "./suggestions.js";
 import { logEvent, logError } from "./log.js";
 import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
 
@@ -185,6 +190,10 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
   if (resource === "comments" && extra === "reconcile" && tooDeep === undefined) {
     return handleReconcile(request, db, env, config, idSegment);
   }
+  // POST /admin/api/suggestions/:id/reject -- review state only (AM-2.3).
+  if (resource === "suggestions" && extra === "reject" && tooDeep === undefined) {
+    return handleSuggestionReject(request, db, config, idSegment);
+  }
   if (extra !== undefined) return apiError(404, "NOT_FOUND", "Not found");
 
   try {
@@ -200,6 +209,37 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       }
       if (method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
       return await handleDiscoveryRun(db, env, config);
+    }
+
+    if (resource === "suggestions") {
+      if (idSegment === "generate") {
+        if (method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+        return await handleSuggestionGenerate(db, env, config);
+      }
+      if (idSegment === "runs") {
+        if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+        return apiJson({ data: await listSuggestionRuns(db, config.pageId, 10) });
+      }
+      if (idSegment !== undefined) return apiError(404, "NOT_FOUND", "Not found");
+      if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+      const status = url.searchParams.get("status");
+      if (status !== null && !SUGGESTION_STATUSES.includes(status)) return invalid("status", "Unknown status");
+      let limit = 25;
+      const limitParam = url.searchParams.get("limit");
+      if (limitParam !== null) {
+        limit = /^\d{1,3}$/.test(limitParam) ? Number(limitParam) : 0;
+        if (limit < 1 || limit > 100) return invalid("limit", "limit must be 1-100");
+      }
+      let beforeId = null;
+      const cursor = url.searchParams.get("cursor");
+      if (cursor !== null) {
+        beforeId = parseId(cursor);
+        if (!beforeId) return invalid("cursor", "Invalid cursor");
+      }
+      const rows = await listSuggestions(db, config.pageId, { status, beforeId, limit: limit + 1 });
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
+      return apiJson({ data: page, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
     }
 
     if (resource === "post-candidates" && idSegment === undefined) {
@@ -403,6 +443,50 @@ async function handleDiscoveryRun(db, env, config) {
   }
   // FAILED -> 502 (the read did not succeed); OK / PARTIAL -> 200 with status.
   return apiJson({ data: result.summary }, result.summary.status === "FAILED" ? 502 : 200);
+}
+
+/* ----------------------------- suggestions ----------------------------- */
+
+const SUGGESTION_FAILURE_HTTP = { ALREADY_RUNNING: 409, HERMES_NOT_CONFIGURED: 503 };
+
+/**
+ * POST /admin/api/suggestions/generate (AM-2.3). Operator-triggered,
+ * serial, bounded. Writes product_suggestions / suggestion_runs only --
+ * never content_mappings, never Facebook. Session + same-origin/JSON CSRF
+ * checks already ran in admin.js. Response: counters and a safe error
+ * category only (no prompt, no AI text, no secrets).
+ */
+async function handleSuggestionGenerate(db, env, config) {
+  let result;
+  try {
+    result = await generateSuggestions({ db, env, config });
+  } catch {
+    logError("admin_suggestions_failed", "UNHANDLED_EXCEPTION");
+    return apiError(500, "INTERNAL_ERROR", "Internal error");
+  }
+  if (!result.summary) {
+    const message = result.code === "ALREADY_RUNNING" ? "A suggestion run is already in progress" : "AI suggestions are not configured";
+    return apiError(SUGGESTION_FAILURE_HTTP[result.code] ?? 500, result.code, message);
+  }
+  return apiJson({ data: result.summary }, result.summary.status === "FAILED" ? 502 : 200);
+}
+
+/** POST /admin/api/suggestions/:id/reject -- PENDING -> REJECTED only. */
+async function handleSuggestionReject(request, db, config, idSegment) {
+  if (request.method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+  const id = parseId(idSegment);
+  if (!id) return apiError(400, "INVALID_ID", "Invalid suggestion id");
+  let outcome;
+  try {
+    outcome = await rejectSuggestion(db, config.pageId, id);
+  } catch {
+    logError("admin_suggestion_reject_failed", "UNHANDLED_EXCEPTION", { suggestion_id: id });
+    return apiError(500, "INTERNAL_ERROR", "Internal error");
+  }
+  if (outcome === "NOT_FOUND") return apiError(404, "NOT_FOUND", "Suggestion not found");
+  if (outcome === "NOT_PENDING") return apiError(409, "NOT_PENDING", "Only a pending suggestion can be rejected");
+  logEvent("admin_suggestion_rejected", { suggestion_id: id });
+  return apiJson({ data: { id, status: "REJECTED" } });
 }
 
 /* ------------------------------ recovery ------------------------------ */

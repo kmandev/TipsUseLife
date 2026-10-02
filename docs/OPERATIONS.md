@@ -309,6 +309,66 @@ tables, nothing existing is altered; older Worker versions ignore them). 4)
 `npx wrangler deploy`. No `wrangler.jsonc` change is needed. Rollback: the
 previous Worker version still works with the tables present.
 
+## Product mapping suggestions (Phase AM-2.3 — review only, manual)
+
+AI **suggests** which catalog product an unmapped discovered post/Reel
+promotes. **It never creates or changes a mapping**, never calls Facebook,
+is not connected to the webhook or the reply pipeline, and runs only when an
+operator presses the button. Mapping stays the existing manual action.
+
+**Run it.** Dashboard → สินค้าแนะนำ → สร้างคำแนะนำ (= authenticated
+`POST /admin/api/suggestions/generate`, same-origin JSON). One run:
+1. lists logical items (AM-2.2 identity `r:<canonical_reel_id>` / `p:<post_id>`)
+   whose representative has **no** mapping row (an inactive mapping counts as
+   mapped);
+2. marks stale `PENDING` suggestions `SUPERSEDED` (the item got mapped, or its
+   text hash changed);
+3. runs the deterministic prefilter (`src/suggestion-prefilter.js`) against
+   active, non-deleted products: full name (10) > Latin brand word (5) >
+   keyword ≥ 3 chars (2) > keyword shared by several products (1); NFC, lower
+   case, URLs/whitespace/punctuation removed; description is not used. Zero
+   hits → no AI call. At most 5 candidates;
+4. calls Hermes (`hermes.js requestAgentReply`, unchanged) **serially**, at most
+   **5 calls per run**, **15 s per call**, **60 s per run**, no retry (a 429
+   skips the item); the caption (URLs replaced by `[link]`, ≤ 1,500 chars) and
+   the candidates `{id,name,keywords,description}` are sent as JSON data —
+   never an affiliate/shopee/image URL, token or secret;
+5. validates the answer strictly: exactly `{product_id, confidence, reason}`;
+   `product_id` must be one of the candidate ids sent for that call (or
+   `null` = no match); confidence `HIGH|MEDIUM|LOW`; reason ≤ 200 chars, no
+   URL. Anything else fails closed and stores nothing;
+6. stores a `PENDING` row in `product_suggestions` (no-match rows keep
+   `product_id` NULL). The same item + text is never sent to the AI twice; a
+   rejected suggestion is not regenerated until the text changes.
+
+Only one run at a time (`409 ALREADY_RUNNING`; a run older than 300 s is
+`RUN_ABANDONED`). `503 HERMES_NOT_CONFIGURED` without `HERMES_API_KEY`.
+Result: `status` OK / PARTIAL / FAILED and counters `eligible`, `processed`,
+`suggested`, `no_match`, `skipped` (no prefilter signal, already suggested,
+over the 5-call cap, budget exhausted, Hermes busy), `failed`, `superseded`;
+`error_code` is a safe category (`HERMES_TIMEOUT`, `HERMES_BUSY`,
+`AI_OUTPUT_PRODUCT_NOT_CANDIDATE`, …). History: `GET /admin/api/suggestions/runs`
+or `SELECT * FROM suggestion_runs ORDER BY id DESC LIMIT 5;`.
+
+**Review.** Each row shows post text, suggested product, confidence, reason,
+prefilter score and status. **ผูกสินค้า** only opens the existing
+"โพสต์ / Reel" mapping form pre-filled — the operator checks and presses
+the existing save. It is offered only for a `PENDING` suggestion with a usable
+product and a `<page>_<n>` representative (a Reel seen only on the reels edge
+cannot be mapped until its posts-edge id is discovered). **ปฏิเสธ** sets
+`REJECTED` (`POST /admin/api/suggestions/:id/reject`). There is no approve
+route in AM-2.3; `APPROVED` is reserved for a later phase.
+
+**Hermes contention.** Suggestions share Hermes' concurrency cap with live
+comment replies. Runs are serial and capped at 5 calls; run them at a quiet
+time and check `GET /admin/api/health` afterwards. A suggestion failure never
+affects replies, discovery or Graph sends.
+
+**Deploy / migrate (not executed by AM-2.3).** Apply
+`database/migrations/0006_product_suggestions.sql` (two new tables, nothing
+existing altered) with `npx wrangler d1 migrations apply tipsuselife-ai --remote`,
+then `npx wrangler deploy`. No `wrangler.jsonc` change.
+
 ## Routine operations
 
 - New product: Dashboard → สินค้า Affiliate → เพิ่มสินค้า (https link on an
