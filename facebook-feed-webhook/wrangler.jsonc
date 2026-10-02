@@ -14,7 +14,7 @@
     // SAFETY: DRY_RUN means no Facebook reply mutation is ever performed.
     // Only the exact string "LIVE" enables live replies, and LIVE also
     // requires a PAGE_ACCESS_TOKEN secret to be present.
-    "REPLY_MODE": "DRY_RUN",
+    "REPLY_MODE": "LIVE",
     "PAGE_ID": "853313081388711",
     "HERMES_URL": "https://hermes-feed.cloudnext.icu/v1/chat/completions",
     "HERMES_TIMEOUT_MS": "20000",
