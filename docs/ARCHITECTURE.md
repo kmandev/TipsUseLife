@@ -71,8 +71,9 @@ agent runs with the webhook platform's default toolsets).
 | Permissions | Read post: Page access token (`pages_read_engagement` / `pages_manage_posts`). Reply: Page token with the MODERATE task + `pages_manage_engagement`. |
 | Graph version | Project uses `v21.0` (released 2024-10-02, available until **2027-01-21**). Configurable via `GRAPH_API_VERSION`. *Historical note:* when this table was written the newest version was v26.0; that has not been re-verified since and is **not** what production uses. |
 
-No Page access token is configured (DRY_RUN), so post content was not
-queried empirically; the decision below does not depend on it.
+When this was written no Page access token was configured (production was
+DRY_RUN; it has been LIVE since `c141193`), so post content was not queried
+empirically; the decision below does not depend on it.
 
 ## Product link decision — Dashboard mapping (Option B)
 

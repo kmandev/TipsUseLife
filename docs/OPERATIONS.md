@@ -4,22 +4,46 @@ All Cloudflare commands run **on the Raspberry Pi** (`~/TipsUseLife-AI`),
 where wrangler is authenticated. Never paste secret values into chat, logs
 or command lines; pipe them or use the interactive prompt.
 
-## Current Operational Status — Phase 8.62
+## Current Operational Status — AM-2.5
 
-Recorded at the Phase 8.x closeout (2026-10-02). Update this section when the
-state changes.
+Recorded after the AM-2.5 production acceptance (2026-10-02). This is the
+operator-supplied baseline from that acceptance, not a fresh verification;
+re-check with `npx wrangler deployments status` before acting on it. Update
+this section when the state changes.
 
-**Production**
+**Production (current)**
 
 | Item | Value |
+|---|---|
+| Worker | `facebook-feed-webhook` |
+| Worker version | `07c822e2-97c5-44cc-b0cc-7b28a54e221c` (100% traffic, message `AM-2.5 0d57a4b guard manual mappings`) |
+| Source baseline | `0d57a4b` (`fix(admin): guard manual content mappings against overwrite and duplicates`) |
+| `REPLY_MODE` | `LIVE` (permanent; see "Permanent LIVE enablement" below) |
+| Rollback target | `3ce5794c-8556-4287-8b08-5f0b5d39e343` (AM-2.4, source `7f97e6c`); AM-2.5 added no migration, so no schema rollback is needed |
+| Tests | 448 / 448 pass |
+| Completed phases since 8.62 | permanent LIVE (`c141193`), AM-2 discovery (`f910975`), AM-2.2 canonical Reels (`356826c`), AM-2.3 suggestions (`81637ed`), AM-2.4 human approval (`7f97e6c`), AM-2.5 manual mapping guards (`0d57a4b`) — AM-2.5 closed / accepted |
+
+**Permanent LIVE enablement.** Commit `c141193` (`feat(webhook): enable
+permanent LIVE mode`, 2026-10-02) changed `wrangler.jsonc` from
+`"REPLY_MODE": "DRY_RUN"` to `"REPLY_MODE": "LIVE"`; it was the only change in
+that commit. Every deploy since then runs LIVE (LIVE still also requires the
+`PAGE_ACCESS_TOKEN` secret). The DRY_RUN state recorded below was the
+production state before that commit.
+
+### Historical status — Phase 8.62 closeout (superseded)
+
+Recorded at the Phase 8.x closeout (2026-10-02), **before** permanent LIVE.
+Kept for history; the evidence notes and the row 196 record below still apply.
+
+| Item | Value at Phase 8.62 |
 |---|---|
 | Worker version | `f2ebf09f-1d6a-42e1-9a37-6e037447be55` (100% traffic) |
 | Source baseline | `936aa0d` (`fix(webhook): harden late cleanup and add Graph response telemetry`) |
 | `REPLY_MODE` | `DRY_RUN` |
-| Permanent LIVE | **NOT ENABLED** |
+| Permanent LIVE | NOT ENABLED at that time (enabled later by `c141193`) |
 | Tests | 357 / 357 pass |
 
-**Evidence status**
+**Evidence status (as of Phase 8.62)**
 
 | Item | Status |
 |---|---|
@@ -46,7 +70,7 @@ state changes.
 
 | Name | Kind | Purpose |
 |---|---|---|
-| `REPLY_MODE` | var | `DRY_RUN` (default). Only the exact string `LIVE` **and** a present `PAGE_ACCESS_TOKEN` enable replies. |
+| `REPLY_MODE` | var | Set to `LIVE` in `wrangler.jsonc` since `c141193`. The code default when unset or any other value is `DRY_RUN`. Only the exact string `LIVE` **and** a present `PAGE_ACCESS_TOKEN` enable replies. |
 | `PAGE_ID` | var | `853313081388711` |
 | `HERMES_URL` | var | `https://hermes-feed.cloudnext.icu/v1/chat/completions` |
 | `HERMES_TIMEOUT_MS` | var | `20000`. The whole per-comment pipeline has a 27 s budget (`PIPELINE_BUDGET_MS`, below the ~30 s `waitUntil` window); Hermes only ever gets what is left after reserving the Graph slice. |
@@ -151,7 +175,10 @@ systemctl --user restart hermes-gateway.service
 
 Controlled LIVE is for deliberate evidence collection only. Permanent LIVE
 enablement is a separate operational decision (next section). This is the
-procedure used in Phases 8.41, 8.42, 8.48 and 8.55:
+procedure used in Phases 8.41, 8.42, 8.48 and 8.55, while production was
+DRY_RUN. *Historical:* production has been permanently LIVE since `c141193`,
+so steps 3, 7 and 8 (switching into and back out of LIVE) no longer apply as
+written:
 
 1. Get explicit authorization for **exactly one** controlled LIVE test.
 2. Define the target post and the test account. Check the duplicate-link guard
@@ -176,6 +203,9 @@ and never change `GRAPH_TIMEOUT_MS` / `GRAPH_LATE_OBSERVE_MS` or induce
 latency to force the late path.
 
 ## Switching DRY_RUN → LIVE permanently (separate decision, two-person-rule recommended)
+
+**Done:** permanent LIVE was enabled by commit `c141193` (2026-10-02); see
+"Current Operational Status". The procedure below is kept for reference.
 
 All must hold first: production DRY_RUN drafts reviewed and correct; Meta app
 has `pages_manage_engagement` approved; a long-lived Page token with the
@@ -367,8 +397,10 @@ server ignores the request body and uses only the stored suggestion:
 - the representative's current text hash must equal the suggestion's
   (otherwise `SUGGESTION_STALE` — generate again);
 - **no mapping row, active or inactive, may exist for any source id of the
-  subject** (`MAPPING_EXISTS`). This is stricter than the manual form, which
-  replaces: an approval never overwrites or re-activates a mapping.
+  subject** (`MAPPING_EXISTS`). An approval never overwrites or re-activates a
+  mapping. (When AM-2.4 shipped, the manual form still replaced an existing
+  mapping; since AM-2.5 the manual form is create-only as well and answers
+  `409 MAPPING_EXISTS` — see "Manual mapping rules (AM-2.5)".)
 The write is one D1 batch (transaction): a conditional INSERT into
 `content_mappings` (`active = 1`, note `จากสินค้าแนะนำ #<id>`), the suggestion
 `PENDING → APPROVED` (`decided_at` set), and the other `PENDING` suggestions of
