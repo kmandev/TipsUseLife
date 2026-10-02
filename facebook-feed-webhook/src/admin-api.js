@@ -223,7 +223,9 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       const rows = await listCandidates(db, config.pageId, { status, mapping, beforeId, limit: limit + 1 });
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
-      return apiJson({ data: page, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
+      // Logical (de-duplicated) items; the cursor is the group's newest source id.
+      const nextCursor = hasMore ? String(page[page.length - 1].group_id) : null;
+      return apiJson({ data: page.map(({ group_id, ...item }) => item), has_more: hasMore, next_cursor: nextCursor });
     }
 
     if (resource === "recovery" && idSegment === undefined) {

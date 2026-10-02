@@ -329,7 +329,8 @@ valid id → compare-and-set → SENT (LATE_RESPONSE:)`. There is never a second
 ## Data model (D1 `tipsuselife-ai`)
 
 Migrations are additive (`database/migrations`): `0001` initial, `0002`
-comment metadata, `0003` affiliate catalog, `0004` post candidates:
+comment metadata, `0003` affiliate catalog, `0004` post candidates, `0005`
+canonical reel id:
 
 - `products` + `affiliate_url`, `platform`, `image_url`, `deleted_at`
   (soft delete). `shopee_url` kept in sync for backward compatibility.
@@ -342,7 +343,9 @@ comment metadata, `0003` affiliate catalog, `0004` post candidates:
   Page posts/reels found by the manual read-only discovery run, and one row
   per run (summary, safe error categories, overlap lock).
   `UNIQUE(page_id, post_id)`; `content_hash` (SHA-256 of the text) detects
-  edits. **The reply pipeline never reads or writes these tables.**
+  edits; `canonical_reel_id` (`0005`, derived from an explicit Reel permalink,
+  not unique) groups the two source ids of one Reel for display only.
+  **The reply pipeline never reads or writes these tables.**
 
 D1 has no row-level security. It is reachable only through the Worker's
 `DB` binding; every Dashboard route is session-authenticated.

@@ -215,14 +215,47 @@ in the `Authorization` header: `/{page}/published_posts` (fields
 (`id,description,created_time,permalink_url`). Nothing else is fetched: no
 comments, no author data, no media.
 
-**Limits.** 25 items per page, at most 2 pages and 50 items per edge, one
-20 s deadline for the whole run. A run that stops at a limit is reported
-`truncated` (older posts may exist; they are not an error). No automatic
-retry. Only one run at a time: a second request answers `409
-ALREADY_RUNNING`; a `RUNNING` row older than 300 s is treated as abandoned
-(`RUN_ABANDONED`). Worst case is roughly 110 D1 queries per run; this needs
-the Workers Paid D1 query limit (1000 per invocation) — **owner to confirm the
-plan before the first run.**
+**Limits.** 25 items per page, at most 2 pages and 50 items per edge. Time
+budget (AM-2.2): **each edge has its own 20 s deadline** (a slow edge cannot
+starve the other; in AM-2.1 a shared 20 s deadline made the posts edge time
+out after one page), and the whole run is bounded by a hard 45 s total. A run
+that stops at a limit is reported `truncated` (older posts may exist; not an
+error). No automatic retry. Only one run at a time: a second request answers
+`409 ALREADY_RUNNING`; a `RUNNING` row older than 300 s is treated as
+abandoned (`RUN_ABANDONED`). Worst case is roughly 190 D1 queries per run
+(the first run after migration 0005 also backfills canonical ids); this needs
+the Workers Paid D1 query limit (1000 per invocation).
+
+**Logical Reels and canonical identity (AM-2.2).** The same Reel is listed
+by Facebook under two ids: the posts edge gives `<page>_<n>` and the reels
+edge a bare video id (observed: 25 of 75 rows in the first production run).
+The numeric parts are unrelated, so the link is the permalink. Source rows are
+kept exactly as read (`post_id` is never changed and nothing is deleted);
+`post_candidates.canonical_reel_id` (migration `0005`, nullable, not unique)
+holds the reel id taken **only** from a permalink of exactly
+`https://www.facebook.com/reel/<digits>` (host `www.facebook.com` or
+`facebook.com`; trailing slash, query and fragment tolerated; anything else —
+other hosts, http, other paths, malformed — gives NULL). Nothing is inferred
+from text, timestamps or id strings.
+
+The Dashboard/API list shows one item per *logical* content: same page and
+same non-null `canonical_reel_id`; with a NULL canonical id the row stands
+alone. The shown row (the **representative**) is chosen by: 1) a row whose
+`post_id` matches an existing `content_mappings` row (an active mapping before
+an inactive one); 2) otherwise the posts-edge row (its `<page>_<n>` id is what
+comment webhooks and therefore mappings use); 3) otherwise the reels-edge row;
+ties: lowest id. Mapping state (`ACTIVE`/`INACTIVE`/`NONE`) is read from the
+representative's `post_id`. `content_mappings` is only read, never written, and
+its keys are unchanged. Each item reports `source_count`, `source_post_ids`,
+`representative_post_id`, `canonical_reel_id`. Pagination and filters apply to
+the logical list.
+
+**Backfill.** Rows discovered before migration 0005 have a NULL
+`canonical_reel_id`. `backfillCanonicalReelIds` (src/discovery.js) fills only
+NULL values from the stored permalink, is idempotent, never changes `post_id`
+or mappings and never deletes. It runs automatically at the end of every
+discovery run, so the first discovery after deploying 0005 groups the old
+rows; until then the old duplicates still show.
 
 **Run result** (`status`): `OK` all edges read; `PARTIAL` one edge failed or
 some rows could not be written (what was read is kept); `FAILED` nothing could
@@ -269,8 +302,8 @@ live check (read-only, operator): run discovery once and read the result; a
 the Meta app.
 
 **Deploy / migrate (not executed by AM-2).** 1) `git pull` on the Pi. 2)
-`cd facebook-feed-webhook && npm test`. 3) Apply
-`database/migrations/0004_post_candidates.sql` with
+`cd facebook-feed-webhook && npm test`. 3) Apply the pending migrations (`0004_post_candidates.sql`, and from AM-2.2
+`0005_post_candidates_canonical_reel.sql`) with
 `npx wrangler d1 migrations apply tipsuselife-ai --remote` (additive: two new
 tables, nothing existing is altered; older Worker versions ignore them). 4)
 `npx wrangler deploy`. No `wrangler.jsonc` change is needed. Rollback: the

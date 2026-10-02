@@ -31,7 +31,13 @@ export const POST_SOURCES = Object.freeze({
 export const DISCOVERY_PAGE_LIMIT = 25;
 export const DISCOVERY_MAX_PAGES = 2;
 export const DISCOVERY_MAX_ITEMS = 50; // per source
-export const DISCOVERY_DEADLINE_MS = 20000; // whole run, all sources
+// Time budget (AM-2.2). Each edge gets its OWN deadline, so one slow edge cannot
+// starve the other (AM-2.1: a shared 20 s deadline let the reels edge use the
+// budget and the posts edge timed out after one page). Graph answered in
+// roughly 7-10 s per page in production, so an edge may complete 2 pages.
+// The total is a hard outer bound for the whole run (2 edges + margin for D1).
+export const DISCOVERY_EDGE_DEADLINE_MS = 20000;
+export const DISCOVERY_TOTAL_DEADLINE_MS = 45000;
 
 /** Post ids look like `<page>_<post>` (posts) or are numeric (reels/videos). */
 export const POST_ID_PATTERN = /^[0-9]{5,}(_[0-9]+)?$/;
@@ -85,6 +91,32 @@ function normalizeCreatedTime(value) {
 }
 
 /**
+ * Canonical Reel identity, derived ONLY from an explicit Reel permalink:
+ *   https://www.facebook.com/reel/<digits>   (host www.facebook.com or facebook.com)
+ * A trailing slash, query string and fragment are tolerated. Anything else
+ * -- other hosts, http, credentials, ports, other paths, a malformed URL --
+ * yields null. Nothing is inferred from message text, timestamps, post-id
+ * strings or approximate matching.
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+export function canonicalReelIdFromPermalink(value) {
+  if (typeof value !== "string" || value.length === 0 || value.length > 500) return null;
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:") return null;
+  if (url.username || url.password || url.port) return null;
+  const host = url.hostname.toLowerCase();
+  if (host !== "www.facebook.com" && host !== "facebook.com") return null;
+  const match = /^\/reel\/([0-9]{5,25})\/?$/.exec(url.pathname);
+  return match ? match[1] : null;
+}
+
+/**
  * @param {string} sourceName 'posts' | 'reels'
  * @param {any} raw one Graph item
  * @returns {object|null} null when the item is unusable (no valid id)
@@ -114,6 +146,7 @@ export function normalizeItem(sourceName, raw) {
     fb_created_time: normalizeCreatedTime(raw.created_time),
     source_status_type: statusType,
     discovery_source: sourceName,
+    canonical_reel_id: canonicalReelIdFromPermalink(permalink),
   };
 }
 

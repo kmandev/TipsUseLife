@@ -13,7 +13,12 @@
  *     second run (atomic INSERT ... WHERE NOT EXISTS).
  */
 
-import { fetchPageContent, DISCOVERY_DEADLINE_MS } from "./facebook-posts.js";
+import {
+  fetchPageContent,
+  canonicalReelIdFromPermalink,
+  DISCOVERY_EDGE_DEADLINE_MS,
+  DISCOVERY_TOTAL_DEADLINE_MS,
+} from "./facebook-posts.js";
 import { logEvent, logError } from "./log.js";
 
 /** A RUNNING row older than this is treated as abandoned (Worker was killed). */
@@ -87,12 +92,12 @@ async function storeItems(db, pageId, items, counters) {
           .prepare(
             `INSERT INTO post_candidates
                (page_id, post_id, content_type, message, permalink, fb_created_time, source_status_type,
-                content_hash, discovery_source, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISCOVERED')
+                content_hash, discovery_source, canonical_reel_id, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISCOVERED')
              ON CONFLICT(page_id, post_id) DO NOTHING
              RETURNING id`
           )
-          .bind(pageId, item.post_id, item.content_type, stored, item.permalink, item.fb_created_time, item.source_status_type, hash, item.discovery_source)
+          .bind(pageId, item.post_id, item.content_type, stored, item.permalink, item.fb_created_time, item.source_status_type, hash, item.discovery_source, item.canonical_reel_id ?? null)
           .first();
         if (inserted) {
           counters.inserted += 1;
@@ -113,12 +118,13 @@ async function storeItems(db, pageId, items, counters) {
                   fb_created_time = COALESCE(?, fb_created_time),
                   content_type = COALESCE(?, content_type),
                   source_status_type = COALESCE(?, source_status_type),
+                  canonical_reel_id = COALESCE(canonical_reel_id, ?),
                   status = 'UPDATED', revision = revision + 1,
                   content_changed_at = datetime('now'), last_seen_at = datetime('now'),
                   updated_at = datetime('now')
             WHERE page_id = ? AND post_id = ? AND content_hash <> ?`
         )
-        .bind(stored, hash, item.permalink, item.fb_created_time, item.content_type, item.source_status_type, pageId, item.post_id, hash)
+        .bind(stored, hash, item.permalink, item.fb_created_time, item.content_type, item.source_status_type, item.canonical_reel_id ?? null, pageId, item.post_id, hash)
         .run();
       if (Number(edit?.meta?.changes ?? 0) > 0) counters.updated += 1;
       else counters.unchanged += 1;
@@ -144,10 +150,11 @@ async function storeItems(db, pageId, items, counters) {
  * Run one bounded discovery. Never throws for Facebook or per-item
  * failures; those are reported in the summary.
  *
- * @param {{db: any, env: any, config: any, fetchImpl?: typeof fetch}} deps
+ * @param {{db: any, env: any, config: any, fetchImpl?: typeof fetch,
+ *          budget?: {edgeDeadlineMs?: number, totalDeadlineMs?: number}}} deps
  * @returns {Promise<{ok: boolean, code?: string, summary?: object}>}
  */
-export async function runDiscovery({ db, env, config, fetchImpl }) {
+export async function runDiscovery({ db, env, config, fetchImpl, budget }) {
   if (!env?.PAGE_ACCESS_TOKEN) return { ok: false, code: "TOKEN_MISSING" };
 
   const lock = await acquireRun(db, config.pageId);
@@ -158,7 +165,11 @@ export async function runDiscovery({ db, env, config, fetchImpl }) {
   let truncated = false;
   let runStatus = "FAILED";
   let errorCode = null;
-  const deadlineAt = Date.now() + DISCOVERY_DEADLINE_MS;
+  // Each edge gets its own deadline (a slow edge cannot starve the other);
+  // the total deadline is the hard outer bound for the whole run.
+  const edgeMs = Number(budget?.edgeDeadlineMs) > 0 ? Number(budget.edgeDeadlineMs) : DISCOVERY_EDGE_DEADLINE_MS;
+  const totalMs = Number(budget?.totalDeadlineMs) > 0 ? Number(budget.totalDeadlineMs) : DISCOVERY_TOTAL_DEADLINE_MS;
+  const totalDeadlineAt = Date.now() + totalMs;
 
   try {
     const merged = new Map();
@@ -167,7 +178,7 @@ export async function runDiscovery({ db, env, config, fetchImpl }) {
         pageId: config.pageId,
         accessToken: env.PAGE_ACCESS_TOKEN,
         graphApiVersion: config.graphApiVersion,
-        deadlineAt,
+        deadlineAt: Math.min(Date.now() + edgeMs, totalDeadlineAt),
         fetchImpl,
       });
       counters.skipped += read.skipped;
@@ -192,6 +203,12 @@ export async function runDiscovery({ db, env, config, fetchImpl }) {
     const items = [...merged.values()];
     counters.discovered = items.length;
     await storeItems(db, config.pageId, items, counters);
+    // Idempotent: only fills canonical_reel_id where it is still NULL.
+    try {
+      await backfillCanonicalReelIds(db, config.pageId);
+    } catch {
+      // A derived grouping key; never fails the run.
+    }
 
     const okCount = sources.filter((s) => s.ok).length;
     if (okCount === 0) {
@@ -230,42 +247,113 @@ export async function runDiscovery({ db, env, config, fetchImpl }) {
   return { ok: runStatus !== "FAILED", code: runStatus === "FAILED" ? errorCode : undefined, summary };
 }
 
+/* ------------------------------ backfill ------------------------------ */
+
+/**
+ * Populate canonical_reel_id for existing candidates from their stored
+ * permalink. Deterministic and idempotent: it only touches rows whose
+ * canonical_reel_id IS NULL, writes only that column, never changes post_id,
+ * never deletes, and never reads or writes content_mappings. Rows whose
+ * permalink is not an explicit Reel permalink stay NULL.
+ *
+ * @returns {Promise<{scanned: number, updated: number}>}
+ */
+export async function backfillCanonicalReelIds(db, pageId, { limit = 500 } = {}) {
+  const found = await db
+    .prepare(
+      `SELECT id, permalink FROM post_candidates
+        WHERE page_id = ? AND canonical_reel_id IS NULL AND permalink LIKE '%/reel/%'
+        ORDER BY id LIMIT ?`
+    )
+    .bind(pageId, limit)
+    .all();
+  let updated = 0;
+  for (const row of found?.results ?? []) {
+    const canonical = canonicalReelIdFromPermalink(row.permalink);
+    if (!canonical) continue;
+    const result = await db
+      .prepare(`UPDATE post_candidates SET canonical_reel_id = ? WHERE id = ? AND canonical_reel_id IS NULL`)
+      .bind(canonical, row.id)
+      .run();
+    updated += Number(result?.meta?.changes ?? 0);
+  }
+  return { scanned: (found?.results ?? []).length, updated };
+}
+
 /* ------------------------------ queries ------------------------------ */
 
 export const CANDIDATE_STATUSES = ["DISCOVERED", "UPDATED"];
 export const MAPPING_FILTERS = ["mapped", "unmapped", "inactive"];
 
 /**
- * Candidates with the current mapping state of each post:
- *   ACTIVE   an active content_mappings row exists
- *   INACTIVE a mapping row exists but is switched off
- *   NONE     no mapping row
- * Read-only; keyset pagination by id (newest first).
+ * LOGICAL candidates: one item per logical content. Source rows are never
+ * merged or deleted -- grouping happens only here, at read time.
+ *
+ * Logical identity:
+ *   same page + same non-null canonical_reel_id  -> one logical Reel
+ *   canonical_reel_id NULL                        -> (page_id, post_id) itself
+ *
+ * REPRESENTATIVE of a group (the row whose fields are shown, and whose
+ * post_id decides the mapping state), first match wins:
+ *   1. a row whose post_id matches an existing content_mappings row
+ *      (an ACTIVE mapping before an inactive one);
+ *   2. otherwise the posts-edge row (its `<page>_<n>` id is the form comment
+ *      webhooks, and therefore content_mappings, use);
+ *   3. otherwise the reels-edge row;
+ *   4. ties: the lowest candidate id.
+ * No `<page>_<n>` id is ever fabricated and content_mappings is only read.
+ *
+ * mapping_state: NONE (no mapping row for the representative's post_id),
+ * ACTIVE, INACTIVE. Filters apply to the logical result. Keyset pagination
+ * on group_id (the newest source row id of the group), newest first.
  */
 export async function listCandidates(db, pageId, { status = null, mapping = null, beforeId = null, limit = 25 } = {}) {
-  const where = ["c.page_id = ?"];
+  const where = ["rn = 1"];
   const args = [pageId];
-  if (status) { where.push("c.status = ?"); args.push(status); }
-  if (mapping === "mapped") where.push("m.active = 1");
-  else if (mapping === "inactive") where.push("m.id IS NOT NULL AND m.active = 0");
-  else if (mapping === "unmapped") where.push("m.id IS NULL");
-  if (beforeId) { where.push("c.id < ?"); args.push(beforeId); }
+  if (status) { where.push("status = ?"); args.push(status); }
+  if (mapping === "mapped") where.push("mapping_state = 'ACTIVE'");
+  else if (mapping === "inactive") where.push("mapping_state = 'INACTIVE'");
+  else if (mapping === "unmapped") where.push("mapping_state = 'NONE'");
+  if (beforeId) { where.push("group_id < ?"); args.push(beforeId); }
   const result = await db
     .prepare(
-      `SELECT c.id, c.post_id, c.content_type, c.message, c.permalink, c.fb_created_time,
-              c.source_status_type, c.discovery_source, c.status, c.revision,
-              c.first_seen_at, c.last_seen_at, c.content_changed_at,
-              CASE WHEN m.id IS NULL THEN 'NONE' WHEN m.active = 1 THEN 'ACTIVE' ELSE 'INACTIVE' END AS mapping_state
-         FROM post_candidates c
-         LEFT JOIN content_mappings m
-           ON m.facebook_page_id = c.page_id AND m.facebook_post_id = c.post_id
+      `WITH base AS (
+         SELECT c.id, c.post_id, c.content_type, c.message, c.permalink, c.fb_created_time,
+                c.source_status_type, c.discovery_source, c.status, c.revision,
+                c.first_seen_at, c.last_seen_at, c.content_changed_at, c.canonical_reel_id,
+                CASE WHEN c.canonical_reel_id IS NOT NULL THEN 'r:' || c.canonical_reel_id
+                     ELSE 'p:' || c.post_id END AS gkey,
+                CASE WHEN m.id IS NULL THEN 'NONE' WHEN m.active = 1 THEN 'ACTIVE' ELSE 'INACTIVE' END AS mapping_state,
+                CASE WHEN m.id IS NULL THEN 2 WHEN m.active = 1 THEN 0 ELSE 1 END AS map_rank,
+                CASE WHEN c.discovery_source = 'posts' THEN 0 ELSE 1 END AS src_rank
+           FROM post_candidates c
+           LEFT JOIN content_mappings m
+             ON m.facebook_page_id = c.page_id AND m.facebook_post_id = c.post_id
+          WHERE c.page_id = ?
+       ),
+       ranked AS (
+         SELECT base.*,
+                ROW_NUMBER() OVER (PARTITION BY gkey ORDER BY map_rank, src_rank, id) AS rn,
+                COUNT(*) OVER (PARTITION BY gkey) AS source_count,
+                MAX(id) OVER (PARTITION BY gkey) AS group_id,
+                GROUP_CONCAT(post_id, ',') OVER (PARTITION BY gkey) AS source_ids
+           FROM base
+       )
+       SELECT id, post_id, content_type, message, permalink, fb_created_time, source_status_type,
+              discovery_source, status, revision, first_seen_at, last_seen_at, content_changed_at,
+              canonical_reel_id, mapping_state, source_count, source_ids, group_id
+         FROM ranked
         WHERE ${where.join(" AND ")}
-        ORDER BY c.id DESC
+        ORDER BY group_id DESC
         LIMIT ?`
     )
     .bind(...args, limit)
     .all();
-  return result?.results ?? [];
+  return (result?.results ?? []).map(({ source_ids, ...row }) => ({
+    ...row,
+    representative_post_id: row.post_id,
+    source_post_ids: String(source_ids ?? row.post_id).split(",").sort(),
+  }));
 }
 
 export async function listRuns(db, pageId, limit = 10) {

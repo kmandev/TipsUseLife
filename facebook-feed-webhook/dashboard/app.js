@@ -353,7 +353,7 @@
     const table = () => !rows.length ? h("p", { class: "muted", text: "ยังไม่มีโพสต์ที่ค้นพบ — กด “ค้นหาโพสต์ใหม่”" }) : h("table", null,
       h("thead", null, h("tr", null, ["ข้อความ", "ประเภท", "สร้างเมื่อ", "สถานะ", "การผูกสินค้า", "ลิงก์"].map((t) => h("th", { text: t })))),
       h("tbody", null, rows.map((c) => h("tr", null,
-        h("td", null, h("div", { text: preview(c.message) || "(ไม่มีข้อความ)", class: c.message ? "" : "muted" }), h("div", { class: "mono small muted", text: c.post_id })),
+        h("td", null, h("div", { text: preview(c.message) || "(ไม่มีข้อความ)", class: c.message ? "" : "muted" }), h("div", { class: "mono small muted", text: c.post_id }), Number(c.source_count) > 1 ? h("div", { class: "muted small", text: "รวม " + c.source_count + " แหล่งข้อมูล (Reel เดียวกัน)" }) : null),
         h("td", { text: c.content_type === "REEL" ? "Reel" : c.content_type === "POST" ? "โพสต์" : "ไม่ทราบ" }),
         h("td", { class: "nowrap small", text: fmtTime(c.fb_created_time) }),
         h("td", null, badge(CANDIDATE_STATUS_LABEL[c.status] || c.status, c.status === "UPDATED" ? "blue" : "gray")),
