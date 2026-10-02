@@ -254,7 +254,7 @@ constraint.
 | Hermes timeout (model may still have run) | recorded `ERROR`; **no automatic retry** (avoids double billing / double reply) |
 | Accidental re-request to Hermes | `Idempotency-Key` cache (5 min) |
 | Double Facebook post | LIVE gate `hasLiveSendAttempt` (any LIVE `GENERATED`/`SENT`/`FAILED` row for the comment blocks a new send) + send-started row written before the Graph request + partial `UNIQUE INDEX replies(comment_id) WHERE status='SENT'`. (`db.js` still exports an older `hasSentReply` helper; the pipeline does not use it.) |
-| Graph API failure | Never retried automatically, in any case. A confirmed Graph 4xx rejection (`GRAPH_REJECTED_<status>`) is recorded `FAILED` (confirmed not sent). A 5xx / other non-2xx status (`GRAPH_UNCERTAIN_<status>`), a timeout (`GRAPH_TIMEOUT`) or a network exception (`GRAPH_NETWORK_ERROR`) is ambiguous: recorded `GENERATED` + `GRAPH_OUTCOME_UNKNOWN:<category>`; the reply may already exist on Facebook |
+| Graph API failure | Never retried automatically, in any case. A confirmed Graph 4xx rejection (`GRAPH_REJECTED_<status>`) is recorded `FAILED` (confirmed not sent). A 5xx / other non-2xx status (`GRAPH_UNCERTAIN_<status>`), a timeout (`GRAPH_TIMEOUT`) or a network exception (`GRAPH_NETWORK_ERROR`) is ambiguous: recorded `GENERATED` + `GRAPH_OUTCOME_UNKNOWN:<category>`; the reply may already exist on Facebook. `GRAPH_TIMEOUT_MS` is the **ambiguity threshold**, not an abort: the same request keeps being observed (see "Late-response capture" below) and a late 2xx with a valid id can still move that row to `SENT` (`LATE_RESPONSE:`) — never through a second POST. Ambiguous rows stay protected: `hasLiveSendAttempt` blocks any new send and recovery classifies them `PROTECTED_AMBIGUOUS_SEND` (action `CHECK_FACEBOOK_NO_RETRY`) |
 | Ambiguous send that Facebook did complete | `GRAPH_OUTCOME_UNKNOWN` means the HTTP outcome was **not observed**, not that Facebook failed (incident: row 245, 2026-10-01 — POST 05:53:35.5Z, reply created by Facebook 05:53:36Z, Worker timeout 05:53:45.5Z). Still never retried. An operator may run **reconciliation** (`POST /admin/api/comments/:id/reconcile`, `recovery.js reconcileComment`): read-only `GET /{reply target}/comments` (`facebook-reply.js fetchCommentReplies`, own 8 s deadline covering headers and body, ≤ 2 pages), strict match, one compare-and-set → `SENT` + `facebook_reply_id`, `error_message` `RECONCILED:<previous>`. Anything else leaves the row unchanged |
 | D1 cannot record the send outcome | The reply row can stay `GENERATED` + `GRAPH_SEND_IN_PROGRESS`; `reply_outcome_unrecorded` is logged. Never retried; `hasLiveSendAttempt` and recovery protections block another send |
 | Echo of our own reply answered again | self-reply layers 1, 2 and 2.5 (see "Self-reply protection") |
@@ -290,6 +290,41 @@ lookup → strict match → compare-and-set → SENT`. There is no POST on this 
 * After reconciliation the row is `SENT` with a known id: layer 2 recognises
   its echo, recovery reports `ALREADY_SENT`, `hasLiveSendAttempt` still blocks
   any send. Calling reconcile again answers `NOT_ELIGIBLE`.
+* Reconciliation is **manual / admin-only** (session + same-origin JSON); nothing
+  runs it automatically.
+
+### Late-response capture (Phase 8.44, hardened in 8.50)
+
+`AMBIGUOUS at the threshold → keep observing the SAME request → late 2xx +
+valid id → compare-and-set → SENT (LATE_RESPONSE:)`. There is never a second POST.
+
+* `sendFacebookReply` dispatches the request once and keeps the original fetch
+  promise. At `GRAPH_TIMEOUT_MS` without response headers it throws the usual
+  ambiguous `GRAPH_TIMEOUT`; the pipeline records `GENERATED` +
+  `GRAPH_OUTCOME_UNKNOWN:GRAPH_TIMEOUT` and the comment `ERROR` first, then
+  awaits the same request inside the same `ctx.waitUntil` work (never a
+  detached promise).
+* The request is aborted only at the hard deadline `observeUntilMs` =
+  `min(threshold + GRAPH_LATE_OBSERVE_MS, pipeline budget left − 2 s)`
+  (default `GRAPH_LATE_OBSERVE_MS` 15000, max 20000, `0` = pre-8.44 behaviour:
+  abort at the threshold). The 2 s reserve is for the late D1 writes.
+* Late **2xx with a valid Facebook id** (`^[0-9]+(_[0-9]+)?$`): the same
+  compare-and-set as reconciliation (same row conditions, same `NOT EXISTS`
+  never-link-twice guard) with provenance `LATE_RESPONSE:<previous>`, then the
+  comment → `REPLIED`. If an operator reconcile won first, the late CAS is
+  refused and `graph_late_response` logs the winner (`current_provenance`).
+* Late **4xx / 5xx**, 2xx with a missing or invalid id or unreadable body,
+  a **network error** after the threshold, or **no headers by the deadline**:
+  logged (`graph_late_response` / `graph_late_network_error` /
+  `graph_response_never_arrived`) and the row **stays ambiguous and protected**.
+  A late error is not treated as proof that nothing was created.
+* Cleanup is non-blocking (`discardBody`): a late non-2xx body is released
+  without being awaited, so it cannot hold the observation or its log line.
+* If the runtime ends the invocation early, the row is already persisted as
+  ambiguous, so the worst case is the existing manual-reconcile path.
+* Production evidence: as of Phase 8.62 a late response has **not** been observed
+  in production (all LIVE sends since the feature shipped answered in < 10 s);
+  the path is covered by deterministic automated tests only.
 
 ## Data model (D1 `tipsuselife-ai`)
 

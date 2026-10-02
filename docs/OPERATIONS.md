@@ -4,6 +4,44 @@ All Cloudflare commands run **on the Raspberry Pi** (`~/TipsUseLife-AI`),
 where wrangler is authenticated. Never paste secret values into chat, logs
 or command lines; pipe them or use the interactive prompt.
 
+## Current Operational Status — Phase 8.62
+
+Recorded at the Phase 8.x closeout (2026-10-02). Update this section when the
+state changes.
+
+**Production**
+
+| Item | Value |
+|---|---|
+| Worker version | `f2ebf09f-1d6a-42e1-9a37-6e037447be55` (100% traffic) |
+| Source baseline | `936aa0d` (`fix(webhook): harden late cleanup and add Graph response telemetry`) |
+| `REPLY_MODE` | `DRY_RUN` |
+| Permanent LIVE | **NOT ENABLED** |
+| Tests | 357 / 357 pass |
+
+**Evidence status**
+
+| Item | Status |
+|---|---|
+| Normal LIVE E2E | **PROVEN** (Phase 8.55, one authorized test): exactly one Graph POST, HTTP 200, `headers_ms` 5524, `graph_elapsed_ms` 5524, Facebook trace/request ids captured, Facebook reply verified via its own webhook echo, D1 reply `SENT`, comment `REPLIED`, no duplicate, no retry, production restored to `DRY_RUN` |
+| Late-response production E2E | **NOT OBSERVED.** Covered by deterministic automated tests (Phase 8.44 / 8.50). No latency was induced and none should be. This is an evidence gap, not a known implementation failure; the design fails safe (the row is recorded ambiguous before late observation starts) |
+| M1 — Worker lifetime 18–27 s | **NOT VERIFIED IN PRODUCTION.** Longest observed production invocation ≈ 17 s |
+| Original Graph timeout root cause | **UNPROVEN.** Evidence shows only that response-header latency can exceed 10 s on some sends (observed 5.5 s – >10 s, with the reply created at about the start of the POST). Not attributed to Facebook, Cloudflare or the network |
+
+**Row 196 (comment 240) — protected ambiguous send**
+
+* Reply row 196: `LIVE` / `GENERATED` / `GRAPH_OUTCOME_UNKNOWN:GRAPH_TIMEOUT`,
+  `facebook_reply_id = NULL`. Comment 240 (`1694107882724308_1081348987969658`): `ERROR`.
+* Recovery: `PROTECTED_AMBIGUOUS_SEND` → **DO NOT RETRY. DO NOT MUTATE.**
+* History: one reconcile attempt (Phase 8.58) → `GRAPH_READ_4XX` (Facebook 400),
+  no change; read-only Graph Explorer (Phase 8.59): the post is readable but
+  comment 240 is not returned by its comment listing (deletion not proven).
+* Decision (Phase 8.60): leave as is. The schema has no truthful terminal
+  status for "dispatched, outcome unknown, investigation stopped": `SENT` would
+  be false without an id, `FAILED` means confirmed-not-sent, and `SKIPPED` would
+  remove `hasLiveSendAttempt` protection. The current state is the truthful,
+  permanently protected record; no further mutation is required.
+
 ## Worker configuration
 
 | Name | Kind | Purpose |
@@ -109,7 +147,35 @@ systemctl --user restart hermes-gateway.service
    mode `DRY_RUN`, draft ending with the product's affiliate URL.
 5. Confirm **no reply appears on Facebook**.
 
-## Switching DRY_RUN → LIVE (deliberate, two-person-rule recommended)
+## Controlled LIVE test (deliberate evidence collection only)
+
+Controlled LIVE is for deliberate evidence collection only. Permanent LIVE
+enablement is a separate operational decision (next section). This is the
+procedure used in Phases 8.41, 8.42, 8.48 and 8.55:
+
+1. Get explicit authorization for **exactly one** controlled LIVE test.
+2. Define the target post and the test account. Check the duplicate-link guard
+   window (same author + post + link within 24 h is suppressed), and that no
+   unresolved ambiguous row is involved.
+3. Deploy the **existing** bundle with only the mode overridden:
+   `npx wrangler deploy --var REPLY_MODE:LIVE --message "<phase> controlled LIVE test"`.
+4. Verify: `npx wrangler deployments status` shows the new version at 100%, and
+   `npx wrangler versions view <id>` shows `REPLY_MODE=LIVE` with every other
+   var and secret name unchanged.
+5. Allow **exactly one** new test comment (posted by a person, never as the
+   Page; no replay, no forged webhook).
+6. Observe with `npx wrangler tail`: `comment_received`, `reply_sent` (or
+   `reply_send_ambiguous` / `graph_late_*`), Graph `status_code`,
+   `headers_ms`, `graph_elapsed_ms`, `fb_trace_id` / `fb_request_id`, the
+   `SELF_AUTHORED` echo, and the new D1 rows (read-only SELECTs).
+7. Restore DRY_RUN: `npx wrangler rollback <previous DRY_RUN version id> -m "<phase> end LIVE window -> DRY_RUN" -y`.
+8. Verify DRY_RUN again (`deployments status` + `versions view`).
+
+Never retry an ambiguous result, never post a second comment to "try again",
+and never change `GRAPH_TIMEOUT_MS` / `GRAPH_LATE_OBSERVE_MS` or induce
+latency to force the late path.
+
+## Switching DRY_RUN → LIVE permanently (separate decision, two-person-rule recommended)
 
 All must hold first: production DRY_RUN drafts reviewed and correct; Meta app
 has `pages_manage_engagement` approved; a long-lived Page token with the
