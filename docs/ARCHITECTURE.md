@@ -329,7 +329,7 @@ valid id → compare-and-set → SENT (LATE_RESPONSE:)`. There is never a second
 ## Data model (D1 `tipsuselife-ai`)
 
 Migrations are additive (`database/migrations`): `0001` initial, `0002`
-comment metadata, `0003` affiliate catalog:
+comment metadata, `0003` affiliate catalog, `0004` post candidates:
 
 - `products` + `affiliate_url`, `platform`, `image_url`, `deleted_at`
   (soft delete). `shopee_url` kept in sync for backward compatibility.
@@ -338,16 +338,37 @@ comment metadata, `0003` affiliate catalog:
 - `comments` + `facebook_post_permalink`, `product_source`
   (MAPPING|NONE; KEYWORD only on historical rows), `ai_action`.
 - `replies` + `affiliate_url`; one `SENT` per comment enforced by index.
+- `post_candidates` / `discovery_runs` (migration `0004`, Phase AM-2):
+  Page posts/reels found by the manual read-only discovery run, and one row
+  per run (summary, safe error categories, overlap lock).
+  `UNIQUE(page_id, post_id)`; `content_hash` (SHA-256 of the text) detects
+  edits. **The reply pipeline never reads or writes these tables.**
 
 D1 has no row-level security. It is reachable only through the Worker's
 `DB` binding; every Dashboard route is session-authenticated.
+
+## Post discovery (Phase AM-2)
+
+A manual, authenticated, read-only operation (`POST /admin/api/discovery/run`)
+reads the Page's posts and reels from the Graph API with `GET` only
+(`src/facebook-posts.js`) and stores them as candidates (`src/discovery.js`),
+shown in the Dashboard tab "โพสต์ที่ค้นพบ" with their mapping state. It is
+deliberately isolated: it writes only `post_candidates` and `discovery_runs`,
+never creates or changes a `content_mapping`, never calls the reply
+pipeline, the Facebook reply sender or Hermes, and no reply-path module
+imports it (enforced by `tests/am2-discovery.test.js`). Mapping stays manual
+(Option B above); AM-2 only removes the need to look post ids up by hand.
+Failures fail closed (`FAILED` / `PARTIAL`, never an empty success). See
+`docs/OPERATIONS.md` → "Post discovery" for limits, error codes and the
+unverified Meta capabilities.
 
 ## Dashboard
 
 Served by the same Worker at `/admin` (vanilla JS, no framework, strict
 CSP, data rendered via `textContent` only). Screens: Overview, Products
 (search, filter, create, edit, enable/disable, soft delete, test link),
-Posts/Reels (mapping CRUD + unmapped posts), Comment Activity, Settings
+Posts/Reels (mapping CRUD + unmapped posts), Discovered Posts (AM-2,
+read-only list + manual discovery run), Comment Activity, Settings
 (read-only; secret presence only). Auth: `ADMIN_PASSWORD` → HMAC-signed
 HttpOnly `SameSite=Strict` cookie (24 h). Writes additionally require a
 same-origin `Origin` and a JSON body. REPLY_MODE cannot be changed from the

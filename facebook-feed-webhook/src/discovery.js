@@ -1,0 +1,286 @@
+/**
+ * Read-only post discovery (Phase AM-2): run, store, list.
+ *
+ * ISOLATION CONTRACT
+ *   - Reads Facebook with GET only (facebook-posts.js).
+ *   - Writes ONLY post_candidates and discovery_runs.
+ *   - Never creates, changes or deactivates a content mapping, never calls
+ *     the comment-reply pipeline or the Facebook reply sender, never talks
+ *     to Hermes. The reply pipeline never reads these tables.
+ *   - Idempotent: running it again changes nothing unless a post is new or
+ *     its text was edited.
+ *   - Overlap-safe: a RUNNING row younger than STALE_RUN_SECONDS blocks a
+ *     second run (atomic INSERT ... WHERE NOT EXISTS).
+ */
+
+import { fetchPageContent, DISCOVERY_DEADLINE_MS } from "./facebook-posts.js";
+import { logEvent, logError } from "./log.js";
+
+/** A RUNNING row older than this is treated as abandoned (Worker was killed). */
+export const STALE_RUN_SECONDS = 300;
+export const MAX_STORED_MESSAGE_CHARS = 2000;
+const IN_CHUNK = 40; // D1 allows 100 bound parameters per statement
+
+/** Order matters: reels first so a reel also listed under posts keeps REEL. */
+const SOURCE_ORDER = ["reels", "posts"];
+
+export async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(text ?? "")));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function chunks(list, size) {
+  const out = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
+
+/**
+ * @returns {Promise<{ok: true, runId: number} | {ok: false, code: "ALREADY_RUNNING"}>}
+ */
+async function acquireRun(db, pageId) {
+  // Mark abandoned runs first, so they never block forever.
+  await db
+    .prepare(
+      `UPDATE discovery_runs
+          SET status = 'FAILED', error_code = 'RUN_ABANDONED', finished_at = datetime('now')
+        WHERE page_id = ? AND status = 'RUNNING'
+          AND started_at <= datetime('now', ?)`
+    )
+    .bind(pageId, `-${STALE_RUN_SECONDS} seconds`)
+    .run();
+  const row = await db
+    .prepare(
+      `INSERT INTO discovery_runs (page_id, status)
+       SELECT ?1, 'RUNNING'
+        WHERE NOT EXISTS (SELECT 1 FROM discovery_runs WHERE page_id = ?1 AND status = 'RUNNING')
+       RETURNING id`
+    )
+    .bind(pageId)
+    .first();
+  return row ? { ok: true, runId: Number(row.id) } : { ok: false, code: "ALREADY_RUNNING" };
+}
+
+/**
+ * Upsert one source's items. Returns counters; per-item D1 failures are
+ * counted, not thrown, so one bad row cannot hide the rest.
+ */
+async function storeItems(db, pageId, items, counters) {
+  const existing = new Map();
+  for (const group of chunks(items, IN_CHUNK)) {
+    const marks = group.map(() => "?").join(",");
+    const rows = await db
+      .prepare(`SELECT post_id, content_hash FROM post_candidates WHERE page_id = ? AND post_id IN (${marks})`)
+      .bind(pageId, ...group.map((i) => i.post_id))
+      .all();
+    for (const r of rows?.results ?? []) existing.set(String(r.post_id), String(r.content_hash));
+  }
+
+  const unchangedIds = [];
+  for (const item of items) {
+    const hash = await sha256Hex(item.message ?? "");
+    const stored = item.message === null ? null : item.message.slice(0, MAX_STORED_MESSAGE_CHARS);
+    const known = existing.get(item.post_id);
+    try {
+      if (known === undefined) {
+        const inserted = await db
+          .prepare(
+            `INSERT INTO post_candidates
+               (page_id, post_id, content_type, message, permalink, fb_created_time, source_status_type,
+                content_hash, discovery_source, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISCOVERED')
+             ON CONFLICT(page_id, post_id) DO NOTHING
+             RETURNING id`
+          )
+          .bind(pageId, item.post_id, item.content_type, stored, item.permalink, item.fb_created_time, item.source_status_type, hash, item.discovery_source)
+          .first();
+        if (inserted) {
+          counters.inserted += 1;
+          continue;
+        }
+        // Lost a race with another writer: treat as already known and refresh below.
+      }
+      if (known === hash) {
+        unchangedIds.push(item.post_id);
+        counters.unchanged += 1;
+        continue;
+      }
+      // Edited content (or a raced insert with different content).
+      const edit = await db
+        .prepare(
+          `UPDATE post_candidates
+              SET message = ?, content_hash = ?, permalink = COALESCE(?, permalink),
+                  fb_created_time = COALESCE(?, fb_created_time),
+                  content_type = COALESCE(?, content_type),
+                  source_status_type = COALESCE(?, source_status_type),
+                  status = 'UPDATED', revision = revision + 1,
+                  content_changed_at = datetime('now'), last_seen_at = datetime('now'),
+                  updated_at = datetime('now')
+            WHERE page_id = ? AND post_id = ? AND content_hash <> ?`
+        )
+        .bind(stored, hash, item.permalink, item.fb_created_time, item.content_type, item.source_status_type, pageId, item.post_id, hash)
+        .run();
+      if (Number(edit?.meta?.changes ?? 0) > 0) counters.updated += 1;
+      else counters.unchanged += 1;
+    } catch {
+      counters.failed += 1;
+    }
+  }
+
+  for (const group of chunks(unchangedIds, IN_CHUNK)) {
+    const marks = group.map(() => "?").join(",");
+    try {
+      await db
+        .prepare(`UPDATE post_candidates SET last_seen_at = datetime('now') WHERE page_id = ? AND post_id IN (${marks})`)
+        .bind(pageId, ...group)
+        .run();
+    } catch {
+      // last_seen_at is informational; the content itself was already compared.
+    }
+  }
+}
+
+/**
+ * Run one bounded discovery. Never throws for Facebook or per-item
+ * failures; those are reported in the summary.
+ *
+ * @param {{db: any, env: any, config: any, fetchImpl?: typeof fetch}} deps
+ * @returns {Promise<{ok: boolean, code?: string, summary?: object}>}
+ */
+export async function runDiscovery({ db, env, config, fetchImpl }) {
+  if (!env?.PAGE_ACCESS_TOKEN) return { ok: false, code: "TOKEN_MISSING" };
+
+  const lock = await acquireRun(db, config.pageId);
+  if (!lock.ok) return { ok: false, code: lock.code };
+
+  const counters = { discovered: 0, inserted: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0 };
+  const sources = [];
+  let truncated = false;
+  let runStatus = "FAILED";
+  let errorCode = null;
+  const deadlineAt = Date.now() + DISCOVERY_DEADLINE_MS;
+
+  try {
+    const merged = new Map();
+    for (const name of SOURCE_ORDER) {
+      const read = await fetchPageContent(name, {
+        pageId: config.pageId,
+        accessToken: env.PAGE_ACCESS_TOKEN,
+        graphApiVersion: config.graphApiVersion,
+        deadlineAt,
+        fetchImpl,
+      });
+      counters.skipped += read.skipped;
+      if (read.truncated) truncated = true;
+      sources.push({
+        source: name,
+        ok: read.error === null,
+        error_code: read.error?.category ?? null,
+        graph_code: read.error?.graphCode ?? null,
+        http_status: read.error?.statusCode ?? null,
+        pages: read.pages,
+        items: read.items.length,
+        complete: read.complete,
+        truncated: read.truncated,
+      });
+      for (const item of read.items) {
+        if (merged.has(item.post_id)) counters.skipped += 1; // same post under two edges
+        else merged.set(item.post_id, item);
+      }
+    }
+
+    const items = [...merged.values()];
+    counters.discovered = items.length;
+    await storeItems(db, config.pageId, items, counters);
+
+    const okCount = sources.filter((s) => s.ok).length;
+    if (okCount === 0) {
+      runStatus = "FAILED";
+      errorCode = sources[0]?.error_code ?? "DISCOVERY_FAILED";
+    } else if (okCount < sources.length || counters.failed > 0) {
+      runStatus = "PARTIAL";
+      errorCode = sources.find((s) => !s.ok)?.error_code ?? (counters.failed > 0 ? "ITEM_WRITE_FAILED" : null);
+    } else {
+      runStatus = "OK";
+    }
+  } catch {
+    runStatus = "FAILED";
+    errorCode = "INTERNAL_ERROR";
+    logError("discovery_failed", "UNHANDLED_EXCEPTION");
+  }
+
+  const summary = { run_id: lock.runId, status: runStatus, error_code: errorCode, ...counters, truncated, sources };
+  try {
+    await db
+      .prepare(
+        `UPDATE discovery_runs
+            SET status = ?, finished_at = datetime('now'), discovered = ?, inserted = ?, updated = ?,
+                unchanged = ?, skipped = ?, failed = ?, truncated = ?, detail = ?, error_code = ?
+          WHERE id = ?`
+      )
+      .bind(
+        runStatus, counters.discovered, counters.inserted, counters.updated, counters.unchanged,
+        counters.skipped, counters.failed, truncated ? 1 : 0, JSON.stringify(sources), errorCode, lock.runId
+      )
+      .run();
+  } catch {
+    logError("discovery_run_record_failed", "D1_UPDATE_FAILED", { run_id: lock.runId });
+  }
+  logEvent("discovery_run", { run_id: lock.runId, status: runStatus, error_code: errorCode, ...counters, truncated });
+  return { ok: runStatus !== "FAILED", code: runStatus === "FAILED" ? errorCode : undefined, summary };
+}
+
+/* ------------------------------ queries ------------------------------ */
+
+export const CANDIDATE_STATUSES = ["DISCOVERED", "UPDATED"];
+export const MAPPING_FILTERS = ["mapped", "unmapped", "inactive"];
+
+/**
+ * Candidates with the current mapping state of each post:
+ *   ACTIVE   an active content_mappings row exists
+ *   INACTIVE a mapping row exists but is switched off
+ *   NONE     no mapping row
+ * Read-only; keyset pagination by id (newest first).
+ */
+export async function listCandidates(db, pageId, { status = null, mapping = null, beforeId = null, limit = 25 } = {}) {
+  const where = ["c.page_id = ?"];
+  const args = [pageId];
+  if (status) { where.push("c.status = ?"); args.push(status); }
+  if (mapping === "mapped") where.push("m.active = 1");
+  else if (mapping === "inactive") where.push("m.id IS NOT NULL AND m.active = 0");
+  else if (mapping === "unmapped") where.push("m.id IS NULL");
+  if (beforeId) { where.push("c.id < ?"); args.push(beforeId); }
+  const result = await db
+    .prepare(
+      `SELECT c.id, c.post_id, c.content_type, c.message, c.permalink, c.fb_created_time,
+              c.source_status_type, c.discovery_source, c.status, c.revision,
+              c.first_seen_at, c.last_seen_at, c.content_changed_at,
+              CASE WHEN m.id IS NULL THEN 'NONE' WHEN m.active = 1 THEN 'ACTIVE' ELSE 'INACTIVE' END AS mapping_state
+         FROM post_candidates c
+         LEFT JOIN content_mappings m
+           ON m.facebook_page_id = c.page_id AND m.facebook_post_id = c.post_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY c.id DESC
+        LIMIT ?`
+    )
+    .bind(...args, limit)
+    .all();
+  return result?.results ?? [];
+}
+
+export async function listRuns(db, pageId, limit = 10) {
+  const result = await db
+    .prepare(
+      `SELECT id, status, started_at, finished_at, discovered, inserted, updated, unchanged, skipped,
+              failed, truncated, error_code, detail
+         FROM discovery_runs WHERE page_id = ? ORDER BY id DESC LIMIT ?`
+    )
+    .bind(pageId, limit)
+    .all();
+  return (result?.results ?? []).map((r) => {
+    let sources = null;
+    try { sources = r.detail ? JSON.parse(r.detail) : null; } catch { sources = null; }
+    const { detail, ...rest } = r;
+    return { ...rest, sources };
+  });
+}

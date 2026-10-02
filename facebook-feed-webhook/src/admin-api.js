@@ -11,6 +11,9 @@
  *   POST   /admin/api/content             (create or replace mapping for a post)
  *   PATCH  /admin/api/content/:id
  *   DELETE /admin/api/content/:id
+ *   POST   /admin/api/discovery/run      one bounded, READ-ONLY post discovery run (AM-2)
+ *   GET    /admin/api/discovery/runs      recent runs with safe error categories (AM-2)
+ *   GET    /admin/api/post-candidates     ?status=&mapping=&limit=&cursor= (AM-2)
  *   GET    /admin/api/health              operational counts (Phase 8.2)
  *   GET    /admin/api/recovery            rows needing operator attention
  *   POST   /admin/api/comments/:id/retry  operator recovery of ONE comment
@@ -39,6 +42,7 @@ import {
   deleteMapping,
   overviewStats,
 } from "./admin-db.js";
+import { runDiscovery, listCandidates, listRuns, CANDIDATE_STATUSES, MAPPING_FILTERS } from "./discovery.js";
 import { logEvent, logError } from "./log.js";
 import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
 
@@ -189,6 +193,39 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       return apiJson({ data: await healthStats(db, config.pageId), mode: config.mode });
     }
 
+    if (resource === "discovery" && (idSegment === "run" || idSegment === "runs")) {
+      if (idSegment === "runs") {
+        if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+        return apiJson({ data: await listRuns(db, config.pageId, 10) });
+      }
+      if (method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+      return await handleDiscoveryRun(db, env, config);
+    }
+
+    if (resource === "post-candidates" && idSegment === undefined) {
+      if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+      const status = url.searchParams.get("status");
+      if (status !== null && !CANDIDATE_STATUSES.includes(status)) return invalid("status", "Unknown status");
+      const mapping = url.searchParams.get("mapping");
+      if (mapping !== null && !MAPPING_FILTERS.includes(mapping)) return invalid("mapping", "Unknown mapping filter");
+      let limit = 25;
+      const limitParam = url.searchParams.get("limit");
+      if (limitParam !== null) {
+        limit = /^\d{1,3}$/.test(limitParam) ? Number(limitParam) : 0;
+        if (limit < 1 || limit > 100) return invalid("limit", "limit must be 1-100");
+      }
+      let beforeId = null;
+      const cursor = url.searchParams.get("cursor");
+      if (cursor !== null) {
+        beforeId = parseId(cursor);
+        if (!beforeId) return invalid("cursor", "Invalid cursor");
+      }
+      const rows = await listCandidates(db, config.pageId, { status, mapping, beforeId, limit: limit + 1 });
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
+      return apiJson({ data: page, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
+    }
+
     if (resource === "recovery" && idSegment === undefined) {
       if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
       return apiJson({ data: await listRecoveryAttention(db, config.pageId) });
@@ -336,6 +373,34 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
     logError("admin_api_failed", "UNHANDLED_EXCEPTION", { resource: resource ?? null });
     return apiError(500, "INTERNAL_ERROR", "Internal error");
   }
+}
+
+/* ------------------------------ discovery ----------------------------- */
+
+const DISCOVERY_FAILURE_HTTP = { ALREADY_RUNNING: 409, TOKEN_MISSING: 503 };
+
+/**
+ * POST /admin/api/discovery/run (AM-2). Operator-triggered, bounded,
+ * READ-ONLY against Facebook (GET only). Writes post_candidates and
+ * discovery_runs only; never touches mappings or the reply pipeline.
+ * Session + same-origin/JSON CSRF checks already ran in admin.js. The body
+ * is ignored. A failed read is reported as a failure -- never as an empty
+ * success. Response: counts and error categories only, no tokens, no Graph
+ * error text, no post text.
+ */
+async function handleDiscoveryRun(db, env, config) {
+  let result;
+  try {
+    result = await runDiscovery({ db, env, config });
+  } catch {
+    logError("admin_discovery_failed", "UNHANDLED_EXCEPTION");
+    return apiError(500, "INTERNAL_ERROR", "Internal error");
+  }
+  if (!result.summary) {
+    return apiError(DISCOVERY_FAILURE_HTTP[result.code] ?? 500, result.code, result.code === "TOKEN_MISSING" ? "Page access token is not configured" : "Discovery is already running");
+  }
+  // FAILED -> 502 (the read did not succeed); OK / PARTIAL -> 200 with status.
+  return apiJson({ data: result.summary }, result.summary.status === "FAILED" ? 502 : 200);
 }
 
 /* ------------------------------ recovery ------------------------------ */

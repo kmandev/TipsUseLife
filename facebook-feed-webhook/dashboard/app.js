@@ -79,6 +79,7 @@
     ["overview", "ภาพรวม"],
     ["products", "สินค้า Affiliate"],
     ["content", "โพสต์ / Reel"],
+    ["discovered", "โพสต์ที่ค้นพบ"],
     ["activity", "กิจกรรมคอมเมนต์"],
     ["settings", "ตั้งค่า"],
   ];
@@ -95,7 +96,7 @@
     const main = h("main", { id: "view" }, h("p", { class: "muted", text: "กำลังโหลด…" }));
     root.appendChild(main);
     root.appendChild(h("div", { id: "toast", class: "toast" }));
-    const views = { overview: viewOverview, products: viewProducts, content: viewContent, activity: viewActivity, settings: viewSettings };
+    const views = { overview: viewOverview, products: viewProducts, content: viewContent, discovered: viewDiscovered, activity: viewActivity, settings: viewSettings };
     views[state.tab](main).catch((e) => { main.replaceChildren(h("p", { class: "error", text: e.message })); });
   }
 
@@ -313,6 +314,103 @@
           h("td", null, u.permalink ? h("a", { href: u.permalink, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: u.facebook_post_id }) : h("span", { class: "mono small", text: u.facebook_post_id })),
           h("td", { text: u.comment_count }), h("td", { text: fmtTime(u.last_comment_at) }),
           h("td", null, h("button", { class: "btn small", text: "ผูกสินค้า", onclick: () => { postId.value = u.facebook_post_id; product.focus(); window.scrollTo({ top: 0, behavior: "smooth" }); } })))))) : h("p", { class: "muted", text: "ไม่มี" }));
+  }
+
+  /* ------------------------- discovered posts (AM-2) ------------------------- */
+  const CANDIDATE_STATUS_LABEL = { DISCOVERED: "ค้นพบใหม่", UPDATED: "ข้อความถูกแก้ไข" };
+  const MAPPING_STATE_LABEL = { ACTIVE: "ผูกสินค้าแล้ว", INACTIVE: "ผูกแต่ปิดอยู่", NONE: "ยังไม่ผูก" };
+  const MAPPING_STATE_KIND = { ACTIVE: "green", INACTIVE: "gray", NONE: "blue" };
+  const RUN_STATUS_KIND = { OK: "green", PARTIAL: "blue", FAILED: "red", RUNNING: "gray" };
+  const ERROR_TEXT = {
+    TOKEN_MISSING: "ยังไม่ได้ตั้งค่า Page access token",
+    TOKEN_INVALID: "Token หมดอายุ/ไม่ถูกต้อง",
+    PERMISSION_DENIED: "ไม่มีสิทธิ์อ่านโพสต์ (ตรวจ permission ของแอป)",
+    RATE_LIMITED: "Facebook จำกัดอัตราการเรียก — ลองใหม่ภายหลัง",
+    TRANSIENT: "Facebook ขัดข้องชั่วคราว — ลองใหม่",
+    GRAPH_REJECTED: "Facebook ปฏิเสธคำขอ",
+    NETWORK: "เครือข่ายขัดข้อง",
+    TIMEOUT: "หมดเวลา",
+    MALFORMED: "ข้อมูลจาก Facebook ไม่ถูกต้อง",
+    ALREADY_RUNNING: "มีการค้นหาที่กำลังทำงานอยู่",
+    RUN_ABANDONED: "การค้นหาถูกยกเลิกกลางคัน",
+    ITEM_WRITE_FAILED: "บันทึกบางรายการไม่สำเร็จ",
+    INTERNAL_ERROR: "ข้อผิดพลาดภายใน",
+  };
+  const errText = (code) => (code ? ERROR_TEXT[code] || code : "");
+  /** Only real Facebook https links become anchors; anything else is shown as text. */
+  const isFacebookUrl = (u) => /^https:\/\/([a-z0-9-]+\.)*facebook\.com\//i.test(String(u || ""));
+  const preview = (t) => { const s = String(t || "").replace(/\s+/g, " ").trim(); return s.length > 140 ? s.slice(0, 140) + "…" : s; };
+
+  async function viewDiscovered(main) {
+    const status = h("select", null, h("option", { value: "", text: "ทุกสถานะ" }), ...Object.entries(CANDIDATE_STATUS_LABEL).map(([v, t]) => h("option", { value: v, text: t })));
+    const mapping = h("select", null, h("option", { value: "", text: "ทุกการผูก" }), h("option", { value: "unmapped", text: "ยังไม่ผูกสินค้า" }), h("option", { value: "mapped", text: "ผูกสินค้าแล้ว" }), h("option", { value: "inactive", text: "ผูกแต่ปิดอยู่" }));
+    const summarySlot = h("div");
+    const runsSlot = h("div");
+    const tableSlot = h("div");
+    const more = h("button", { class: "btn ghost", text: "โหลดเพิ่ม" });
+    let cursor = null; let rows = [];
+
+    const table = () => !rows.length ? h("p", { class: "muted", text: "ยังไม่มีโพสต์ที่ค้นพบ — กด “ค้นหาโพสต์ใหม่”" }) : h("table", null,
+      h("thead", null, h("tr", null, ["ข้อความ", "ประเภท", "สร้างเมื่อ", "สถานะ", "การผูกสินค้า", "ลิงก์"].map((t) => h("th", { text: t })))),
+      h("tbody", null, rows.map((c) => h("tr", null,
+        h("td", null, h("div", { text: preview(c.message) || "(ไม่มีข้อความ)", class: c.message ? "" : "muted" }), h("div", { class: "mono small muted", text: c.post_id })),
+        h("td", { text: c.content_type === "REEL" ? "Reel" : c.content_type === "POST" ? "โพสต์" : "ไม่ทราบ" }),
+        h("td", { class: "nowrap small", text: fmtTime(c.fb_created_time) }),
+        h("td", null, badge(CANDIDATE_STATUS_LABEL[c.status] || c.status, c.status === "UPDATED" ? "blue" : "gray")),
+        h("td", null, badge(MAPPING_STATE_LABEL[c.mapping_state] || c.mapping_state, MAPPING_STATE_KIND[c.mapping_state])),
+        h("td", null, isFacebookUrl(c.permalink) ? h("a", { href: c.permalink, target: "_blank", rel: "noopener noreferrer", class: "small", text: "เปิดบน Facebook ↗" }) : h("span", { class: "muted small", text: "-" }))))));
+
+    const load = async (reset) => {
+      if (reset) { cursor = null; rows = []; }
+      const qs = new URLSearchParams({ limit: "25" });
+      if (status.value) qs.set("status", status.value);
+      if (mapping.value) qs.set("mapping", mapping.value);
+      if (cursor) qs.set("cursor", cursor);
+      const res = await api("/admin/api/post-candidates?" + qs);
+      rows = rows.concat(res.data || []); cursor = res.next_cursor;
+      tableSlot.replaceChildren(table());
+      more.style.display = res.has_more ? "" : "none";
+    };
+
+    const runsTable = (runs) => !runs.length ? h("p", { class: "muted small", text: "ยังไม่เคยค้นหา" }) : h("table", null,
+      h("thead", null, h("tr", null, ["เวลา", "ผล", "พบ", "ใหม่", "แก้ไข", "ไม่เปลี่ยน", "ข้าม", "ล้มเหลว", "ข้อผิดพลาด"].map((t) => h("th", { text: t })))),
+      h("tbody", null, runs.map((r) => h("tr", null,
+        h("td", { class: "nowrap small", text: fmtTime(r.started_at) }),
+        h("td", null, badge(r.status, RUN_STATUS_KIND[r.status]), Number(r.truncated) === 1 ? h("div", { class: "muted small", text: "ถึงขีดจำกัดแล้ว" }) : null),
+        h("td", { text: r.discovered }), h("td", { text: r.inserted }), h("td", { text: r.updated }), h("td", { text: r.unchanged }), h("td", { text: r.skipped }), h("td", { text: r.failed }),
+        h("td", { class: "small" }, r.error_code ? h("div", { class: "error", text: errText(r.error_code) }) : null,
+          ...(r.sources || []).filter((s) => !s.ok).map((s) => h("div", { class: "muted", text: s.source + ": " + errText(s.error_code) + (s.graph_code ? " (code " + s.graph_code + ")" : "") })))))));
+
+    const loadRuns = async () => { const res = await api("/admin/api/discovery/runs"); runsSlot.replaceChildren(runsTable(res.data || [])); };
+
+    const run = h("button", { class: "btn primary", text: "ค้นหาโพสต์ใหม่", onclick: async (e) => {
+      e.target.disabled = true; summarySlot.replaceChildren(h("p", { class: "muted", text: "กำลังอ่านโพสต์จาก Facebook (อ่านอย่างเดียว)…" }));
+      try {
+        const res = await fetch("/admin/api/discovery/run", { method: "POST", headers: { "content-type": "application/json" }, body: "{}", credentials: "same-origin" });
+        const data = await res.json().catch(() => null);
+        const d = data && data.data;
+        if (res.ok && d) {
+          summarySlot.replaceChildren(h("p", { class: d.status === "OK" ? "" : "error", text: "ผล: " + d.status + " · พบ " + d.discovered + " · ใหม่ " + d.inserted + " · แก้ไข " + d.updated + " · ไม่เปลี่ยน " + d.unchanged + " · ข้าม " + d.skipped + " · ล้มเหลว " + d.failed + (d.truncated ? " · ถึงขีดจำกัด (อาจยังมีโพสต์เก่ากว่านี้)" : "") + (d.error_code ? " · " + errText(d.error_code) : "") }));
+        } else {
+          const code = (d && d.error_code) || (data && data.error && data.error.code) || String(res.status);
+          summarySlot.replaceChildren(h("p", { class: "error", text: "ค้นหาไม่สำเร็จ: " + errText(code) }));
+        }
+      } catch (ex) { summarySlot.replaceChildren(h("p", { class: "error", text: ex.message })); }
+      e.target.disabled = false;
+      try { await Promise.all([load(true), loadRuns()]); } catch (ex) { toast(ex.message, "err"); }
+    } });
+
+    status.addEventListener("change", () => load(true));
+    mapping.addEventListener("change", () => load(true));
+    more.addEventListener("click", () => load(false));
+    main.replaceChildren(
+      h("div", { class: "row-between" }, h("h2", { text: "โพสต์ที่ค้นพบ" }), run),
+      h("p", { class: "muted", text: "อ่านโพสต์/Reel ของเพจจาก Facebook แบบอ่านอย่างเดียวและเก็บไว้เป็นรายการ — ขั้นนี้ไม่ผูกสินค้า ไม่ตอบคอมเมนต์ และไม่แก้ไข mapping ใด ๆ ทั้งสิ้น ผูกสินค้าได้ที่แท็บ “โพสต์ / Reel”" }),
+      summarySlot,
+      h("div", { class: "toolbar" }, status, mapping),
+      tableSlot, more,
+      h("h3", { text: "ประวัติการค้นหา" }), runsSlot);
+    await Promise.all([load(true), loadRuns()]);
   }
 
   /* ----------------------------- activity ---------------------------- */

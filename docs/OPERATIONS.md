@@ -199,6 +199,83 @@ Settings → "REPLY_MODE (มีผลจริง)" must then read `LIVE`.
 | Edge proxy | `systemctl --user restart hermes-edge-proxy`; to remove it: `disable --now`, then restore `~/.hermes/backups/config.yaml.<ts>` and restart Hermes |
 | D1 | migrations are additive; older Worker versions ignore the new columns/table |
 
+## Post discovery (Phase AM-2 — read-only, manual)
+
+Lists the Page's posts and reels in the Dashboard tab **โพสต์ที่ค้นพบ** so
+they can be mapped to products. **AM-2 does not create, change or
+deactivate any mapping, does not change comment replies, does not call
+Hermes, and performs no Facebook write.** Nothing runs automatically: there
+is no cron, queue or webhook trigger for discovery.
+
+**Run it.** Dashboard → โพสต์ที่ค้นพบ → ค้นหาโพสต์ใหม่ (equivalent to an
+authenticated `POST /admin/api/discovery/run` with a same-origin JSON body).
+It reads two edges with `GET` only, using the existing `PAGE_ACCESS_TOKEN`
+in the `Authorization` header: `/{page}/published_posts` (fields
+`id,message,created_time,permalink_url,status_type`) and `/{page}/video_reels`
+(`id,description,created_time,permalink_url`). Nothing else is fetched: no
+comments, no author data, no media.
+
+**Limits.** 25 items per page, at most 2 pages and 50 items per edge, one
+20 s deadline for the whole run. A run that stops at a limit is reported
+`truncated` (older posts may exist; they are not an error). No automatic
+retry. Only one run at a time: a second request answers `409
+ALREADY_RUNNING`; a `RUNNING` row older than 300 s is treated as abandoned
+(`RUN_ABANDONED`). Worst case is roughly 110 D1 queries per run; this needs
+the Workers Paid D1 query limit (1000 per invocation) — **owner to confirm the
+plan before the first run.**
+
+**Run result** (`status`): `OK` all edges read; `PARTIAL` one edge failed or
+some rows could not be written (what was read is kept); `FAILED` nothing could
+be read — HTTP 502, never presented as an empty success. Counters:
+`discovered`, `inserted`, `updated` (text edited), `unchanged`, `skipped`
+(malformed id or the same post under both edges), `failed` (D1 write errors).
+`503 TOKEN_MISSING` = no `PAGE_ACCESS_TOKEN` (no run is recorded).
+
+**Candidate status** (`post_candidates.status`): `DISCOVERED` — first seen,
+text unchanged since; `UPDATED` — text changed after first discovery
+(`revision` increments, `content_changed_at` set). Posts removed on Facebook
+are **not** detected in AM-2 (absence from a bounded listing proves nothing).
+Mapping state shown per row: `ACTIVE`, `INACTIVE`, `NONE`, read from
+`content_mappings`; a candidate is "unmapped" only when no active mapping row
+exists.
+
+**Inspect errors.** Dashboard → โพสต์ที่ค้นพบ → ประวัติการค้นหา, or
+`GET /admin/api/discovery/runs`, or D1:
+`SELECT id,status,error_code,detail FROM discovery_runs ORDER BY id DESC LIMIT 5;`.
+`detail` holds per-edge `{source, ok, error_code, graph_code, http_status,
+pages, items, complete, truncated}` only — never a token, a Graph error
+message or post text. Error codes: `TOKEN_INVALID` (Graph 190/463/467 or HTTP
+401 — token expired/revoked), `PERMISSION_DENIED` (Graph 10, 200–299, HTTP
+403 — the token lacks a read permission), `RATE_LIMITED` (4/17/32/613 or 429),
+`TRANSIENT` (5xx), `GRAPH_REJECTED` (other 4xx), `NETWORK`, `TIMEOUT`,
+`MALFORMED`, `RUN_ABANDONED`, `ITEM_WRITE_FAILED`, `INTERNAL_ERROR`.
+
+**Meta permissions — status.** Reading a Page's posts needs a Page token with
+`pages_read_engagement` (and, for reels/videos, `pages_show_list`/the Page
+task that can read videos). **UNVERIFIED:** no live Graph request was made
+in AM-2 (no Page token is reachable from the build environment), so these
+are unconfirmed against the real Page and v21.0:
+
+- that the current token can read `published_posts` and `video_reels`;
+- that the field names above are accepted by v21.0;
+- that a reel's `id` from `video_reels` equals the `post_id` Meta sends in a
+  comment webhook (needed for the mapping join to match);
+- that `permalink_url` for reels is returned;
+- webhook delivery of post create/edit events (not used by AM-2).
+
+If a read is refused the run reports the failure; nothing is faked. First
+live check (read-only, operator): run discovery once and read the result; a
+`PERMISSION_DENIED`/`TOKEN_INVALID` result is the exact blocker to resolve in
+the Meta app.
+
+**Deploy / migrate (not executed by AM-2).** 1) `git pull` on the Pi. 2)
+`cd facebook-feed-webhook && npm test`. 3) Apply
+`database/migrations/0004_post_candidates.sql` with
+`npx wrangler d1 migrations apply tipsuselife-ai --remote` (additive: two new
+tables, nothing existing is altered; older Worker versions ignore them). 4)
+`npx wrangler deploy`. No `wrangler.jsonc` change is needed. Rollback: the
+previous Worker version still works with the tables present.
+
 ## Routine operations
 
 - New product: Dashboard → สินค้า Affiliate → เพิ่มสินค้า (https link on an
