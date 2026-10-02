@@ -396,6 +396,17 @@ then `npx wrangler deploy`. No `wrangler.jsonc` change.
 
 - New product: Dashboard → สินค้า Affiliate → เพิ่มสินค้า (https link on an
   allowed host; description is the only product truth the AI gets).
+- Manual mapping rules (AM-2.5): the post id must be the Page post id
+  `<page_id>_<post_id>` (a bare Reel/video id is rejected, 400). The product
+  must exist, be active and not deleted (`PRODUCT_UNAVAILABLE`, 400). Creating
+  never replaces: if the post — or another discovered row of the same Reel —
+  already has a mapping (active or inactive) the answer is `409
+  MAPPING_EXISTS` and nothing changes; edit the existing row instead. Editing
+  (PATCH): changing the product needs an available product and a confirmation
+  in the Dashboard; a mapping can only be (re)activated with an available
+  product and while no other row of the same Reel is active; deactivating is
+  always allowed. Existing mappings whose product later becomes inactive keep
+  working as before (the reply simply carries no link).
 - New post/reel: after its first comment it appears under
   "โพสต์ที่มีคอมเมนต์แต่ยังไม่ผูกสินค้า" → ผูกสินค้า. Or paste its id.
 - Product sold out / link dead: toggle it off — mapped posts stop getting a

@@ -305,14 +305,24 @@
       mappings.length ? h("table", null,
         h("thead", null, h("tr", null, ["โพสต์", "ประเภท", "สินค้า", "คอมเมนต์", "สถานะ", ""].map((t) => h("th", { text: t })))),
         h("tbody", null, mappings.map((m) => {
-          const sel = h("select", { onchange: async (e) => { try { await api("/admin/api/content/" + m.id, { method: "PATCH", body: { product_id: Number(e.target.value) } }); toast("เปลี่ยนสินค้าแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); } } }, productOptions(m.product_id));
+          // AM-2.5: changing a live mapping's product needs an explicit confirmation.
+          // Cancel restores the persisted value and sends nothing; an error reloads the persisted state.
+          const sel = h("select", { onchange: async (e) => {
+            const next = products.find((p) => String(p.id) === String(e.target.value));
+            const current = products.find((p) => Number(p.id) === Number(m.product_id));
+            const ok = window.confirm("เปลี่ยนสินค้าของโพสต์ " + m.facebook_post_id + "\nจาก: " + ((current && current.name) || m.product_name || ("#" + m.product_id)) + "\nเป็น: " + ((next && next.name) || ("#" + e.target.value)) + "\nคำตอบคอมเมนต์ถัดไปของโพสต์นี้จะใช้ลิงก์สินค้าใหม่");
+            if (!ok) { e.target.value = String(m.product_id); return; }
+            try { await api("/admin/api/content/" + m.id, { method: "PATCH", body: { product_id: Number(e.target.value) } }); toast("เปลี่ยนสินค้าแล้ว"); }
+            catch (ex) { toast(ex.message, "err"); }
+            refresh();
+          } }, productOptions(m.product_id));
           const unusable = Number(m.product_active) !== 1 || m.product_deleted_at;
           return h("tr", null,
             h("td", null, m.permalink ? h("a", { href: m.permalink, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: m.facebook_post_id }) : h("span", { class: "mono small", text: m.facebook_post_id }), m.note ? h("div", { class: "muted small", text: m.note }) : null),
             h("td", { text: m.facebook_content_type === "REEL" ? "Reel" : "โพสต์" }),
             h("td", null, products.some((p) => Number(p.id) === Number(m.product_id)) ? sel : h("span", { text: m.product_name }), unusable ? h("div", { class: "error small", text: "สินค้าถูกปิด/ลบ — จะไม่แนบลิงก์" }) : null),
             h("td", { text: m.comment_count ?? 0 }),
-            h("td", null, h("label", { class: "switch" }, h("input", { type: "checkbox", checked: Number(m.active) === 1, onchange: async (e) => { try { await api("/admin/api/content/" + m.id, { method: "PATCH", body: { active: e.target.checked } }); toast("อัปเดตแล้ว"); } catch (ex) { toast(ex.message, "err"); e.target.checked = !e.target.checked; } } }), h("span", { text: Number(m.active) === 1 ? "เปิด" : "ปิด" }))),
+            h("td", null, h("label", { class: "switch" }, h("input", { type: "checkbox", checked: Number(m.active) === 1, onchange: async (e) => { try { await api("/admin/api/content/" + m.id, { method: "PATCH", body: { active: e.target.checked } }); toast("อัปเดตแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); e.target.checked = !e.target.checked; } } }), h("span", { text: Number(m.active) === 1 ? "เปิด" : "ปิด" }))),
             h("td", null, h("button", { class: "btn small danger", text: "ยกเลิก", onclick: async () => { if (!window.confirm("ยกเลิกการผูกสินค้ากับโพสต์นี้?")) return; try { await api("/admin/api/content/" + m.id, { method: "DELETE" }); toast("ยกเลิกแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); } } })));
         }))) : h("p", { class: "muted", text: "ยังไม่มี mapping" }),
       h("h3", { text: "โพสต์ที่มีคอมเมนต์แต่ยังไม่ผูกสินค้า" }),

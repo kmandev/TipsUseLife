@@ -8,7 +8,7 @@
  *   PATCH  /admin/api/products/:id        (edit, or {active} toggle)
  *   DELETE /admin/api/products/:id        (soft delete)
  *   GET    /admin/api/content
- *   POST   /admin/api/content             (create or replace mapping for a post)
+ *   POST   /admin/api/content             (create a mapping; 409 if the post/Reel is already mapped -- AM-2.5)
  *   PATCH  /admin/api/content/:id
  *   DELETE /admin/api/content/:id
  *   POST   /admin/api/discovery/run      one bounded, READ-ONLY post discovery run (AM-2)
@@ -42,8 +42,10 @@ import {
   listMappings,
   listUnmappedPosts,
   getMapping,
-  upsertMapping,
-  updateMapping,
+  insertMappingIfAbsent,
+  updateMappingGuarded,
+  subjectSourcePostIds,
+  mappingsForPosts,
   deleteMapping,
   overviewStats,
 } from "./admin-db.js";
@@ -131,14 +133,25 @@ export function validateProductInput(body, allowedHosts) {
   };
 }
 
-export function validateMappingInput(body) {
+/**
+ * @param {object} body
+ * @param {{pageId?: string, legacyKey?: boolean}} [options] pageId: the post id
+ *   must be `<pageId>_<n>` (AM-2.5: a bare reel/video id is never a mapping
+ *   key -- comment webhooks always carry `<page>_<n>`). legacyKey: PATCH of an
+ *   existing row, whose immutable key is not re-validated.
+ */
+export function validateMappingInput(body, { pageId = null, legacyKey = false } = {}) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { ok: false, response: apiError(400, "INVALID_REQUEST", "Invalid request body") };
   }
   const postId = typeof body.facebook_post_id === "string" ? body.facebook_post_id.trim() : "";
-  // Page post ids look like "<page_id>_<post_id>"; reels/videos are numeric.
-  if (!/^[0-9]{5,}(_[0-9]{1,})?$/.test(postId)) {
-    return { ok: false, response: invalid("facebook_post_id", "Facebook post/reel id must look like 123_456 or 123456") };
+  if (!legacyKey) {
+    if (!/^[0-9]{5,}_[0-9]+$/.test(postId)) {
+      return { ok: false, response: invalid("facebook_post_id", "Use the Page post id <page_id>_<post_id> (a bare Reel/video id cannot be mapped)") };
+    }
+    if (pageId && !postId.startsWith(`${pageId}_`)) {
+      return { ok: false, response: invalid("facebook_post_id", "The post id must belong to this Page") };
+    }
   }
   const type = String(body.facebook_content_type ?? "POST").toUpperCase();
   if (!CONTENT_TYPES.includes(type)) return { ok: false, response: invalid("facebook_content_type", "Type must be POST or REEL") };
@@ -149,6 +162,27 @@ export function validateMappingInput(body) {
   const active = toActive(body.active);
   if (active === null) return { ok: false, response: invalid("active", "active must be true/false") };
   return { ok: true, value: { facebook_post_id: postId, facebook_content_type: type, product_id: productId, note: note.value, active } };
+}
+
+/** AM-2.5: a product may be mapped (or keep an ACTIVE mapping) only when it exists, is active and not deleted. */
+function productAvailable(product) {
+  return Boolean(product) && Number(product.active) === 1 && !product.deleted_at;
+}
+
+function productUnavailable() {
+  return apiError(400, "PRODUCT_UNAVAILABLE", "Product not found, inactive or deleted", { "x-invalid-field": "product_id" });
+}
+
+/** 409 for an existing mapping on the same post or the same logical Reel; ids only. */
+function mappingExists(rows, postId) {
+  const exact = rows.find((r) => r.facebook_post_id === postId);
+  const message = exact
+    ? "This post already has a mapping; edit the existing mapping instead"
+    : "Another row of the same Reel is already mapped; edit that mapping instead";
+  return apiJson(
+    { error: { code: "MAPPING_EXISTS", message }, existing_mapping_ids: rows.map((r) => Number(r.id)) },
+    409
+  );
 }
 
 async function readJson(request) {
@@ -371,11 +405,15 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
           return apiJson({ data: { mappings, unmapped } });
         }
         if (method === "POST") {
-          const checked = validateMappingInput(await readJson(request));
+          // AM-2.5: create only -- never overwrites. Edits go through PATCH.
+          const checked = validateMappingInput(await readJson(request), { pageId: config.pageId });
           if (!checked.ok) return checked.response;
-          const product = await getProduct(db, checked.value.product_id);
-          if (!product || product.deleted_at) return invalid("product_id", "Product not found");
-          const id = await upsertMapping(db, { ...checked.value, facebook_page_id: config.pageId });
+          if (!productAvailable(await getProduct(db, checked.value.product_id))) return productUnavailable();
+          const sourceIds = await subjectSourcePostIds(db, config.pageId, checked.value.facebook_post_id);
+          const existingRows = await mappingsForPosts(db, config.pageId, sourceIds);
+          if (existingRows.length) return mappingExists(existingRows, checked.value.facebook_post_id);
+          const id = await insertMappingIfAbsent(db, { ...checked.value, facebook_page_id: config.pageId }, sourceIds);
+          if (!id) return mappingExists(await mappingsForPosts(db, config.pageId, sourceIds), checked.value.facebook_post_id);
           logEvent("admin_mapping_saved", { mapping_id: id, product_id: checked.value.product_id });
           return apiJson({ data: await getMapping(db, id) }, 201);
         }
@@ -398,11 +436,24 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
           ...(body && typeof body === "object" && !Array.isArray(body) ? body : {}),
         };
         merged.facebook_post_id = existing.facebook_post_id; // the key is immutable
-        const checked = validateMappingInput(merged);
+        const checked = validateMappingInput(merged, { legacyKey: true });
         if (!checked.ok) return checked.response;
-        const product = await getProduct(db, checked.value.product_id);
-        if (!product || product.deleted_at) return invalid("product_id", "Product not found");
-        await updateMapping(db, id, config.pageId, checked.value);
+        const v = checked.value;
+        // AM-2.5: a product change must target an available product, and a
+        // mapping may only end up ACTIVE with an available product. A pure
+        // deactivation or a note edit on an inactive mapping is never blocked.
+        const productChanged = Number(v.product_id) !== Number(existing.product_id);
+        const endsActive = Number(v.active) === 1;
+        if (productChanged || endsActive) {
+          if (!productAvailable(await getProduct(db, v.product_id))) return productUnavailable();
+        }
+        const siblings = (await subjectSourcePostIds(db, config.pageId, existing.facebook_post_id)).filter((p) => p !== existing.facebook_post_id);
+        if (endsActive) {
+          const conflicts = (await mappingsForPosts(db, config.pageId, siblings, id)).filter((r) => Number(r.active) === 1);
+          if (conflicts.length) return mappingExists(conflicts, existing.facebook_post_id);
+        }
+        const changed = await updateMappingGuarded(db, id, config.pageId, v, siblings);
+        if (!changed) return mappingExists(await mappingsForPosts(db, config.pageId, siblings, id), existing.facebook_post_id);
         logEvent("admin_mapping_updated", { mapping_id: id });
         return apiJson({ data: await getMapping(db, id) });
       }

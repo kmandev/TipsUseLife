@@ -159,6 +159,8 @@ export async function getMapping(db, id) {
 
 /**
  * Create or replace the mapping for a post (one product per post/reel).
+ * AM-2.5: no longer used by the admin API (create is insertMappingIfAbsent,
+ * edits are updateMappingGuarded); kept for compatibility only.
  * @returns {Promise<number>} mapping id
  */
 export async function upsertMapping(db, m) {
@@ -177,6 +179,92 @@ export async function upsertMapping(db, m) {
     .bind(m.facebook_page_id, m.facebook_post_id, m.facebook_content_type, m.product_id, m.active, m.note)
     .first();
   return Number(row.id);
+}
+
+/* ----------------- AM-2.5 manual mapping safety helpers ----------------- */
+
+/**
+ * Every known physical source id of the logical subject `postId` belongs to
+ * (AM-2.2 canonical Reel grouping, read from post_candidates). A post that
+ * discovery has not seen -- or that has no canonical reel id -- is its own
+ * subject: no sibling is guessed or fabricated.
+ * @returns {Promise<string[]>} always includes postId
+ */
+export async function subjectSourcePostIds(db, pageId, postId) {
+  const row = await db
+    .prepare(`SELECT canonical_reel_id FROM post_candidates WHERE page_id = ? AND post_id = ? AND canonical_reel_id IS NOT NULL LIMIT 1`)
+    .bind(pageId, postId)
+    .first();
+  if (!row?.canonical_reel_id) return [postId];
+  const res = await db
+    .prepare(`SELECT post_id FROM post_candidates WHERE page_id = ? AND canonical_reel_id = ?`)
+    .bind(pageId, row.canonical_reel_id)
+    .all();
+  const ids = new Set([postId, ...(res?.results ?? []).map((r) => String(r.post_id))]);
+  return [...ids];
+}
+
+/** Mapping rows (any state) on the given source ids, optionally excluding one mapping id. */
+export async function mappingsForPosts(db, pageId, postIds, excludeId = null) {
+  if (!postIds.length) return [];
+  const marks = postIds.map(() => "?").join(",");
+  const res = await db
+    .prepare(
+      `SELECT id, facebook_post_id, product_id, active FROM content_mappings
+        WHERE facebook_page_id = ? AND facebook_post_id IN (${marks}) ${excludeId ? "AND id <> ?" : ""}`
+    )
+    .bind(pageId, ...postIds, ...(excludeId ? [excludeId] : []))
+    .all();
+  return res?.results ?? [];
+}
+
+/**
+ * Create-only manual mapping (AM-2.5). One statement: the row is inserted only
+ * if NO mapping (active or inactive) exists on any source id of the subject.
+ * Never replaces an existing mapping (that is PATCH's job).
+ * @returns {Promise<number|null>} new mapping id, or null when a mapping exists
+ */
+export async function insertMappingIfAbsent(db, m, sourcePostIds) {
+  const ids = sourcePostIds.length ? sourcePostIds : [m.facebook_post_id];
+  const marks = ids.map(() => "?").join(",");
+  try {
+    const row = await db
+      .prepare(
+        `INSERT INTO content_mappings (facebook_page_id, facebook_post_id, facebook_content_type, product_id, active, note)
+         SELECT ?, ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (SELECT 1 FROM content_mappings WHERE facebook_page_id = ? AND facebook_post_id IN (${marks}))
+         RETURNING id`
+      )
+      .bind(m.facebook_page_id, m.facebook_post_id, m.facebook_content_type, m.product_id, m.active, m.note, m.facebook_page_id, ...ids)
+      .first();
+    return row ? Number(row.id) : null;
+  } catch (error) {
+    if (/UNIQUE/i.test(String(error?.message))) return null; // lost a race: the exact post got mapped
+    throw error;
+  }
+}
+
+/**
+ * Guarded PATCH (AM-2.5): one UPDATE statement. When the result is active, it
+ * applies only if no OTHER active mapping exists on a sibling source id of the
+ * same subject. Deactivation is never blocked by that guard.
+ * @returns {Promise<number>} rows changed (0 = conflict or not found)
+ */
+export async function updateMappingGuarded(db, id, pageId, m, siblingPostIds) {
+  const others = siblingPostIds.length ? siblingPostIds : ["__none__"];
+  const marks = others.map(() => "?").join(",");
+  const result = await db
+    .prepare(
+      `UPDATE content_mappings
+          SET facebook_content_type = ?, product_id = ?, active = ?, note = ?, updated_at = datetime('now')
+        WHERE id = ? AND facebook_page_id = ?
+          AND (? = 0 OR NOT EXISTS (
+                SELECT 1 FROM content_mappings o
+                 WHERE o.facebook_page_id = ? AND o.id <> ? AND o.active = 1 AND o.facebook_post_id IN (${marks})))`
+    )
+    .bind(m.facebook_content_type, m.product_id, m.active, m.note, id, pageId, m.active, pageId, id, ...others)
+    .run();
+  return Number(result?.meta?.changes ?? 0);
 }
 
 export async function updateMapping(db, id, pageId, m) {

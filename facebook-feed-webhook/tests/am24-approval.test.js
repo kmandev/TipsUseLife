@@ -274,3 +274,37 @@ test("isolation: approval code makes no network call and the reply path is uncha
     assert.doesNotMatch(readFileSync(join(ROOT, "src", f), "utf8"), /approveSuggestion|product_suggestions/, f);
   }
 });
+
+/* ============ AM-2.5 compatibility: manual guards vs. approval ============ */
+
+test("AM-2.5: a manual mapping created after the suggestion was listed makes approval 409 without overwriting", async () => {
+  const db = db0();
+  seedReel(db);
+  const id = await seedSuggestion(db);
+  assert.equal((await listSuggestions(db, P))[0].mappable, true, "listed as mappable");
+  const manual = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: `${P}_1643230854478678`, facebook_content_type: "REEL", product_id: 8, note: "manual" } });
+  assert.equal(manual.status, 201);
+  const before = JSON.stringify(mappings(db));
+  const r = await approve(db, id);
+  assert.equal(r.status, 409);
+  assert.equal(r.json.error.code, "MAPPING_EXISTS");
+  assert.equal(JSON.stringify(mappings(db)), before, "the manual mapping is kept");
+  assert.equal(statuses(db)[0].status, "PENDING");
+});
+
+test("AM-2.5: after an approval, the manual form cannot add or replace a mapping for that Reel", async () => {
+  const db = db0();
+  seedReel(db);
+  const id = await seedSuggestion(db);
+  assert.equal((await approve(db, id)).status, 200);
+  const before = JSON.stringify(mappings(db));
+  const same = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: `${P}_1643230854478678`, product_id: 8 } });
+  assert.equal(same.status, 409);
+  const bare = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: "1418143500204950", product_id: 8 } });
+  assert.equal(bare.status, 400, "bare reel id rejected");
+  assert.equal(JSON.stringify(mappings(db)), before);
+  const again = await approve(db, id);
+  assert.equal(again.status, 200);
+  assert.equal(again.json.idempotent, true);
+  assert.equal(mappings(db).length, 1);
+});

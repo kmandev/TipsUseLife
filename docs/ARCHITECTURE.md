@@ -81,7 +81,9 @@ URL scraped from post text would let any link in a caption become a
 "trusted" affiliate link. So:
 
 1. **Content mapping (authoritative).** In the Dashboard, a post/reel id is
-   mapped to one product. The Dashboard lists posts that have received
+   mapped to one product. (AM-2.5: create never replaces an existing mapping, a
+   bare Reel id is never a key, the product must be available, and one logical
+   Reel cannot get a second mapping through another physical row.) The Dashboard lists posts that have received
    comments but have no mapping yet, so ids never have to be looked up by
    hand. If the mapped product is inactive/deleted/invalid, the reply gets
    **no link** — it never falls back to another product.

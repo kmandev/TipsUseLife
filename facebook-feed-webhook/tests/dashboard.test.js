@@ -116,7 +116,9 @@ test("products: invalid input is rejected before D1", async () => {
   assert.equal(db._state.products.length, 0);
 });
 
-test("content mappings: create/replace, change product, toggle, delete; deleted product disables mappings", async () => {
+// AM-2.5: POST no longer replaces an existing mapping (it answers 409 MAPPING_EXISTS and
+// leaves the row untouched); a deliberate product change goes through PATCH.
+test("content mappings: create, no silent replace, change product, toggle, delete; deleted product disables mappings", async () => {
   const db = createFakeD1();
   const a = (await req(db, "POST", "/admin/api/products", { body: GOOD })).json.data.id;
   const b = (await req(db, "POST", "/admin/api/products", { body: { ...GOOD, name: "หูฟัง", affiliate_url: "https://s.shopee.co.th/xyz" } })).json.data.id;
@@ -125,9 +127,12 @@ test("content mappings: create/replace, change product, toggle, delete; deleted 
   const m = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: post, facebook_content_type: "REEL", product_id: a } });
   assert.equal(m.status, 201);
   const again = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: post, product_id: b } });
-  assert.equal(again.json.data.id, m.json.data.id, "one mapping per post (upsert)");
+  assert.equal(again.status, 409, "one mapping per post: create never replaces");
+  assert.equal(again.json.error.code, "MAPPING_EXISTS");
+  assert.deepEqual(again.json.existing_mapping_ids, [m.json.data.id]);
   assert.equal(db._state.mappings.length, 1);
-  assert.equal(db._state.mappings[0].product_id, b);
+  assert.equal(db._state.mappings[0].product_id, a, "the existing mapping is unchanged");
+  assert.equal((await req(db, "PATCH", `/admin/api/content/${m.json.data.id}`, { body: { product_id: b } })).json.data.product_id, b, "a deliberate change uses PATCH");
 
   const mid = m.json.data.id;
   assert.equal((await req(db, "PATCH", `/admin/api/content/${mid}`, { body: { product_id: a } })).json.data.product_id, a);
@@ -193,4 +198,147 @@ test("session endpoint and logout", async () => {
   assert.equal((await req(db, "GET", "/admin/session")).json.authenticated, true);
   const out = await req(db, "POST", "/admin/logout");
   assert.match(out.response.headers.get("set-cookie"), /Max-Age=0/);
+});
+
+/* ===================== AM-2.5 manual mapping safety ===================== */
+
+const AM25_PAGE = "853313081388711";
+const AM25_PRODUCTS = [
+  { id: 1, name: "สินค้า A", affiliate_url: "https://s.shopee.co.th/a1" },
+  { id: 2, name: "สินค้า B", affiliate_url: "https://s.shopee.co.th/b2" },
+  { id: 3, name: "ปิดอยู่", affiliate_url: "https://s.shopee.co.th/c3", active: 0 },
+  { id: 4, name: "ลบแล้ว", affiliate_url: "https://s.shopee.co.th/d4", deleted_at: "2026-09-01 00:00:00" },
+];
+/** One canonical Reel known under its posts-edge id and its bare reels-edge id. */
+function am25Db(mappings = []) {
+  const db = createFakeD1({ products: AM25_PRODUCTS, mappings });
+  const ins = (postId, src) =>
+    db._sqlite
+      .prepare(`INSERT INTO post_candidates (page_id, post_id, content_type, message, permalink, content_hash, discovery_source, canonical_reel_id) VALUES (?, ?, 'REEL', 'x', 'https://www.facebook.com/reel/7777777/', 'h', ?, '7777777')`)
+      .run(AM25_PAGE, postId, src);
+  ins("7777777", "reels");
+  ins(`${AM25_PAGE}_5550001`, "posts");
+  return db;
+}
+const am25Maps = (db) => JSON.stringify(db._query("SELECT * FROM content_mappings ORDER BY id"));
+
+test("AM-2.5 POST: bare reel ids, foreign-page ids and malformed ids are rejected", async () => {
+  const db = am25Db();
+  for (const id of ["7777777", "1418143500204950", "999999_123", "abc_123", `${AM25_PAGE}_`, `${AM25_PAGE}`]) {
+    const r = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: id, product_id: 1 } });
+    assert.equal(r.status, 400, id);
+    assert.equal(r.response.headers.get("x-invalid-field"), "facebook_post_id");
+  }
+  assert.equal(db._state.mappings.length, 0);
+});
+
+test("AM-2.5 POST: missing, inactive and deleted products are rejected", async () => {
+  const db = am25Db();
+  for (const productId of [99, 3, 4]) {
+    const r = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: `${AM25_PAGE}_5550001`, product_id: productId } });
+    assert.equal(r.status, 400, String(productId));
+    assert.equal(r.json.error.code, "PRODUCT_UNAVAILABLE");
+  }
+  assert.equal(db._state.mappings.length, 0);
+});
+
+test("AM-2.5 POST: an exact-post duplicate is 409 and never overwrites (active or inactive)", async () => {
+  for (const active of [1, 0]) {
+    const db = am25Db([{ facebook_post_id: `${AM25_PAGE}_5550001`, product_id: 1, active, facebook_content_type: "REEL" }]);
+    const before = am25Maps(db);
+    const r = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: `${AM25_PAGE}_5550001`, product_id: 2, facebook_content_type: "POST", note: "x" } });
+    assert.equal(r.status, 409);
+    assert.equal(r.json.error.code, "MAPPING_EXISTS");
+    assert.match(r.json.error.message, /edit the existing mapping/);
+    assert.equal(am25Maps(db), before, "existing mapping unchanged");
+  }
+});
+
+test("AM-2.5 POST: another physical row of an already-mapped canonical Reel is 409", async () => {
+  // A legacy bare-id mapping on the reels-edge row blocks mapping the posts-edge row.
+  const db = am25Db([{ facebook_post_id: "7777777", product_id: 1, active: 1, facebook_content_type: "REEL" }]);
+  const before = am25Maps(db);
+  const r = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: `${AM25_PAGE}_5550001`, product_id: 2 } });
+  assert.equal(r.status, 409);
+  assert.equal(r.json.error.code, "MAPPING_EXISTS");
+  assert.match(r.json.error.message, /same Reel/);
+  assert.equal(am25Maps(db), before);
+});
+
+test("AM-2.5 POST: a post discovery has not seen yet can still be mapped (exact-post rules only)", async () => {
+  const db = am25Db();
+  const r = await req(db, "POST", "/admin/api/content", { body: { facebook_post_id: `${AM25_PAGE}_1603079361827161`, facebook_content_type: "REEL", product_id: 1 } });
+  assert.equal(r.status, 201);
+  assert.equal(db._state.mappings.length, 1);
+});
+
+test("AM-2.5 PATCH: unavailable product changes and unsafe reactivation are blocked; deactivation always works", async () => {
+  const db = am25Db([{ facebook_post_id: `${AM25_PAGE}_5550001`, product_id: 1, active: 1, facebook_content_type: "REEL" }]);
+  const id = db._state.mappings[0].id;
+  const before = am25Maps(db);
+  for (const productId of [3, 4, 99]) {
+    const r = await req(db, "PATCH", `/admin/api/content/${id}`, { body: { product_id: productId } });
+    assert.equal(r.status, 400, String(productId));
+    assert.equal(r.json.error.code, "PRODUCT_UNAVAILABLE");
+  }
+  assert.equal(am25Maps(db), before, "no partial update");
+
+  // The product later becomes inactive: deactivation still works, reactivation does not.
+  db._sqlite.prepare(`UPDATE products SET active = 0 WHERE id = 1`).run();
+  const off = await req(db, "PATCH", `/admin/api/content/${id}`, { body: { active: false } });
+  assert.equal(off.status, 200);
+  assert.equal(off.json.data.active, 0);
+  const note = await req(db, "PATCH", `/admin/api/content/${id}`, { body: { note: "แก้บันทึก" } });
+  assert.equal(note.status, 200, "a note edit on an inactive mapping is not blocked");
+  const on = await req(db, "PATCH", `/admin/api/content/${id}`, { body: { active: true } });
+  assert.equal(on.status, 400);
+  assert.equal(on.json.error.code, "PRODUCT_UNAVAILABLE");
+  assert.equal(db._state.mappings[0].active, 0);
+  // Product available again -> reactivation allowed.
+  db._sqlite.prepare(`UPDATE products SET active = 1 WHERE id = 1`).run();
+  assert.equal((await req(db, "PATCH", `/admin/api/content/${id}`, { body: { active: true } })).status, 200);
+});
+
+test("AM-2.5 PATCH: reactivating or editing a mapping while a sibling row of the same Reel is active is 409", async () => {
+  const db = am25Db([
+    { facebook_post_id: "7777777", product_id: 1, active: 1, facebook_content_type: "REEL" }, // legacy sibling
+    { facebook_post_id: `${AM25_PAGE}_5550001`, product_id: 2, active: 0, facebook_content_type: "REEL" },
+  ]);
+  const target = db._state.mappings.find((m) => m.facebook_post_id === `${AM25_PAGE}_5550001`).id;
+  const before = am25Maps(db);
+  const r = await req(db, "PATCH", `/admin/api/content/${target}`, { body: { active: true } });
+  assert.equal(r.status, 409);
+  assert.equal(r.json.error.code, "MAPPING_EXISTS");
+  const r2 = await req(db, "PATCH", `/admin/api/content/${target}`, { body: { active: true, product_id: 1, facebook_content_type: "POST" } });
+  assert.equal(r2.status, 409);
+  assert.equal(am25Maps(db), before, "nothing changed");
+  // Deactivating the legacy sibling is always allowed, after which the target may be activated.
+  const sib = db._state.mappings.find((m) => m.facebook_post_id === "7777777").id;
+  assert.equal((await req(db, "PATCH", `/admin/api/content/${sib}`, { body: { active: false } })).status, 200);
+  assert.equal((await req(db, "PATCH", `/admin/api/content/${target}`, { body: { active: true } })).status, 200);
+});
+
+test("AM-2.5 PATCH: the page/post key stays immutable", async () => {
+  const db = am25Db([{ facebook_post_id: `${AM25_PAGE}_5550001`, product_id: 1, active: 1, facebook_content_type: "REEL" }]);
+  const id = db._state.mappings[0].id;
+  const r = await req(db, "PATCH", `/admin/api/content/${id}`, { body: { facebook_post_id: `${AM25_PAGE}_42`, facebook_page_id: "1", product_id: 2 } });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.data.facebook_post_id, `${AM25_PAGE}_5550001`);
+  assert.equal(r.json.data.facebook_page_id, AM25_PAGE);
+});
+
+test("AM-2.5 dashboard: product change asks first; cancel restores and sends nothing; errors reload", () => {
+  const app = readFileSync(new URL("../dashboard/app.js", import.meta.url), "utf8");
+  const start = app.indexOf("const sel = h(\"select\", { onchange: async (e) => {");
+  assert.ok(start > 0);
+  const handler = app.slice(start, app.indexOf("}, productOptions(m.product_id));", start));
+  const confirmAt = handler.indexOf("window.confirm(");
+  const patchAt = handler.indexOf('method: "PATCH"');
+  assert.ok(confirmAt > 0 && patchAt > confirmAt, "PATCH only after confirmation");
+  assert.match(handler, /if \(!ok\) \{ e\.target\.value = String\(m\.product_id\); return; \}/, "cancel restores the persisted value before any request");
+  assert.equal((handler.match(/api\(/g) || []).length, 1, "confirm sends exactly one request");
+  assert.match(handler, /จาก: [\s\S]*เป็น: /, "shows current and proposed product");
+  assert.match(handler, /catch \(ex\) \{ toast\(ex\.message, "err"\); \}\s*refresh\(\);/, "success or error reloads the persisted state");
+  // The active switch reverts on error and reflects the server response.
+  assert.match(app, /toast\("อัปเดตแล้ว"\); refresh\(\); \} catch \(ex\) \{ toast\(ex\.message, "err"\); e\.target\.checked = !e\.target\.checked; \}/);
 });
