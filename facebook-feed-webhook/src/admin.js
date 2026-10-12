@@ -23,6 +23,7 @@
  * payload+HMAC session token.
  */
 
+import { handleTelegramWebhook, TELEGRAM_WEBHOOK_PATH } from "./telegram-bot.js";
 import { hmacSha256Hex, timingSafeEqual } from "./crypto.js";
 import { resolveConfig } from "./config.js";
 import { listComments } from "./db.js";
@@ -497,6 +498,12 @@ export async function handleAdminRequest(request, url, env, ctx) {
     if (path === "/admin/app.css") {
       if (request.method !== "GET") return methodNotAllowed("GET");
       return staticAsset(DASHBOARD_CSS, "text/css; charset=utf-8");
+    }
+
+    // Upgrade U12: Telegram bot webhook. No admin session -- authenticated by
+    // Telegram's secret header + owner chat id inside handleTelegramWebhook.
+    if (path === TELEGRAM_WEBHOOK_PATH) {
+      return await handleTelegramWebhook(request, env);
     }
 
     if (path === ADMIN_LOGIN_PATH) {

@@ -465,6 +465,32 @@ Turn alerts off: `npx wrangler secret delete TELEGRAM_BOT_TOKEN` (the cron
 keeps recording state silently). Remove the cron entirely: delete
 `triggers` from `wrangler.jsonc` and deploy.
 
+## Map products from Telegram (Upgrade U12)
+
+The bot sends PENDING product suggestions to the owner's chat as button
+messages (new ones after the daily run; `/pending` or Dashboard → ตั้งค่า →
+"ส่งคำแนะนำที่รออนุมัติ" re-sends up to 5). Buttons — every change needs a
+second confirm tap:
+- **✅ ผูกสินค้านี้** → confirm → the AM-2.4 approval (`approveSuggestion`, all its guards).
+- **🔁 เลือกสินค้าอื่น / 🔎 เลือกสินค้า** → up to 8 active products (prefilter
+  matches first) → confirm → create-only mapping with the AM-2.5 rules
+  (no overwrite, no second row of the same Reel, `<page>_<n>` key only,
+  available product); the AI suggestion becomes `REJECTED`.
+- **❌ ปฏิเสธ / ข้าม** → confirm → `REJECTED`.
+Each decision is in the ประวัติ tab with `via: telegram`.
+
+Security: Telegram posts to `/admin/telegram/webhook` (outside the admin
+session) with header `X-Telegram-Bot-Api-Secret-Token`, which must equal
+HMAC(`ADMIN_SESSION_SECRET`, "telegram-webhook-v1") (first 48 hex chars) —
+no new secret; rotating `ADMIN_SESSION_SECRET` requires "เชื่อมต่อใหม่". Only
+taps/messages whose sender id equals `TELEGRAM_CHAT_ID` act; anything else
+gets "ไม่มีสิทธิ์" and changes nothing. No Facebook or Hermes call.
+
+Set up once: Dashboard → ตั้งค่า → "ผูกสินค้าผ่าน Telegram" → **เชื่อมต่อ
+Telegram** (calls `setWebhook` + `setMyCommands` with the Worker's own URL).
+Turn button messages off in the daily run with var `TELEGRAM_MAP_BUTTONS = "0"`;
+disconnect with `curl "https://api.telegram.org/bot<TOKEN>/deleteWebhook"`.
+
 ## Admin change history (Upgrade U8)
 
 Migration `0007_admin_audit.sql` adds one table, `admin_audit` (additive; no

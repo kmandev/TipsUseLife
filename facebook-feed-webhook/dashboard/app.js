@@ -1098,6 +1098,25 @@
       a.telegram_configured ? null : h("p", { class: "hint", text: "ตั้งค่า: สร้างบอทกับ @BotFather แล้วรัน npx wrangler secret put TELEGRAM_BOT_TOKEN และ npx wrangler secret put TELEGRAM_CHAT_ID บน Pi (ดู docs/OPERATIONS.md)" }));
   }
 
+  /* Upgrade U12: map products from Telegram (buttons, two-tap confirm). */
+  function telegramMapCard(t, reload) {
+    const act = (label, path, okText, ask) => h("button", { class: "btn small", text: label, onclick: async (e) => {
+      if (ask && !window.confirm(ask)) return;
+      e.target.disabled = true;
+      try { const r = (await api(path, { method: "POST", body: {} })).data || {}; toast(okText(r)); } catch (ex) { toast(ex.message, "err"); }
+      e.target.disabled = false; reload();
+    } });
+    const state = !t.configured ? badge("ยังไม่ได้ตั้งค่า Telegram", "gray") : t.connected ? badge("เชื่อมต่อแล้ว", "green") : badge("ยังไม่ได้เชื่อมต่อ", "red");
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h3", { text: "ผูกสินค้าผ่าน Telegram" }), state),
+      h("p", { class: "muted small", text: "บอทจะส่งคำแนะนำสินค้าที่รออนุมัติพร้อมปุ่ม ✅ ผูกสินค้านี้ / 🔁 เลือกสินค้าอื่น / ❌ ปฏิเสธ — ทุกการผูกต้องกดยืนยันอีกครั้ง และรับคำสั่งจากแชทของคุณ (TELEGRAM_CHAT_ID) เท่านั้น พิมพ์ /pending ในแชทเพื่อเรียกรายการ" }),
+      t.configured && t.has_error ? h("p", { class: "error small", text: "Telegram รายงานว่าส่ง webhook ล่าสุดไม่สำเร็จ — กดเชื่อมต่อใหม่" }) : null,
+      t.configured && t.pending_update_count ? h("p", { class: "muted small", text: "ข้อความค้างใน Telegram: " + t.pending_update_count }) : null,
+      t.configured ? h("div", { class: "actions" },
+        act(t.connected ? "เชื่อมต่อใหม่" : "เชื่อมต่อ Telegram", "/admin/api/telegram/setup", () => "เชื่อมต่อแล้ว — ลองพิมพ์ /pending ใน Telegram", t.connected ? null : "ลงทะเบียน webhook ของบอทให้ชี้มาที่ Worker นี้?"),
+        act("ส่งคำแนะนำที่รออนุมัติ", "/admin/api/telegram/notify", (r) => "ส่งแล้ว " + (r.sent || 0) + " รายการ")) : null);
+  }
+
   /* Upgrade U7: daily housekeeping (discovery + review-only suggestions). */
   function dailyCard(dj, reload) {
     const st = dj.state || {};
@@ -1123,7 +1142,7 @@
   }
 
   async function viewSettings(main) {
-    const [res, alerts, daily] = await Promise.all([api("/admin/api/settings"), api("/admin/api/alerts").catch(() => ({ data: { telegram_configured: false, state: null } })), api("/admin/api/daily").catch(() => ({ data: {} }))]);
+    const [res, alerts, daily, tg] = await Promise.all([api("/admin/api/settings"), api("/admin/api/alerts").catch(() => ({ data: { telegram_configured: false, state: null } })), api("/admin/api/daily").catch(() => ({ data: {} })), api("/admin/api/telegram").catch(() => ({ data: { configured: false } }))]);
     const s = res.data || {};
     state.mode = s.reply_mode;
     const kv = (k, v) => h("tr", null, h("th", { text: k }), h("td", { class: "mono", text: v }));
@@ -1135,6 +1154,7 @@
         kv("โดเมนลิงก์ที่อนุญาต", (s.affiliate_allowed_hosts || []).join(", ")),
         ...Object.entries(s.secrets_present || {}).map(([k, v]) => kv(k, v ? "ตั้งค่าแล้ว" : "ยังไม่ตั้งค่า"))))),
       alertsCard(alerts.data || {}, () => viewSettings(main)),
+      telegramMapCard(tg.data || {}, () => viewSettings(main)),
       dailyCard(daily.data || {}, () => viewSettings(main)),
       h("div", { class: "card note" }, h("h3", { text: "การเปิด LIVE" }), h("p", { text: "ระบบจะตอบคอมเมนต์จริงเฉพาะเมื่อ REPLY_MODE = LIVE และตั้งค่า PAGE_ACCESS_TOKEN แล้วเท่านั้น การเปลี่ยนโหมดทำได้โดยการ deploy อย่างตั้งใจ (ดู docs/OPERATIONS.md) ไม่สามารถเปิดจากหน้านี้ได้" })));
     renderModeInHeader();

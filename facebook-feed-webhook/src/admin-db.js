@@ -570,7 +570,7 @@ export const AUDIT_ACTIONS = Object.freeze([
 const AUDIT_FIELDS = {
   PRODUCT: ["name", "platform", "affiliate_url", "active", "deleted_at"],
   MAPPING: ["facebook_post_id", "facebook_content_type", "product_id", "active", "note"],
-  SUGGESTION: ["status", "product_id", "post_id", "mapping_post_id", "idempotent"],
+  SUGGESTION: ["status", "product_id", "post_id", "mapping_post_id", "idempotent", "via"],
   COMMENT: ["status", "reason", "outcome", "detail"],
 };
 

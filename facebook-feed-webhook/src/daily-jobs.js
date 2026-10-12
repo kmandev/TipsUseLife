@@ -17,6 +17,7 @@ import { resolveConfig } from "./config.js";
 import { runDiscovery } from "./discovery.js";
 import { generateSuggestions } from "./suggestions.js";
 import { sendTelegram, telegramConfigured } from "./alerts.js";
+import { notifyPendingSuggestions } from "./telegram-bot.js";
 import { logEvent, logError } from "./log.js";
 
 export const DAILY_STATE_KEY = "daily_jobs_v1";
@@ -115,6 +116,15 @@ export async function runDailyJobs(env, opts = {}) {
     state.notify_error = r.ok ? null : r.error;
   }
   state.notified = sent;
+  // U12: new pending suggestions also arrive as button messages (tap to map; two-tap confirm).
+  if (telegramConfigured(env) && String(env?.TELEGRAM_MAP_BUTTONS ?? "1") !== "0") {
+    try {
+      const n = await notifyPendingSuggestions(env, { max: 5, onlyNew: true, fetchImpl: opts.fetchImpl });
+      state.suggestion_messages = n.sent;
+    } catch {
+      state.suggestion_messages = 0;
+    }
+  }
   await writeDailyState(db, state);
   logEvent("daily_jobs", {
     discovery: d?.status ?? "OFF", inserted: d?.inserted ?? 0,

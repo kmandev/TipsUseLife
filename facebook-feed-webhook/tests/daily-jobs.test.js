@@ -36,7 +36,9 @@ test("U7 daily run: discovery then suggestions, one Telegram summary pointing at
     suggest: async () => { order.push("suggest"); return okSuggest()(); } });
   assert.deepEqual(order, ["discover", "suggest"]);
   assert.equal(r.pending, 3);
-  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls.filter((c) => c.url.endsWith("/sendMessage") && !c.body.reply_markup).length, 1, "one summary");
+  assert.equal(f.calls.filter((c) => c.body.reply_markup).length, 3, "U12: each pending suggestion as a button message");
+  assert.equal(r.suggestion_messages, 3);
   const text = f.calls[0].body.text;
   assert.match(text, /ค้นพบโพสต์\/Reel ใหม่ 2 รายการ · ข้อความถูกแก้ไข 1/);
   assert.match(text, /AI แนะนำสินค้าใหม่ 1 รายการ/);

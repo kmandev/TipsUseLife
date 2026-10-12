@@ -29,6 +29,9 @@
  *   POST   /admin/api/alerts/test         send one Telegram test message (no D1 write)
  *   POST   /admin/api/alerts/check        run the read-only alert check now (same as the cron)
  *   GET    /admin/api/audit               admin change history ?type=&limit=&cursor= (U8)
+ *   GET    /admin/api/telegram            Telegram bot webhook status (U12)
+ *   POST   /admin/api/telegram/setup      register the bot webhook (+ /pending command)
+ *   POST   /admin/api/telegram/notify     send pending suggestions to Telegram now
  *   GET    /admin/api/daily               daily housekeeping status + switches (U7)
  *   POST   /admin/api/daily/run           run discovery + review-only suggestions now (never maps)
  *   GET    /admin/api/recovery            rows needing operator attention
@@ -74,6 +77,7 @@ import { logEvent, logError } from "./log.js";
 import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
 import { runAlertCheck, sendTestAlert, readAlertState, telegramConfigured } from "./alerts.js";
 import { runDailyJobs, readDailyState } from "./daily-jobs.js";
+import { setupTelegramWebhook, telegramWebhookInfo, notifyPendingSuggestions } from "./telegram-bot.js";
 
 const PLATFORMS = ["shopee", "lazada", "tiktok", "other"];
 const CONTENT_TYPES = ["POST", "REEL"];
@@ -328,6 +332,29 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
       return apiJson({ data: page, available, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
+    }
+
+    // Upgrade U12: map products from Telegram (bot webhook management).
+    if (resource === "telegram") {
+      if (idSegment === undefined) {
+        if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+        if (!telegramConfigured(env)) return apiJson({ data: { configured: false } });
+        const info = await telegramWebhookInfo(env);
+        const expected = url.origin + "/admin/telegram/webhook";
+        return apiJson({ data: { configured: true, ok: info.ok, connected: info.ok && info.url === expected, url: info.url ?? null, pending_update_count: info.pending_update_count ?? 0, has_error: Boolean(info.has_error), error: info.ok ? null : info.error } });
+      }
+      if (idSegment === "setup" || idSegment === "notify") {
+        if (method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+        if (!telegramConfigured(env)) return apiError(503, "TELEGRAM_NOT_CONFIGURED", "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID first");
+        if (idSegment === "setup") {
+          const r = await setupTelegramWebhook(env, url.origin);
+          logEvent("admin_telegram_setup", { ok: r.ok, error: r.error ?? null });
+          return r.ok ? apiJson({ data: r }) : apiError(502, r.error || "TELEGRAM_FAILED", "Telegram did not accept the webhook");
+        }
+        const r = await notifyPendingSuggestions(env, { max: 5, onlyNew: false });
+        return apiJson({ data: r });
+      }
+      return apiError(404, "NOT_FOUND", "Not found");
     }
 
     // Upgrade U7: daily housekeeping (discovery + review-only suggestions).
