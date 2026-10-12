@@ -464,6 +464,24 @@ Turn alerts off: `npx wrangler secret delete TELEGRAM_BOT_TOKEN` (the cron
 keeps recording state silently). Remove the cron entirely: delete
 `triggers` from `wrangler.jsonc` and deploy.
 
+## Insights (Upgrades U3–U6 — read-only)
+
+All are read-only SELECTs over existing tables (no migration, no write):
+- **แนวโน้มรายวัน** (overview): `GET /admin/api/stats/daily?days=7|14|30|90` —
+  per local day (Asia/Bangkok, UTC+7): comments, AI replies, ERROR, LIVE
+  `SENT`, `SENT` with a link. Hover/arrow keys for values; "ดูเป็นตาราง" for a table.
+- **ค้นหาคอมเมนต์** (activity): `GET /admin/api/comments?q=&status=&from=&to=&post=&limit=&cursor=`
+  — `q` matches comment text / author name (literal, `%`/`_` escaped) or an
+  exact comment id; dates are local days, `to` inclusive. Same row shape as
+  `/admin/comments` (never `author_id`).
+- **รายละเอียดคอมเมนต์** (click a row): `GET /admin/api/comments/:id` — the
+  comment, every reply row in order (mode, status, safe reason category,
+  text, link, Facebook reply id) and the post's mapping. Display only: there
+  is no retry/send button in the drawer.
+- **ผลงาน** tab: `GET /admin/api/stats/posts` and `/stats/products` — comments,
+  AI replies, LIVE sent, sent with link per post / per resolved product. Link
+  clicks are not tracked (that is U10).
+
 ## Routine operations
 
 - New product: Dashboard → สินค้า Affiliate → เพิ่มสินค้า (https link on an

@@ -244,6 +244,7 @@
     ["discovered", "โพสต์ที่ค้นพบ"],
     ["suggestions", "สินค้าแนะนำ"],
     ["activity", "กิจกรรมคอมเมนต์"],
+    ["performance", "ผลงาน"],
     ["settings", "ตั้งค่า"],
   ];
 
@@ -261,8 +262,147 @@
     const main = h("main", { id: "view" }, h("p", { class: "muted", text: "กำลังโหลด…" }));
     root.appendChild(main);
     root.appendChild(h("div", { id: "toast", class: "toast" }));
-    const views = { overview: viewOverview, products: viewProducts, content: viewContent, discovered: viewDiscovered, suggestions: viewSuggestions, activity: viewActivity, settings: viewSettings };
+    const views = { overview: viewOverview, products: viewProducts, content: viewContent, discovered: viewDiscovered, suggestions: viewSuggestions, activity: viewActivity, performance: viewPerformance, settings: viewSettings };
     views[state.tab](main).catch((e) => { main.replaceChildren(h("p", { class: "error", text: e.message })); });
+  }
+
+  /* ------------------------------ SVG + trend chart (U3) ------------------------------ */
+  function svgEl(tag, attrs, ...children) {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) if (v !== null && v !== undefined && v !== false) el.setAttribute(k, String(v));
+    for (const c of children.flat()) if (c) el.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    return el;
+  }
+  // Validated categorical slots 1-3 (blue / orange / aqua), light + dark, see app.css --s1..--s3.
+  const TREND_SERIES = [["comments", "คอมเมนต์ที่รับ", "s1"], ["ai_replies", "AI เลือกตอบ", "s2"], ["sent", "ส่งจริง (SENT)", "s3"]];
+  const niceMax = (v) => { if (v <= 5) return 5; const p = Math.pow(10, Math.floor(Math.log10(v))); const n = v / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p; };
+  const dayLabel = (d) => { const [, m, dd] = String(d).split("-"); return Number(dd) + "/" + Number(m); };
+
+  /** Line chart: one shared y-axis (all counts), crosshair + tooltip, legend, keyboard, table view. */
+  function trendChart(rows) {
+    const W = 760, H = 240, L = 40, R = 46, T = 14, B = 28;
+    const iw = W - L - R, ih = H - T - B;
+    const max = niceMax(Math.max(1, ...rows.flatMap((r) => TREND_SERIES.map(([k]) => Number(r[k]) || 0))));
+    const x = (i) => L + (rows.length <= 1 ? iw / 2 : (i * iw) / (rows.length - 1));
+    const y = (v) => T + ih - (v / max) * ih;
+    const grid = [0, 0.25, 0.5, 0.75, 1].map((f) => svgEl("g", null,
+      svgEl("line", { x1: L, x2: W - R, y1: y(max * f), y2: y(max * f), class: f === 0 ? "axis" : "grid" }),
+      svgEl("text", { x: L - 8, y: y(max * f) + 4, class: "tick", "text-anchor": "end" }, fmtNum(Math.round(max * f)))));
+    const step = Math.max(1, Math.ceil(rows.length / 8));
+    const lastTick = rows.length - 1;
+    const xticks = rows.map((r, i) => ((i % step === 0 && lastTick - i >= step / 2) || i === lastTick) ? svgEl("text", { x: x(i), y: H - 8, class: "tick", "text-anchor": "middle" }, dayLabel(r.day)) : null);
+    const lines = TREND_SERIES.map(([k, , cls]) => svgEl("path", { class: "line " + cls, d: rows.map((r, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(Number(r[k]) || 0).toFixed(1)).join(" ") }));
+    // Direct labels: last value at the line end (text in text tokens, a short colored key beside it).
+    const last = rows.length - 1;
+    const ends = TREND_SERIES.map(([k, , cls]) => ({ k, cls, v: Number(rows[last]?.[k]) || 0 })).sort((a, b) => b.v - a.v);
+    let prevY = -99;
+    const endLabels = ends.map((e) => { let ly = Math.max(y(e.v) + 4, prevY + 13); prevY = ly; return svgEl("g", null, svgEl("line", { x1: W - R + 4, x2: W - R + 12, y1: ly - 4, y2: ly - 4, class: "key " + e.cls }), svgEl("text", { x: W - R + 15, y: ly, class: "end-label" }, fmtNum(e.v))); });
+    const hair = svgEl("line", { y1: T, y2: T + ih, class: "hair", visibility: "hidden" });
+    const dots = TREND_SERIES.map(([, , cls]) => svgEl("circle", { r: 4.5, class: "dot " + cls, visibility: "hidden" }));
+    const hit = svgEl("rect", { x: L, y: T, width: iw, height: ih, class: "hit" });
+    const chart = svgEl("svg", { viewBox: "0 0 " + W + " " + H, class: "trend", role: "img", "aria-label": "แนวโน้มรายวัน: คอมเมนต์ที่รับ AI เลือกตอบ และส่งจริง" }, grid, xticks, lines, endLabels, hair, dots, hit);
+    const tip = h("div", { class: "chart-tip", role: "status" });
+    const wrap = h("div", { class: "chart-wrap", tabindex: "0", "aria-label": "เลื่อนดูค่ารายวันด้วยปุ่มลูกศรซ้าย/ขวา" }, chart, tip);
+    let cur = -1;
+    const show = (i) => {
+      if (i < 0 || i >= rows.length) return;
+      cur = i;
+      const r = rows[i];
+      hair.setAttribute("x1", x(i)); hair.setAttribute("x2", x(i)); hair.setAttribute("visibility", "visible");
+      TREND_SERIES.forEach(([k], j) => { dots[j].setAttribute("cx", x(i)); dots[j].setAttribute("cy", y(Number(r[k]) || 0)); dots[j].setAttribute("visibility", "visible"); });
+      tip.replaceChildren(...[h("div", { class: "tip-day", text: r.day }),
+        ...TREND_SERIES.map(([k, label, cls]) => h("div", { class: "tip-row" }, h("span", { class: "tip-key " + cls }), h("strong", { text: fmtNum(r[k]) }), h("span", { class: "muted", text: label }))),
+        h("div", { class: "tip-row" }, h("span", { class: "tip-key none" }), h("strong", { text: fmtNum(r.sent_with_link) }), h("span", { class: "muted", text: "แนบลิงก์" })),
+        Number(r.errors) ? h("div", { class: "tip-row" }, h("span", { class: "tip-key none" }), h("strong", { text: fmtNum(r.errors) }), h("span", { class: "muted", text: "ERROR" })) : null].filter(Boolean));
+      tip.classList.add("show");
+      const box = chart.getBoundingClientRect();
+      const px = (x(i) / W) * box.width;
+      tip.style.left = Math.min(Math.max(px + 12, 0), box.width - 170) + "px";
+      if (px + 12 > box.width - 170) tip.style.left = Math.max(px - 182, 0) + "px";
+    };
+    const hide = () => { cur = -1; hair.setAttribute("visibility", "hidden"); dots.forEach((d) => d.setAttribute("visibility", "hidden")); tip.classList.remove("show"); };
+    hit.addEventListener("pointermove", (e) => {
+      const box = chart.getBoundingClientRect();
+      const vx = ((e.clientX - box.left) / box.width) * W;
+      show(Math.round(((vx - L) / iw) * (rows.length - 1)));
+    });
+    hit.addEventListener("pointerleave", hide);
+    wrap.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowRight") { e.preventDefault(); show(cur < 0 ? rows.length - 1 : Math.min(rows.length - 1, cur + 1)); }
+      if (e.key === "ArrowLeft") { e.preventDefault(); show(cur < 0 ? rows.length - 1 : Math.max(0, cur - 1)); }
+      if (e.key === "Escape") hide();
+    });
+    wrap.addEventListener("blur", hide);
+    const legend = h("div", { class: "legend" }, TREND_SERIES.map(([, label, cls]) => h("span", { class: "legend-item" }, h("span", { class: "legend-key " + cls }), label)));
+    return { legend, wrap };
+  }
+
+  function trendTable(rows) {
+    return h("table", { class: "compact" },
+      h("thead", null, h("tr", null, ["วัน", "คอมเมนต์", "AI ตอบ", "ส่งจริง", "แนบลิงก์", "ERROR"].map((t, i) => h("th", { text: t, class: i ? "num" : null })))),
+      h("tbody", null, rows.slice().reverse().map((r) => h("tr", null, h("td", { class: "mono small", text: r.day }), ...["comments", "ai_replies", "sent", "sent_with_link", "errors"].map((k) => h("td", { class: "num", text: fmtNum(r[k]) }))))));
+  }
+
+  function trendCard() {
+    const body = h("div", { class: "trend-body" }, h("p", { class: "muted small", text: "กำลังโหลด…" }));
+    let days = 30; let asTable = false; let rows = [];
+    const draw = () => {
+      if (!rows.length) { body.replaceChildren(h("p", { class: "muted", text: "ยังไม่มีข้อมูล" })); return; }
+      if (asTable) { body.replaceChildren(trendTable(rows)); return; }
+      const c = trendChart(rows);
+      body.replaceChildren(c.legend, c.wrap);
+    };
+    const load = async () => {
+      body.classList.add("loading");
+      try { rows = (await api("/admin/api/stats/daily?days=" + days)).data || []; draw(); }
+      catch (ex) { body.replaceChildren(h("p", { class: "error", text: ex.message })); }
+      body.classList.remove("loading");
+    };
+    const seg = h("div", { class: "seg", role: "group", "aria-label": "ช่วงเวลา" });
+    const segBtns = [7, 30, 90].map((n) => h("button", { type: "button", class: "seg-btn" + (n === days ? " active" : ""), text: n + " วัน", "aria-pressed": n === days ? "true" : "false", onclick: () => {
+      days = n; segBtns.forEach((b, i) => { const on = [7, 30, 90][i] === n; b.classList.toggle("active", on); b.setAttribute("aria-pressed", on ? "true" : "false"); }); load();
+    } }));
+    seg.replaceChildren(...segBtns);
+    const toggle = h("button", { type: "button", class: "btn small ghost", text: "ดูเป็นตาราง", onclick: (e) => { asTable = !asTable; e.target.textContent = asTable ? "ดูเป็นกราฟ" : "ดูเป็นตาราง"; draw(); } });
+    load();
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h3", { text: "แนวโน้มรายวัน" }), h("div", { class: "head-tools" }, seg, toggle)),
+      h("p", { class: "muted small", text: "นับตามวันเวลาไทย (UTC+7) · ส่งจริง = คำตอบ LIVE ที่ Facebook รับแล้ว" }),
+      body);
+  }
+
+  /* ------------------------------ comment drawer (U6) ------------------------------ */
+  const REPLY_STATUS_TEXT = { GENERATED: "ร่างแล้ว / กำลังส่ง", SENT: "ส่งแล้ว", FAILED: "ส่งไม่สำเร็จ", SKIPPED: "ข้าม" };
+  function closeDrawer() { const d = $("#drawer"); if (d) d.remove(); document.removeEventListener("keydown", drawerKey); }
+  function drawerKey(e) { if (e.key === "Escape") closeDrawer(); }
+  async function openComment(id) {
+    closeDrawer();
+    const panel = h("aside", { class: "drawer-panel", role: "dialog", "aria-modal": "true", "aria-label": "รายละเอียดคอมเมนต์", tabindex: "-1" }, h("p", { class: "muted", text: "กำลังโหลด…" }));
+    const root = h("div", { id: "drawer", class: "drawer" }, h("div", { class: "drawer-scrim", onclick: closeDrawer }), panel);
+    document.body.appendChild(root);
+    document.addEventListener("keydown", drawerKey);
+    panel.focus();
+    let c;
+    try { c = (await api("/admin/api/comments/" + id)).data; } catch (ex) { panel.replaceChildren(h("p", { class: "error", text: ex.message })); return; }
+    const kv = (k, v) => h("div", { class: "dkv" }, h("div", { class: "dk", text: k }), h("div", { class: "dv" }, v));
+    panel.replaceChildren(...[ // filter(Boolean): replaceChildren(null) would print "null"
+      h("div", { class: "drawer-head" }, h("h3", { text: "คอมเมนต์ #" + c.id }), h("button", { class: "btn small ghost", text: "ปิด ✕", onclick: closeDrawer })),
+      h("div", { class: "feed-top" }, h("strong", { text: c.author_name || "ไม่ทราบชื่อ" }), badge(c.status, STATUS_KIND[c.status]), c.ai_action ? badge(c.ai_action, c.ai_action === "REPLY" ? "blue" : "gray") : null),
+      h("div", { class: "quote pre", text: c.comment_text || "" }),
+      h("div", { class: "feed-links" }, commentLinks({ facebook_comment_id: c.facebook_comment_id, facebook_post_id: c.facebook_post_id })),
+      kv("เวลาที่รับ", h("span", { text: fmtTime(c.created_at) })),
+      kv("Comment ID", extLink(fbCommentUrl(c.facebook_comment_id, c.facebook_post_id, c.facebook_post_permalink), c.facebook_comment_id || "-", "mono small")),
+      kv("โพสต์", extLink(fbPostUrl(c.facebook_post_id, c.facebook_post_permalink), c.facebook_post_id || "-", "mono small")),
+      c.facebook_parent_id ? kv("ตอบกลับคอมเมนต์", h("span", { class: "mono small", text: c.facebook_parent_id })) : null,
+      kv("สินค้าของโพสต์", c.mapping ? h("span", null, productLink(c.mapping.product_name), Number(c.mapping.active) === 1 ? null : h("span", { class: "muted small", text: " (mapping ปิดอยู่)" }), c.mapping.product_usable ? null : h("div", { class: "error small", text: "สินค้าถูกปิด/ลบ — จะไม่แนบลิงก์" })) : h("span", { class: "muted", text: "ยังไม่ผูกสินค้า" })),
+      kv("สินค้าที่ใช้ตอบ", c.matched_product ? productLink(c.matched_product.name) : h("span", { class: "muted", text: "-" })),
+      h("h3", { text: "ประวัติคำตอบ (" + (c.replies || []).length + ")" }),
+      (c.replies || []).length ? h("ol", { class: "timeline" }, c.replies.map((r) => h("li", null,
+        h("div", { class: "feed-top" }, badge(r.mode, r.mode === "LIVE" ? "red" : "blue"), badge(REPLY_STATUS_TEXT[r.status] || r.status, STATUS_KIND[r.status]), h("span", { class: "muted small", text: fmtTime(r.created_at) })),
+        r.response_text ? linkify(r.response_text, "pre reply-text") : null,
+        r.reason ? h("div", { class: "small muted mono", text: r.reason }) : null,
+        r.facebook_reply_id ? h("div", { class: "small" }, "Reply ID: ", extLink(fbCommentUrl(r.facebook_reply_id, c.facebook_post_id, c.facebook_post_permalink), r.facebook_reply_id, "mono small")) : null))) : h("p", { class: "muted small", text: "ยังไม่มีคำตอบ" }),
+      c.ai_response ? h("details", null, h("summary", { text: "ผลลัพธ์ดิบจาก AI" }), h("div", { class: "pre small mono raw", text: c.ai_response })) : null].filter(Boolean));
   }
 
   /* ----------------------------- overview ---------------------------- */
@@ -323,7 +463,7 @@
 
   function recentFeed(rows) {
     if (!rows.length) return h("p", { class: "muted", text: "ยังไม่มีคอมเมนต์" });
-    return h("ul", { class: "feed" }, rows.map((c) => h("li", { class: "feed-item" },
+    return h("ul", { class: "feed" }, rows.map((c) => h("li", { class: "feed-item clickable", tabindex: "0", role: "button", "aria-label": "ดูรายละเอียดคอมเมนต์", onclick: (e) => { if (!e.target.closest("a")) openComment(c.id); }, onkeydown: (e) => { if (e.key === "Enter") openComment(c.id); } },
       h("div", { class: "avatar", text: (String(c.author_name || "").trim().charAt(0) || "?").toUpperCase() }),
       h("div", { class: "feed-body" },
         h("div", { class: "feed-top" },
@@ -354,6 +494,7 @@
           h("p", { class: "muted", text: "สรุปการทำงานของระบบตอบคอมเมนต์ · อัปเดต " + new Date().toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" }) })),
         h("div", { class: "hero-actions" }, refreshBtn)),
       h("div", { class: "kpi-grid" }, kpis.map(kpiCard)),
+      trendCard(),
       h("div", { class: "ov-grid" },
         h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", { text: "เส้นทางคอมเมนต์" }), h("span", { class: "muted small", text: "เทียบกับคอมเมนต์ที่รับ" })), funnel(d),
           h("div", { class: "mini-row" },
@@ -781,7 +922,7 @@
     if (!rows.length) return h("p", { class: "muted", text: "ยังไม่มีคอมเมนต์" });
     return h("table", null,
       h("thead", null, h("tr", null, ["เวลา", "คอมเมนต์", "AI", "คำตอบ", "สินค้า", "โหมด", "สถานะ"].map((t) => h("th", { text: t })))),
-      h("tbody", null, rows.map((c) => h("tr", null,
+      h("tbody", null, rows.map((c) => h("tr", { class: "clickable", tabindex: "0", title: "คลิกเพื่อดูรายละเอียด", onclick: (e) => { if (!e.target.closest("a,button")) openComment(c.id); }, onkeydown: (e) => { if (e.key === "Enter") openComment(c.id); } },
         h("td", { class: "nowrap small", text: fmtTime(c.created_at) }),
         h("td", null, h("div", { class: "small muted", text: c.author_name || "" }), h("div", { text: c.comment_text || "" }), commentLinks(c)),
         h("td", null, c.ai_action ? badge(c.ai_action, c.ai_action === "REPLY" ? "blue" : "gray") : "-"),
@@ -795,16 +936,71 @@
     const filter = h("select", null, ["", "PROCESSED", "REPLIED", "SKIPPED", "ERROR", "RECEIVED"].map((s) => h("option", { value: s, text: s || "ทุกสถานะ" })));
     const nav = state.nav; state.nav = null;
     if (nav && nav.status) filter.value = nav.status;
+    // U4: search -- text/author/comment id, date range (Thai local days), post.
+    const q = h("input", { type: "search", class: "search", placeholder: "ค้นหาข้อความ / ชื่อ / Comment ID", maxlength: 100 });
+    const from = h("input", { type: "date", "aria-label": "ตั้งแต่วันที่" });
+    const to = h("input", { type: "date", "aria-label": "ถึงวันที่" });
+    const post = h("input", { class: "mono", placeholder: "Post ID (ไม่บังคับ)", maxlength: 60 });
+    if (nav && nav.post) post.value = nav.post;
+    const clear = h("button", { type: "button", class: "btn small ghost", text: "ล้างตัวกรอง" });
     const slot = h("div");
     const paging = cursorPaging((cursor, size) => {
       const qs = new URLSearchParams({ limit: String(size) });
       if (filter.value) qs.set("status", filter.value);
+      if (q.value.trim()) qs.set("q", q.value.trim());
+      if (from.value) qs.set("from", from.value);
+      if (to.value) qs.set("to", to.value);
+      if (post.value.trim()) qs.set("post", post.value.trim());
       if (cursor) qs.set("cursor", cursor);
-      return api("/admin/comments?" + qs);
+      return api("/admin/api/comments?" + qs);
     }, (rows) => slot.replaceChildren(activityTable(rows)), 25);
-    filter.addEventListener("change", () => paging.reset().catch((ex) => toast(ex.message, "err")));
-    main.replaceChildren(h("div", { class: "row-between" }, h("h2", { text: "กิจกรรมคอมเมนต์" }), filter), slot, paging.bar);
+    const reload = () => paging.reset().catch((ex) => toast(ex.message, "err"));
+    let t = null;
+    q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(reload, 300); });
+    post.addEventListener("input", () => { clearTimeout(t); t = setTimeout(reload, 400); });
+    for (const el of [filter, from, to]) el.addEventListener("change", reload);
+    clear.addEventListener("click", () => { q.value = ""; from.value = ""; to.value = ""; post.value = ""; filter.value = ""; reload(); });
+    main.replaceChildren(
+      h("div", { class: "row-between" }, h("h2", { text: "กิจกรรมคอมเมนต์" })),
+      h("div", { class: "toolbar filters" }, q, filter, h("label", { class: "inline-field" }, "ตั้งแต่ ", from), h("label", { class: "inline-field" }, "ถึง ", to), post, clear),
+      h("p", { class: "muted small", text: "คลิกแถวเพื่อดูรายละเอียดและประวัติคำตอบทั้งหมด" }),
+      slot, paging.bar);
     await paging.reset();
+  }
+
+  /* ----------------------------- performance (U5) ---------------------------- */
+  async function viewPerformance(main) {
+    const [posts, products] = await Promise.all([api("/admin/api/stats/posts"), api("/admin/api/stats/products")]);
+    const rate = (a, b) => (num(b) ? pct(a, b) + "%" : "-");
+    const postTable = (page) => h("table", null,
+      h("thead", null, h("tr", null, ["โพสต์", "สินค้า", "คอมเมนต์", "AI ตอบ", "ส่งจริง", "แนบลิงก์", "อัตราตอบ", "ล่าสุด"].map((t, i) => h("th", { text: t, class: i >= 2 && i <= 6 ? "num" : null })))),
+      h("tbody", null, page.map((r) => h("tr", null,
+        h("td", null, extLink(fbPostUrl(r.post_id, r.permalink), r.post_id, "mono small")),
+        h("td", null, r.product_name ? h("span", null, productLink(r.product_name), r.mapping_active === 0 ? h("span", { class: "muted small", text: " (ปิด)" }) : null) : h("a", { href: "#content", class: "small", text: "ยังไม่ผูก → ผูกสินค้า", onclick: (e) => { e.preventDefault(); goTo("content"); } })),
+        h("td", { class: "num" }, h("a", { href: "#activity", text: fmtNum(r.comments), title: "ดูคอมเมนต์ของโพสต์นี้", onclick: (e) => { e.preventDefault(); goTo("activity", { post: r.post_id }); } })),
+        h("td", { class: "num", text: fmtNum(r.ai_replies) }),
+        h("td", { class: "num", text: fmtNum(r.sent) }),
+        h("td", { class: "num", text: fmtNum(r.sent_with_link) }),
+        h("td", { class: "num", text: rate(r.ai_replies, r.comments) }),
+        h("td", { class: "nowrap small", text: fmtTime(r.last_comment_at) })))));
+    const productTable = (page) => h("table", null,
+      h("thead", null, h("tr", null, ["สินค้า", "สถานะ", "โพสต์ที่ผูก", "คอมเมนต์", "AI ตอบ", "ส่งจริง", "แนบลิงก์"].map((t, i) => h("th", { text: t, class: i >= 2 ? "num" : null })))),
+      h("tbody", null, page.map((r) => h("tr", null,
+        h("td", null, productLink(r.name)),
+        h("td", null, r.deleted_at ? badge("ลบแล้ว", "gray") : r.active === 1 ? badge("เปิด", "green") : badge("ปิด", "gray")),
+        h("td", { class: "num" }, r.mapped_posts ? h("a", { href: "#content", text: fmtNum(r.mapped_posts), onclick: (e) => { e.preventDefault(); goTo("content"); } }) : h("span", { class: "muted", text: "0" })),
+        h("td", { class: "num", text: fmtNum(r.comments) }),
+        h("td", { class: "num", text: fmtNum(r.ai_replies) }),
+        h("td", { class: "num", text: fmtNum(r.sent) }),
+        h("td", { class: "num", text: fmtNum(r.sent_with_link) })))));
+    const p = posts.data || []; const pr = products.data || [];
+    main.replaceChildren(
+      h("h2", { text: "ผลงานรายโพสต์และรายสินค้า" }),
+      h("p", { class: "muted", text: "ดูว่าโพสต์/สินค้าไหนมีคนคอมเมนต์มาก ตอบไปกี่ครั้ง และแนบลิงก์ Affiliate ไปกี่ครั้ง (นับเฉพาะคำตอบ LIVE ที่ส่งสำเร็จ) — ยังไม่รวมจำนวนคลิกลิงก์" }),
+      h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", { text: "รายโพสต์" }), h("span", { class: "muted small", text: fmtNum(p.length) + " โพสต์" })),
+        p.length ? pagedList(p, postTable, 10) : h("p", { class: "muted", text: "ยังไม่มีข้อมูล" })),
+      h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", { text: "รายสินค้า" }), h("span", { class: "muted small", text: fmtNum(pr.length) + " สินค้า" })),
+        pr.length ? pagedList(pr, productTable, 10) : h("p", { class: "muted", text: "ยังไม่มีข้อมูล" })));
   }
 
   /* ----------------------------- settings ---------------------------- */

@@ -20,6 +20,11 @@
  *   POST   /admin/api/suggestions/:id/reject  PENDING -> REJECTED (AM-2.3)
  *   POST   /admin/api/suggestions/:id/approve HUMAN approval -> one content mapping (AM-2.4)
  *   GET    /admin/api/health              operational counts (Phase 8.2)
+ *   GET    /admin/api/stats/daily?days=7|14|30|90   per local day: comments, AI replies, errors, LIVE sent, sent with link (U3)
+ *   GET    /admin/api/stats/posts         per post: comments, replies, sent, links, mapping (U5)
+ *   GET    /admin/api/stats/products      per product: mapped posts, comments, replies, sent, links (U5)
+ *   GET    /admin/api/comments            search ?q=&status=&from=&to=&post=&limit=&cursor= (U4)
+ *   GET    /admin/api/comments/:id        one comment + full reply history + mapping (U6)
  *   GET    /admin/api/alerts              alert status (Telegram configured?, last check, token verdict)
  *   POST   /admin/api/alerts/test         send one Telegram test message (no D1 write)
  *   POST   /admin/api/alerts/check        run the read-only alert check now (same as the cron)
@@ -51,6 +56,12 @@ import {
   mappingsForPosts,
   deleteMapping,
   overviewStats,
+  dailyStats,
+  DAILY_RANGES,
+  searchComments,
+  commentDetail,
+  postPerformance,
+  productPerformance,
 } from "./admin-db.js";
 import { runDiscovery, listCandidates, listRuns, CANDIDATE_STATUSES, MAPPING_FILTERS } from "./discovery.js";
 import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, approveSuggestion, SUGGESTION_STATUSES } from "./suggestions.js";
@@ -60,6 +71,7 @@ import { runAlertCheck, sendTestAlert, readAlertState, telegramConfigured } from
 
 const PLATFORMS = ["shopee", "lazada", "tiktok", "other"];
 const CONTENT_TYPES = ["POST", "REEL"];
+const COMMENT_STATUSES = ["RECEIVED", "PROCESSED", "REPLIED", "SKIPPED", "ERROR"];
 
 export function apiJson(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -243,6 +255,50 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
     if (resource === "health" && idSegment === undefined) {
       if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
       return apiJson({ data: await healthStats(db, config.pageId), mode: config.mode });
+    }
+
+    // Upgrades U3/U5: read-only insight queries.
+    if (resource === "stats") {
+      if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+      if (idSegment === "daily") {
+        const days = Number(url.searchParams.get("days") || 30);
+        if (!DAILY_RANGES.includes(days)) return invalid("days", "days must be one of " + DAILY_RANGES.join(", "));
+        return apiJson({ data: await dailyStats(db, config.pageId, days), days, timezone: "Asia/Bangkok" });
+      }
+      if (idSegment === "posts") return apiJson({ data: await postPerformance(db, config.pageId) });
+      if (idSegment === "products") return apiJson({ data: await productPerformance(db, config.pageId) });
+      return apiError(404, "NOT_FOUND", "Not found");
+    }
+
+    // Upgrades U4/U6: comment search and detail (read-only).
+    if (resource === "comments") {
+      if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+      if (idSegment !== undefined) {
+        const id = parseId(idSegment);
+        if (!id) return apiError(404, "NOT_FOUND", "Not found");
+        const detail = await commentDetail(db, config.pageId, id);
+        return detail ? apiJson({ data: detail }) : apiError(404, "NOT_FOUND", "Comment not found");
+      }
+      const sp = url.searchParams;
+      const limit = Number(sp.get("limit") || 25);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) return invalid("limit", "limit must be 1-100");
+      const q = (sp.get("q") || "").trim();
+      if (q.length > 100) return invalid("q", "q must be at most 100 characters");
+      const status = sp.get("status") || null;
+      if (status && !COMMENT_STATUSES.includes(status)) return invalid("status", "Unknown status");
+      const day = /^\d{4}-\d{2}-\d{2}$/;
+      const from = sp.get("from") || null;
+      const to = sp.get("to") || null;
+      if ((from && (!day.test(from) || Number.isNaN(Date.parse(from)))) || (to && (!day.test(to) || Number.isNaN(Date.parse(to))))) return invalid("from", "Dates must be YYYY-MM-DD");
+      const postId = sp.get("post") || null;
+      if (postId && !/^[0-9]{5,}(_[0-9]+)?$/.test(postId)) return invalid("post", "Invalid post id");
+      const cursorRaw = sp.get("cursor");
+      const beforeId = cursorRaw ? parseId(cursorRaw) : null;
+      if (cursorRaw && !beforeId) return invalid("cursor", "Invalid cursor");
+      const rows = await searchComments(db, { pageId: config.pageId, q: q || null, status, from, to, postId, beforeId, limit: limit + 1 });
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
+      return apiJson({ data: page, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
     }
 
     // Upgrade U1: operator alerts (Telegram). GET status; POST test / check.

@@ -331,3 +331,230 @@ export async function overviewStats(db, pageId) {
     .first();
   return counts ?? {};
 }
+
+/* -------------- Upgrades U3-U6: insight queries (read-only) -------------- */
+// All read-only SELECTs, page-scoped, every value bound. Day buckets use the
+// Page's local day (Asia/Bangkok, UTC+7) so "today" matches the operator's.
+
+export const LOCAL_TZ_OFFSET_HOURS = 7;
+export const DAILY_RANGES = [7, 14, 30, 90];
+
+/** "YYYY-MM-DD" of `date` in UTC+7. */
+export function localDay(date) {
+  return new Date(date.getTime() + LOCAL_TZ_OFFSET_HOURS * 3600e3).toISOString().slice(0, 10);
+}
+
+/** UTC "YYYY-MM-DD HH:MM:SS" of local midnight `day` (UTC+7). */
+function localMidnightUtc(day) {
+  const ms = Date.parse(day + "T00:00:00Z") - LOCAL_TZ_OFFSET_HOURS * 3600e3;
+  return new Date(ms).toISOString().slice(0, 19).replace("T", " ");
+}
+
+/**
+ * U3: one row per local day for the last `days` days (oldest first, zero-filled).
+ * @returns {Promise<Array<{day: string, comments: number, ai_replies: number, errors: number, sent: number, sent_with_link: number}>>}
+ */
+export async function dailyStats(db, pageId, days, now = new Date()) {
+  const today = localDay(now);
+  const startDay = localDay(new Date(Date.parse(today + "T12:00:00Z") - (days - 1) * 86400e3));
+  const since = localMidnightUtc(startDay);
+  const shift = `+${LOCAL_TZ_OFFSET_HOURS} hours`;
+  const [c, r] = await Promise.all([
+    db
+      .prepare(
+        `SELECT date(created_at, ?) AS day,
+                COUNT(*) AS comments,
+                SUM(CASE WHEN ai_action = 'REPLY' THEN 1 ELSE 0 END) AS ai_replies,
+                SUM(CASE WHEN status = 'ERROR' THEN 1 ELSE 0 END) AS errors
+           FROM comments
+          WHERE page_id = ? AND created_at >= ?
+          GROUP BY day`
+      )
+      .bind(shift, pageId, since)
+      .all(),
+    db
+      .prepare(
+        `SELECT date(r.created_at, ?) AS day,
+                SUM(CASE WHEN r.status = 'SENT' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE WHEN r.status = 'SENT' AND r.affiliate_url IS NOT NULL THEN 1 ELSE 0 END) AS sent_with_link
+           FROM replies r JOIN comments c ON c.id = r.comment_id
+          WHERE c.page_id = ? AND r.mode = 'LIVE' AND r.created_at >= ?
+          GROUP BY day`
+      )
+      .bind(shift, pageId, since)
+      .all(),
+  ]);
+  const byDay = new Map();
+  for (const row of c?.results ?? []) byDay.set(row.day, { comments: Number(row.comments), ai_replies: Number(row.ai_replies), errors: Number(row.errors) });
+  const sent = new Map((r?.results ?? []).map((row) => [row.day, row]));
+  const out = [];
+  for (let i = 0; i < days; i += 1) {
+    const day = localDay(new Date(Date.parse(startDay + "T12:00:00Z") + i * 86400e3));
+    const a = byDay.get(day) || {};
+    const b = sent.get(day) || {};
+    out.push({
+      day,
+      comments: a.comments || 0,
+      ai_replies: a.ai_replies || 0,
+      errors: a.errors || 0,
+      sent: Number(b.sent || 0),
+      sent_with_link: Number(b.sent_with_link || 0),
+    });
+  }
+  return out;
+}
+
+const COMMENT_COLUMNS = `c.id, c.facebook_comment_id, c.author_name, c.comment_text, c.status, c.ai_response,
+         c.product_source, c.ai_action, c.facebook_post_id, c.created_at, c.updated_at,
+         p.id AS product_id, p.name AS product_name,
+         r.mode AS reply_mode, r.status AS reply_status, r.facebook_reply_id AS reply_facebook_reply_id,
+         r.response_text AS reply_text, r.error_message AS reply_reason`;
+const LATEST_REPLY_JOIN = `LEFT JOIN products p ON p.id = c.matched_product_id
+       LEFT JOIN replies r ON r.id = (SELECT r2.id FROM replies r2 WHERE r2.comment_id = c.id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)`;
+
+/** Same public shape as GET /admin/comments (admin.js mapRow): never author_id. */
+export function mapCommentRow(row) {
+  const hasReply = row.reply_mode !== null && row.reply_mode !== undefined;
+  return {
+    id: Number(row.id),
+    facebook_comment_id: row.facebook_comment_id ?? null,
+    author_name: row.author_name ?? null,
+    comment_text: row.comment_text ?? null,
+    status: row.status,
+    matched_product: row.product_id !== null && row.product_id !== undefined ? { id: Number(row.product_id), name: row.product_name ?? null } : null,
+    product_source: row.product_source ?? null,
+    ai_action: row.ai_action ?? null,
+    facebook_post_id: row.facebook_post_id ?? null,
+    ai_response: row.ai_response ?? null,
+    reply: hasReply
+      ? { mode: row.reply_mode, status: row.reply_status ?? null, facebook_reply_id: row.reply_facebook_reply_id ?? null, response_text: row.reply_text ?? null, reason: row.reply_reason ?? null }
+      : null,
+    created_at: row.created_at ?? null,
+    updated_at: row.updated_at ?? null,
+  };
+}
+
+const likeEscape = (s) => String(s).replace(/[\\%_]/g, (m) => "\\" + m);
+
+/**
+ * U4: search comments. Filters are AND-ed; `q` matches comment text, author
+ * name (LIKE) or an exact comment id. Newest first; cursor = last id.
+ */
+export async function searchComments(db, { pageId, q = null, status = null, from = null, to = null, postId = null, beforeId = null, limit }) {
+  const where = ["c.page_id = ?"];
+  const params = [pageId];
+  if (q) {
+    where.push("(c.comment_text LIKE ? ESCAPE '\\' OR c.author_name LIKE ? ESCAPE '\\' OR c.facebook_comment_id = ?)");
+    const like = "%" + likeEscape(q) + "%";
+    params.push(like, like, q);
+  }
+  if (status) { where.push("c.status = ?"); params.push(status); }
+  if (from) { where.push("c.created_at >= ?"); params.push(localMidnightUtc(from)); }
+  if (to) {
+    const next = localDay(new Date(Date.parse(to + "T12:00:00Z") + 86400e3));
+    where.push("c.created_at < ?"); params.push(localMidnightUtc(next));
+  }
+  if (postId) { where.push("c.facebook_post_id = ?"); params.push(postId); }
+  if (beforeId) { where.push("c.id < ?"); params.push(beforeId); }
+  params.push(limit);
+  const res = await db
+    .prepare(`SELECT ${COMMENT_COLUMNS} FROM comments c ${LATEST_REPLY_JOIN} WHERE ${where.join(" AND ")} ORDER BY c.id DESC LIMIT ?`)
+    .bind(...params)
+    .all();
+  return (res?.results ?? []).map(mapCommentRow);
+}
+
+/** U6: one comment with its full reply history and post mapping (no author_id). */
+export async function commentDetail(db, pageId, id) {
+  const row = await db
+    .prepare(`SELECT ${COMMENT_COLUMNS}, c.facebook_parent_id, c.facebook_created_time, c.facebook_post_permalink
+                FROM comments c ${LATEST_REPLY_JOIN} WHERE c.page_id = ? AND c.id = ?`)
+    .bind(pageId, id)
+    .first();
+  if (!row) return null;
+  const [replies, mapping] = await Promise.all([
+    db
+      .prepare(
+        `SELECT id, mode, status, error_message AS reason, response_text, affiliate_url, facebook_reply_id, created_at
+           FROM replies WHERE comment_id = ? ORDER BY created_at ASC, id ASC`
+      )
+      .bind(id)
+      .all(),
+    row.facebook_post_id
+      ? db
+          .prepare(
+            `SELECT m.id, m.active, m.facebook_content_type, p.id AS product_id, p.name AS product_name, p.active AS product_active, p.deleted_at AS product_deleted_at
+               FROM content_mappings m JOIN products p ON p.id = m.product_id
+              WHERE m.facebook_page_id = ? AND m.facebook_post_id = ? LIMIT 1`
+          )
+          .bind(pageId, row.facebook_post_id)
+          .first()
+      : null,
+  ]);
+  return {
+    ...mapCommentRow(row),
+    facebook_parent_id: row.facebook_parent_id ?? null,
+    facebook_created_time: row.facebook_created_time ?? null,
+    facebook_post_permalink: row.facebook_post_permalink ?? null,
+    replies: (replies?.results ?? []).map((r) => ({ ...r, id: Number(r.id) })),
+    mapping: mapping
+      ? { id: Number(mapping.id), active: Number(mapping.active), content_type: mapping.facebook_content_type, product_id: Number(mapping.product_id), product_name: mapping.product_name, product_usable: Number(mapping.product_active) === 1 && !mapping.product_deleted_at }
+      : null,
+  };
+}
+
+/** U5: per-post performance (posts that received comments), most commented first. */
+export async function postPerformance(db, pageId, limit = 500) {
+  const res = await db
+    .prepare(
+      `SELECT c.facebook_post_id AS post_id,
+              COUNT(*) AS comments,
+              SUM(CASE WHEN c.ai_action = 'REPLY' THEN 1 ELSE 0 END) AS ai_replies,
+              SUM(CASE WHEN c.status = 'ERROR' THEN 1 ELSE 0 END) AS errors,
+              (SELECT COUNT(*) FROM replies r JOIN comments c2 ON c2.id = r.comment_id
+                WHERE c2.page_id = c.page_id AND c2.facebook_post_id = c.facebook_post_id AND r.mode = 'LIVE' AND r.status = 'SENT') AS sent,
+              (SELECT COUNT(*) FROM replies r JOIN comments c2 ON c2.id = r.comment_id
+                WHERE c2.page_id = c.page_id AND c2.facebook_post_id = c.facebook_post_id AND r.mode = 'LIVE' AND r.status = 'SENT' AND r.affiliate_url IS NOT NULL) AS sent_with_link,
+              MAX(c.created_at) AS last_comment_at,
+              MAX(c.facebook_post_permalink) AS permalink,
+              (SELECT m.active FROM content_mappings m WHERE m.facebook_page_id = c.page_id AND m.facebook_post_id = c.facebook_post_id LIMIT 1) AS mapping_active,
+              (SELECT p.name FROM content_mappings m JOIN products p ON p.id = m.product_id
+                WHERE m.facebook_page_id = c.page_id AND m.facebook_post_id = c.facebook_post_id LIMIT 1) AS product_name
+         FROM comments c
+        WHERE c.page_id = ? AND c.facebook_post_id IS NOT NULL
+        GROUP BY c.facebook_post_id
+        ORDER BY comments DESC, last_comment_at DESC
+        LIMIT ?`
+    )
+    .bind(pageId, limit)
+    .all();
+  return (res?.results ?? []).map((r) => ({
+    ...r,
+    comments: Number(r.comments), ai_replies: Number(r.ai_replies), errors: Number(r.errors),
+    sent: Number(r.sent), sent_with_link: Number(r.sent_with_link),
+    mapping_active: r.mapping_active === null || r.mapping_active === undefined ? null : Number(r.mapping_active),
+  }));
+}
+
+/** U5: per-product performance, from the product each comment resolved to. */
+export async function productPerformance(db, pageId) {
+  const res = await db
+    .prepare(
+      `SELECT p.id AS product_id, p.name, p.active, p.deleted_at,
+              (SELECT COUNT(*) FROM content_mappings m WHERE m.facebook_page_id = ?1 AND m.product_id = p.id AND m.active = 1) AS mapped_posts,
+              (SELECT COUNT(*) FROM comments c WHERE c.page_id = ?1 AND c.matched_product_id = p.id) AS comments,
+              (SELECT COUNT(*) FROM comments c WHERE c.page_id = ?1 AND c.matched_product_id = p.id AND c.ai_action = 'REPLY') AS ai_replies,
+              (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id
+                WHERE c.page_id = ?1 AND c.matched_product_id = p.id AND r.mode = 'LIVE' AND r.status = 'SENT') AS sent,
+              (SELECT COUNT(*) FROM replies r JOIN comments c ON c.id = r.comment_id
+                WHERE c.page_id = ?1 AND c.matched_product_id = p.id AND r.mode = 'LIVE' AND r.status = 'SENT' AND r.affiliate_url IS NOT NULL) AS sent_with_link
+         FROM products p
+        ORDER BY comments DESC, p.id DESC
+        LIMIT 500`
+    )
+    .bind(pageId)
+    .all();
+  return (res?.results ?? [])
+    .map((r) => ({ ...r, product_id: Number(r.product_id), active: Number(r.active), mapped_posts: Number(r.mapped_posts), comments: Number(r.comments), ai_replies: Number(r.ai_replies), sent: Number(r.sent), sent_with_link: Number(r.sent_with_link) }))
+    .filter((r) => !r.deleted_at || r.comments > 0);
+}
