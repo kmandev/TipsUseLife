@@ -85,24 +85,36 @@ export async function setProductActive(db, id, active) {
  * Soft delete. The row stays (comments and mappings reference it), it is
  * deactivated and hidden, and every mapping pointing at it is switched off
  * so no reply can ever resolve to it again.
+ *
+ * AM-2.6-B: both updates run in ONE D1 batch (a transaction): either the
+ * product is soft-deleted AND all its mappings are switched off, or nothing
+ * changes (a failure rolls both back and is thrown to the caller, as before).
+ * The mapping update only applies when THIS call soft-deleted the product:
+ * it is tied to the exact `deleted_at` stamp written by the first statement,
+ * so calling this for an already-deleted product changes nothing (no
+ * recovery behaviour). Returns the number of product rows soft-deleted
+ * (0 or 1), as before.
  */
 export async function softDeleteProduct(db, id) {
-  const result = await db
-    .prepare(
-      `UPDATE products
-          SET active = 0, deleted_at = datetime('now'), updated_at = datetime('now')
-        WHERE id = ? AND deleted_at IS NULL`
-    )
-    .bind(id)
-    .run();
-  const changed = Number(result?.meta?.changes ?? 0);
-  if (changed > 0) {
-    await db
-      .prepare(`UPDATE content_mappings SET active = 0, updated_at = datetime('now') WHERE product_id = ?`)
-      .bind(id)
-      .run();
-  }
-  return changed;
+  // Same format as SQLite datetime('now') (UTC, "YYYY-MM-DD HH:MM:SS").
+  const stamp = new Date().toISOString().slice(0, 19).replace("T", " ");
+  const results = await db.batch([
+    db
+      .prepare(
+        `UPDATE products
+            SET active = 0, deleted_at = ?, updated_at = datetime('now')
+          WHERE id = ? AND deleted_at IS NULL`
+      )
+      .bind(stamp, id),
+    db
+      .prepare(
+        `UPDATE content_mappings SET active = 0, updated_at = datetime('now')
+          WHERE product_id = ?
+            AND EXISTS (SELECT 1 FROM products WHERE id = ? AND deleted_at = ? AND active = 0)`
+      )
+      .bind(id, id, stamp),
+  ]);
+  return Number(results?.[0]?.meta?.changes ?? 0);
 }
 
 /* ------------------------- content mappings ------------------------ */

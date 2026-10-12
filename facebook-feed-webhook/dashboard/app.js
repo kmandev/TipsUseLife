@@ -227,6 +227,24 @@
       h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit", text: "บันทึก" }), h("button", { class: "btn ghost", type: "button", text: "ยกเลิก", onclick: onDone })));
   }
 
+  /* productToggleHandler (AM-2.6-B) -- product list on/off switch.
+   * Turning OFF a product that still has active mapped posts asks first: those
+   * posts stop getting a link (the mappings themselves stay as they are).
+   * Cancel restores the switch to the persisted state and sends nothing.
+   * Turning ON, or OFF with no mapped posts, sends the PATCH directly. */
+  function productToggleHandler(p, refresh) {
+    return async (e) => {
+      const next = e.target.checked;
+      const mapped = Number(p.mapping_count) || 0;
+      if (!next && Number(p.active) === 1 && mapped > 0) {
+        const ok = window.confirm("ปิดสินค้า “" + p.name + "” ?\nโพสต์ที่ผูกสินค้านี้ " + mapped + " โพสต์จะไม่ได้รับลิงก์สินค้าในคำตอบคอมเมนต์อีก จนกว่าจะเปิดสินค้าอีกครั้ง\n(การผูกสินค้ายังคงอยู่ ไม่ถูกลบ)");
+        if (!ok) { e.target.checked = Number(p.active) === 1; return; }
+      }
+      try { await api("/admin/api/products/" + p.id, { method: "PATCH", body: { active: next } }); toast(next ? "เปิดใช้สินค้าแล้ว" : "ปิดสินค้าแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); e.target.checked = !next; }
+    };
+  }
+  /* end productToggleHandler */
+
   async function viewProducts(main) {
     const search = h("input", { placeholder: "ค้นหาชื่อ / คีย์เวิร์ด", class: "search" });
     const filter = h("select", null, h("option", { value: "", text: "ทั้งหมด" }), h("option", { value: "1", text: "เปิดใช้" }), h("option", { value: "0", text: "ปิดอยู่" }));
@@ -259,9 +277,7 @@
         h("td", { class: "small", text: p.keywords || "-" }),
         h("td", null, p.affiliate_url ? h("a", { href: p.affiliate_url, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: "ทดสอบลิงก์ ↗" }) : "-"),
         h("td", { text: p.mapping_count ?? 0 }),
-        h("td", null, h("label", { class: "switch" }, h("input", { type: "checkbox", checked: Number(p.active) === 1, onchange: async (e) => {
-          try { await api("/admin/api/products/" + p.id, { method: "PATCH", body: { active: e.target.checked } }); toast(e.target.checked ? "เปิดใช้สินค้าแล้ว" : "ปิดสินค้าแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); e.target.checked = !e.target.checked; }
-        } }), h("span", { text: Number(p.active) === 1 ? "เปิด" : "ปิด" }))),
+        h("td", null, h("label", { class: "switch" }, h("input", { type: "checkbox", checked: Number(p.active) === 1, onchange: productToggleHandler(p, refresh) }), h("span", { text: Number(p.active) === 1 ? "เปิด" : "ปิด" }))),
         h("td", { class: "nowrap" },
           h("button", { class: "btn small", text: "แก้ไข", onclick: () => formSlot.replaceChildren(productForm(p, () => { formSlot.replaceChildren(); refresh(); })) }),
           h("button", { class: "btn small danger", text: "ลบ", onclick: async () => {

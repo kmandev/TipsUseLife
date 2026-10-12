@@ -342,3 +342,159 @@ test("AM-2.5 dashboard: product change asks first; cancel restores and sends not
   // The active switch reverts on error and reflects the server response.
   assert.match(app, /toast\("อัปเดตแล้ว"\); refresh\(\); \} catch \(ex\) \{ toast\(ex\.message, "err"\); e\.target\.checked = !e\.target\.checked; \}/);
 });
+
+/* ---------------- AM-2.6-B: product availability consistency ---------------- */
+
+const AM26_PRODUCTS = [
+  { id: 1, name: "สินค้า A", affiliate_url: "https://s.shopee.co.th/a", active: 1 },
+  { id: 2, name: "สินค้า B", affiliate_url: "https://s.shopee.co.th/b", active: 1 },
+];
+const AM26_MAPPINGS = [
+  { facebook_post_id: "853313081388711_101", product_id: 1, active: 1 },
+  { facebook_post_id: "853313081388711_102", product_id: 1, active: 1 },
+  { facebook_post_id: "853313081388711_103", product_id: 1, active: 0 },
+  { facebook_post_id: "853313081388711_201", product_id: 2, active: 1 },
+];
+
+test("AM-2.6-B delete: product soft-delete and mapping deactivation apply together in one batch", async () => {
+  const db = createFakeD1({ products: AM26_PRODUCTS, mappings: AM26_MAPPINGS });
+  const r = await req(db, "DELETE", "/admin/api/products/1");
+  assert.equal(r.status, 200);
+  const p1 = db._state.products.find((p) => p.id === 1);
+  assert.equal(p1.active, 0);
+  assert.ok(p1.deleted_at, "deleted_at set");
+  assert.match(p1.deleted_at, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, "same format as datetime('now')");
+  const byPost = Object.fromEntries(db._state.mappings.map((m) => [m.facebook_post_id, m.active]));
+  assert.deepEqual(byPost, {
+    "853313081388711_101": 0,
+    "853313081388711_102": 0,
+    "853313081388711_103": 0,
+    "853313081388711_201": 1,
+  }, "every mapping of product 1 is off; product 2 untouched");
+  assert.equal(db._state.products.find((p) => p.id === 2).deleted_at, null);
+  const src = readFileSync(new URL("../src/admin-db.js", import.meta.url), "utf8");
+  const fn = src.slice(src.indexOf("export async function softDeleteProduct"), src.indexOf("/* ------------------------- content mappings"));
+  assert.match(fn, /db\.batch\(\[/, "uses a single D1 batch");
+  assert.doesNotMatch(fn, /\.run\(\)/, "no separate statement outside the batch");
+});
+
+test("AM-2.6-B delete: a failing mapping update rolls the product update back (nothing partial)", async () => {
+  const db = createFakeD1({ products: AM26_PRODUCTS, mappings: AM26_MAPPINGS, failOn: /UPDATE content_mappings SET active = 0/ });
+  const before = { products: db._state.products, mappings: db._state.mappings };
+  const r = await req(db, "DELETE", "/admin/api/products/1");
+  assert.equal(r.status, 500);
+  assert.equal(r.json?.error?.code, "INTERNAL_ERROR");
+  assert.deepEqual(db._state.products, before.products, "product not left soft-deleted");
+  assert.deepEqual(db._state.mappings, before.mappings, "no mapping partially changed");
+  const p1 = db._state.products.find((p) => p.id === 1);
+  assert.equal(p1.active, 1);
+  assert.equal(p1.deleted_at, null);
+  // Direct call: the error reaches the caller, still nothing applied.
+  const { softDeleteProduct } = await import("../src/admin-db.js");
+  await assert.rejects(() => softDeleteProduct(db, 1));
+  assert.deepEqual(db._state.products, before.products);
+  assert.deepEqual(db._state.mappings, before.mappings);
+});
+
+test("AM-2.6-B delete: contract unchanged -- already-deleted or unknown product is 404; no recovery behaviour", async () => {
+  const db = createFakeD1({ products: AM26_PRODUCTS, mappings: AM26_MAPPINGS });
+  assert.equal((await req(db, "DELETE", "/admin/api/products/1")).status, 200);
+  assert.equal((await req(db, "DELETE", "/admin/api/products/1")).status, 404, "already deleted");
+  assert.equal((await req(db, "DELETE", "/admin/api/products/999")).status, 404, "unknown");
+  // A direct second call on an already-deleted product changes nothing (returns 0).
+  db._sqlite.prepare("UPDATE content_mappings SET active = 1 WHERE facebook_post_id = ?").run("853313081388711_101");
+  db._sqlite.prepare("UPDATE products SET deleted_at = '2000-01-01 00:00:00' WHERE id = 1").run();
+  const { softDeleteProduct } = await import("../src/admin-db.js");
+  assert.equal(await softDeleteProduct(db, 1), 0);
+  assert.equal(db._state.mappings.find((m) => m.facebook_post_id === "853313081388711_101").active, 1, "no repair of an earlier delete");
+});
+
+test("AM-2.6-B toggle: turning a product OFF keeps its mappings exactly as they were (reply path rejects it at reply time)", async () => {
+  const db = createFakeD1({ products: AM26_PRODUCTS, mappings: AM26_MAPPINGS });
+  const before = db._state.mappings;
+  const off = await req(db, "PATCH", "/admin/api/products/1", { body: { active: false } });
+  assert.equal(off.status, 200);
+  assert.equal(off.json.data.active, 0);
+  assert.equal(db._state.products.find((p) => p.id === 1).deleted_at, null);
+  assert.deepEqual(db._state.mappings, before, "content_mappings.active unchanged");
+  const listed = (await req(db, "GET", "/admin/api/products")).json.data.find((p) => p.id === 1);
+  assert.equal(listed.mapping_count, 2, "active mappings still counted");
+});
+
+function loadToggleHandler() {
+  const app = readFileSync(new URL("../dashboard/app.js", import.meta.url), "utf8");
+  const start = app.indexOf("function productToggleHandler(p, refresh) {");
+  const end = app.indexOf("/* end productToggleHandler */");
+  assert.ok(start > 0 && end > start, "handler present");
+  const src = app.slice(start, end);
+  const calls = { api: [], confirm: [], toast: [], refresh: 0 };
+  let confirmAnswer = true;
+  let apiFails = false;
+  const api = async (path, options) => { calls.api.push({ path, options }); if (apiFails) throw new Error("boom"); return { data: {} }; };
+  const toast = (m, k) => calls.toast.push([m, k]);
+  const win = { confirm: (msg) => { calls.confirm.push(msg); return confirmAnswer; } };
+  // eslint-disable-next-line no-new-func
+  const make = new Function("api", "toast", "window", src + "\nreturn productToggleHandler;")(api, toast, win);
+  return {
+    calls,
+    setConfirm: (v) => { confirmAnswer = v; },
+    setApiFails: (v) => { apiFails = v; },
+    handler: (p) => make(p, () => { calls.refresh += 1; }),
+  };
+}
+
+test("AM-2.6-B dashboard: switching OFF a mapped product asks first; cancel restores and sends nothing", async () => {
+  const t = loadToggleHandler();
+  t.setConfirm(false);
+  const target = { checked: false };
+  await t.handler({ id: 7, name: "สินค้า A", active: 1, mapping_count: 3 })({ target });
+  assert.equal(t.calls.confirm.length, 1);
+  assert.match(t.calls.confirm[0], /3 โพสต์/, "says how many posts stop getting a link");
+  assert.match(t.calls.confirm[0], /ลิงก์/);
+  assert.equal(t.calls.api.length, 0, "cancel sends no request");
+  assert.equal(target.checked, true, "switch restored to the persisted (active) state");
+  assert.equal(t.calls.refresh, 0, "no unnecessary reload");
+});
+
+test("AM-2.6-B dashboard: confirming sends exactly one PATCH {active:false} and refreshes", async () => {
+  const t = loadToggleHandler();
+  t.setConfirm(true);
+  const target = { checked: false };
+  await t.handler({ id: 7, name: "สินค้า A", active: 1, mapping_count: 3 })({ target });
+  assert.equal(t.calls.confirm.length, 1);
+  assert.equal(t.calls.api.length, 1);
+  assert.equal(t.calls.api[0].path, "/admin/api/products/7");
+  assert.deepEqual(t.calls.api[0].options, { method: "PATCH", body: { active: false } });
+  assert.equal(t.calls.refresh, 1);
+  // Existing error handling kept: a failure reverts the switch and toasts.
+  const t2 = loadToggleHandler();
+  t2.setConfirm(true);
+  t2.setApiFails(true);
+  const target2 = { checked: false };
+  await t2.handler({ id: 7, name: "สินค้า A", active: 1, mapping_count: 3 })({ target: target2 });
+  assert.equal(t2.calls.api.length, 1);
+  assert.equal(target2.checked, true, "reverted on error");
+  assert.equal(t2.calls.toast.at(-1)[1], "err");
+});
+
+test("AM-2.6-B dashboard: OFF with zero mappings and turning ON send one PATCH with no confirmation", async () => {
+  const t = loadToggleHandler();
+  await t.handler({ id: 8, name: "B", active: 1, mapping_count: 0 })({ target: { checked: false } });
+  assert.equal(t.calls.confirm.length, 0);
+  assert.equal(t.calls.api.length, 1);
+  assert.deepEqual(t.calls.api[0].options, { method: "PATCH", body: { active: false } });
+
+  const on = loadToggleHandler();
+  await on.handler({ id: 9, name: "C", active: 0, mapping_count: 4 })({ target: { checked: true } });
+  assert.equal(on.calls.confirm.length, 0, "turning ON never asks");
+  assert.equal(on.calls.api.length, 1);
+  assert.deepEqual(on.calls.api[0].options, { method: "PATCH", body: { active: true } });
+  assert.equal(on.calls.refresh, 1);
+});
+
+test("AM-2.6-B dashboard: the product list switch uses the handler; delete confirmation and edit form unchanged", () => {
+  const app = readFileSync(new URL("../dashboard/app.js", import.meta.url), "utf8");
+  assert.match(app, /checked: Number\(p\.active\) === 1, onchange: productToggleHandler\(p, refresh\) \}/);
+  assert.match(app, /การลบจะปิด mapping เหล่านั้นด้วย/, "delete warning kept");
+  assert.match(app, /active: h\("input", \{ type: "checkbox", checked: Number\(p\.active\) === 1 \}\)/, "edit form checkbox unchanged");
+});
