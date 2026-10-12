@@ -245,6 +245,7 @@
     ["suggestions", "สินค้าแนะนำ"],
     ["activity", "กิจกรรมคอมเมนต์"],
     ["performance", "ผลงาน"],
+    ["audit", "ประวัติ"],
     ["settings", "ตั้งค่า"],
   ];
 
@@ -262,7 +263,7 @@
     const main = h("main", { id: "view" }, h("p", { class: "muted", text: "กำลังโหลด…" }));
     root.appendChild(main);
     root.appendChild(h("div", { id: "toast", class: "toast" }));
-    const views = { overview: viewOverview, products: viewProducts, content: viewContent, discovered: viewDiscovered, suggestions: viewSuggestions, activity: viewActivity, performance: viewPerformance, settings: viewSettings };
+    const views = { overview: viewOverview, products: viewProducts, content: viewContent, discovered: viewDiscovered, suggestions: viewSuggestions, activity: viewActivity, performance: viewPerformance, audit: viewAudit, settings: viewSettings };
     views[state.tab](main).catch((e) => { main.replaceChildren(h("p", { class: "error", text: e.message })); });
   }
 
@@ -1001,6 +1002,65 @@
         p.length ? pagedList(p, postTable, 10) : h("p", { class: "muted", text: "ยังไม่มีข้อมูล" })),
       h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", { text: "รายสินค้า" }), h("span", { class: "muted small", text: fmtNum(pr.length) + " สินค้า" })),
         pr.length ? pagedList(pr, productTable, 10) : h("p", { class: "muted", text: "ยังไม่มีข้อมูล" })));
+  }
+
+  /* ----------------------------- audit (U8) ---------------------------- */
+  const AUDIT_ACTION_TEXT = {
+    PRODUCT_CREATE: "เพิ่มสินค้า", PRODUCT_UPDATE: "แก้ไขสินค้า", PRODUCT_TOGGLE: "เปิด/ปิดสินค้า", PRODUCT_DELETE: "ลบสินค้า",
+    MAPPING_CREATE: "ผูกสินค้ากับโพสต์", MAPPING_UPDATE: "แก้ไขการผูก", MAPPING_DELETE: "ยกเลิกการผูก",
+    SUGGESTION_APPROVE: "อนุมัติคำแนะนำ", SUGGESTION_REJECT: "ปฏิเสธคำแนะนำ",
+    COMMENT_RETRY: "Retry คอมเมนต์", COMMENT_RECONCILE: "ตรวจผลส่ง (Reconcile)",
+  };
+  const AUDIT_KIND = { PRODUCT_DELETE: "red", MAPPING_DELETE: "red", SUGGESTION_REJECT: "gray", SUGGESTION_APPROVE: "green", MAPPING_CREATE: "green", PRODUCT_CREATE: "green", COMMENT_RETRY: "blue", COMMENT_RECONCILE: "blue" };
+  const FIELD_TEXT = { name: "ชื่อ", platform: "แพลตฟอร์ม", affiliate_url: "ลิงก์", active: "สถานะ", deleted_at: "ลบเมื่อ", facebook_post_id: "โพสต์", facebook_content_type: "ประเภท", product_id: "สินค้า #", note: "บันทึก", status: "สถานะ", reason: "ผล", outcome: "ผลลัพธ์", detail: "รายละเอียด", mapping_post_id: "โพสต์", post_id: "โพสต์" };
+  const showVal = (k, v) => v === null || v === undefined || v === "" ? "—" : (k === "active" ? (Number(v) === 1 ? "เปิด" : "ปิด") : String(v));
+
+  /** Field-level diff: "สินค้า #: 3 → 5". Unchanged fields are hidden on updates. */
+  function auditChanges(r) {
+    const b = r.before || {}; const a = r.after || {};
+    const keys = [...new Set([...Object.keys(b), ...Object.keys(a)])];
+    const rows = keys.filter((k) => !r.before || !r.after || JSON.stringify(b[k]) !== JSON.stringify(a[k])).map((k) => {
+      const val = (v) => (k === "affiliate_url" && v ? extLink(v, String(v).replace(/^https:\/\//, ""), "small") : h("span", { text: showVal(k, v) }));
+      return h("div", { class: "chg" }, h("span", { class: "muted", text: (FIELD_TEXT[k] || k) + ": " }),
+        r.before ? val(b[k]) : null, r.before && r.after ? h("span", { class: "muted", text: " → " }) : null, r.after ? val(a[k]) : null);
+    });
+    return rows.length ? rows : [h("span", { class: "muted small", text: "ไม่มีการเปลี่ยนค่า" })];
+  }
+
+  function auditTarget(r) {
+    const t = r.target_type; const id = r.target_id;
+    const post = (r.after && (r.after.facebook_post_id || r.after.mapping_post_id)) || (r.before && r.before.facebook_post_id);
+    if (t === "PRODUCT") return productLink((r.after && r.after.name) || (r.before && r.before.name) || ("#" + id));
+    if (t === "MAPPING" && post) return extLink(fbPostUrl(post), post, "mono small");
+    if (t === "SUGGESTION") return h("a", { href: "#suggestions", text: "คำแนะนำ #" + id });
+    if (t === "COMMENT") return h("a", { href: "#activity", text: "คอมเมนต์ #" + id, onclick: (e) => { e.preventDefault(); openComment(id); } });
+    return h("span", { text: t + " #" + id });
+  }
+
+  async function viewAudit(main) {
+    const type = h("select", null, [["", "ทุกประเภท"], ["MAPPING", "การผูกสินค้า"], ["PRODUCT", "สินค้า"], ["SUGGESTION", "คำแนะนำ"], ["COMMENT", "คอมเมนต์"]].map(([v, t]) => h("option", { value: v, text: t })));
+    const slot = h("div");
+    const note = h("div");
+    const paging = cursorPaging(async (cursor, size) => {
+      const qs = new URLSearchParams({ limit: String(size) });
+      if (type.value) qs.set("type", type.value);
+      if (cursor) qs.set("cursor", cursor);
+      const res = await api("/admin/api/audit?" + qs);
+      note.replaceChildren(...(res.available === false ? [h("p", { class: "error small", text: "ยังไม่ได้รัน migration 0007 — ระบบยังทำงานปกติ แต่ยังไม่บันทึกประวัติ" })] : []));
+      return res;
+    }, (rows) => slot.replaceChildren(!rows.length ? h("p", { class: "muted", text: "ยังไม่มีประวัติ" }) : h("table", null,
+      h("thead", null, h("tr", null, ["เวลา", "การกระทำ", "รายการ", "การเปลี่ยนแปลง"].map((t) => h("th", { text: t })))),
+      h("tbody", null, rows.map((r) => h("tr", null,
+        h("td", { class: "nowrap small", text: fmtTime(r.created_at) }),
+        h("td", null, badge(AUDIT_ACTION_TEXT[r.action] || r.action, AUDIT_KIND[r.action] || "blue")),
+        h("td", null, auditTarget(r)),
+        h("td", { class: "small" }, auditChanges(r))))))), 25);
+    type.addEventListener("change", () => paging.reset().catch((ex) => toast(ex.message, "err")));
+    main.replaceChildren(
+      h("div", { class: "row-between" }, h("h2", { text: "ประวัติการแก้ไข" }), type),
+      h("p", { class: "muted", text: "ทุกการเปลี่ยนแปลงที่ทำจากแดชบอร์ด พร้อมค่าก่อน → หลัง (ระบบมีรหัสผู้ดูแลเดียว จึงไม่ระบุชื่อผู้ทำ)" }),
+      note, slot, paging.bar);
+    await paging.reset();
   }
 
   /* ----------------------------- settings ---------------------------- */

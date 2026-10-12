@@ -558,3 +558,65 @@ export async function productPerformance(db, pageId) {
     .map((r) => ({ ...r, product_id: Number(r.product_id), active: Number(r.active), mapped_posts: Number(r.mapped_posts), comments: Number(r.comments), ai_replies: Number(r.ai_replies), sent: Number(r.sent), sent_with_link: Number(r.sent_with_link) }))
     .filter((r) => !r.deleted_at || r.comments > 0);
 }
+
+/* ------------------------ Upgrade U8: admin audit ------------------------ */
+
+export const AUDIT_ACTIONS = Object.freeze([
+  "PRODUCT_CREATE", "PRODUCT_UPDATE", "PRODUCT_TOGGLE", "PRODUCT_DELETE",
+  "MAPPING_CREATE", "MAPPING_UPDATE", "MAPPING_DELETE",
+  "SUGGESTION_APPROVE", "SUGGESTION_REJECT",
+  "COMMENT_RETRY", "COMMENT_RECONCILE",
+]);
+const AUDIT_FIELDS = {
+  PRODUCT: ["name", "platform", "affiliate_url", "active", "deleted_at"],
+  MAPPING: ["facebook_post_id", "facebook_content_type", "product_id", "active", "note"],
+  SUGGESTION: ["status", "product_id", "post_id", "mapping_post_id", "idempotent"],
+  COMMENT: ["status", "reason", "outcome", "detail"],
+};
+
+/** Keep only whitelisted business fields (never tokens or comment text). */
+export function auditSnapshot(targetType, obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const out = {};
+  for (const k of AUDIT_FIELDS[targetType] || []) if (obj[k] !== undefined) out[k] = obj[k];
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * Append one audit row. Best-effort by design: a failure here (for example
+ * before migration 0007 is applied) is logged by the caller's logEvent path
+ * and NEVER fails or undoes the admin action itself.
+ * @returns {Promise<boolean>}
+ */
+export async function recordAudit(db, { pageId, action, targetType, targetId = null, before = null, after = null }) {
+  try {
+    const b = auditSnapshot(targetType, before);
+    const a = auditSnapshot(targetType, after);
+    await db
+      .prepare(`INSERT INTO admin_audit (page_id, action, target_type, target_id, before_json, after_json) VALUES (?, ?, ?, ?, ?, ?)`)
+      .bind(pageId, action, targetType, targetId, b ? JSON.stringify(b) : null, a ? JSON.stringify(a) : null)
+      .run();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Newest first, id cursor. Missing table (pre-migration) -> []. */
+export async function listAudit(db, pageId, { beforeId = null, limit = 25, targetType = null } = {}) {
+  const where = ["page_id = ?"];
+  const params = [pageId];
+  if (targetType) { where.push("target_type = ?"); params.push(targetType); }
+  if (beforeId) { where.push("id < ?"); params.push(beforeId); }
+  params.push(limit);
+  try {
+    const res = await db
+      .prepare(`SELECT id, action, target_type, target_id, before_json, after_json, created_at FROM admin_audit WHERE ${where.join(" AND ")} ORDER BY id DESC LIMIT ?`)
+      .bind(...params)
+      .all();
+    const parse = (s) => { try { return s ? JSON.parse(s) : null; } catch { return null; } };
+    return { available: true, rows: (res?.results ?? []).map((r) => ({ id: Number(r.id), action: r.action, target_type: r.target_type, target_id: r.target_id === null ? null : Number(r.target_id), before: parse(r.before_json), after: parse(r.after_json), created_at: r.created_at })) };
+  } catch {
+    return { available: false, rows: [] };
+  }
+}

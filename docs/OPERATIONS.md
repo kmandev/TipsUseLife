@@ -465,6 +465,24 @@ Turn alerts off: `npx wrangler secret delete TELEGRAM_BOT_TOKEN` (the cron
 keeps recording state silently). Remove the cron entirely: delete
 `triggers` from `wrangler.jsonc` and deploy.
 
+## Admin change history (Upgrade U8)
+
+Migration `0007_admin_audit.sql` adds one table, `admin_audit` (additive; no
+existing table changes). Every state-changing Dashboard action appends one
+row: product create / update / toggle / delete, mapping create / update /
+delete, suggestion approve / reject, comment retry / reconcile. Each row
+keeps only whitelisted business fields before → after (name, platform,
+affiliate URL, active, deleted_at; post id, type, product_id, active, note;
+suggestion status; retry/reconcile result) — never a token, description,
+keywords or comment text. There is one admin password, so "who" is not
+recorded. Writing history is best-effort: if it fails (e.g. before 0007 is
+applied) the action itself still succeeds and `admin_audit_write_failed` is
+logged. View: Dashboard → **ประวัติ** (`GET /admin/api/audit?type=&limit=&cursor=`).
+
+Deploy order: `npx wrangler d1 migrations apply tipsuselife-ai --remote`
+(only 0007 pending), then `npx wrangler deploy`. Rollback: the previous
+Worker ignores the table; no schema rollback needed.
+
 ## Daily housekeeping (Upgrade U7)
 
 Every day at 06:17 Asia/Bangkok (`17 23 * * *` UTC) `src/daily-jobs.js`

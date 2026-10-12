@@ -28,6 +28,7 @@
  *   GET    /admin/api/alerts              alert status (Telegram configured?, last check, token verdict)
  *   POST   /admin/api/alerts/test         send one Telegram test message (no D1 write)
  *   POST   /admin/api/alerts/check        run the read-only alert check now (same as the cron)
+ *   GET    /admin/api/audit               admin change history ?type=&limit=&cursor= (U8)
  *   GET    /admin/api/daily               daily housekeeping status + switches (U7)
  *   POST   /admin/api/daily/run           run discovery + review-only suggestions now (never maps)
  *   GET    /admin/api/recovery            rows needing operator attention
@@ -64,6 +65,8 @@ import {
   commentDetail,
   postPerformance,
   productPerformance,
+  recordAudit,
+  listAudit,
 } from "./admin-db.js";
 import { runDiscovery, listCandidates, listRuns, CANDIDATE_STATUSES, MAPPING_FILTERS } from "./discovery.js";
 import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, approveSuggestion, SUGGESTION_STATUSES } from "./suggestions.js";
@@ -75,6 +78,13 @@ import { runDailyJobs, readDailyState } from "./daily-jobs.js";
 const PLATFORMS = ["shopee", "lazada", "tiktok", "other"];
 const CONTENT_TYPES = ["POST", "REEL"];
 const COMMENT_STATUSES = ["RECEIVED", "PROCESSED", "REPLIED", "SKIPPED", "ERROR"];
+const AUDIT_TYPES = ["MAPPING", "PRODUCT", "SUGGESTION", "COMMENT"];
+
+/** U8: best-effort change history; never blocks or undoes the action. */
+async function audit(db, config, action, targetType, targetId, before, after) {
+  const ok = await recordAudit(db, { pageId: config.pageId, action, targetType, targetId, before, after });
+  if (!ok) logError("admin_audit_write_failed", "D1_WRITE_FAILED", { action });
+}
 
 export function apiJson(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
@@ -304,6 +314,22 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       return apiJson({ data: page, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
     }
 
+    // Upgrade U8: admin change history (read-only listing).
+    if (resource === "audit" && idSegment === undefined) {
+      if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+      const limit = Number(url.searchParams.get("limit") || 25);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) return invalid("limit", "limit must be 1-100");
+      const type = url.searchParams.get("type") || null;
+      if (type && !AUDIT_TYPES.includes(type)) return invalid("type", "Unknown type");
+      const cursorRaw = url.searchParams.get("cursor");
+      const beforeId = cursorRaw ? parseId(cursorRaw) : null;
+      if (cursorRaw && !beforeId) return invalid("cursor", "Invalid cursor");
+      const { available, rows } = await listAudit(db, config.pageId, { beforeId, limit: limit + 1, targetType: type });
+      const hasMore = rows.length > limit;
+      const page = hasMore ? rows.slice(0, limit) : rows;
+      return apiJson({ data: page, available, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
+    }
+
     // Upgrade U7: daily housekeeping (discovery + review-only suggestions).
     if (resource === "daily") {
       if (idSegment === undefined) {
@@ -458,7 +484,9 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
           if (!checked.ok) return checked.response;
           const id = await createProduct(db, checked.value);
           logEvent("admin_product_created", { product_id: id });
-          return apiJson({ data: await getProduct(db, id) }, 201);
+          const created = await getProduct(db, id);
+          await audit(db, config, "PRODUCT_CREATE", "PRODUCT", id, null, created);
+          return apiJson({ data: created }, 201);
         }
         return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET, POST" });
       }
@@ -477,18 +505,23 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
           if (active === null) return invalid("active", "active must be true/false");
           await setProductActive(db, id, active);
           logEvent("admin_product_toggled", { product_id: id, active });
-          return apiJson({ data: await getProduct(db, id) });
+          const toggled = await getProduct(db, id);
+          await audit(db, config, "PRODUCT_TOGGLE", "PRODUCT", id, existing, toggled);
+          return apiJson({ data: toggled });
         }
         const checked = validateProductInput(body, config.affiliateAllowedHosts);
         if (!checked.ok) return checked.response;
         await updateProduct(db, id, checked.value);
         logEvent("admin_product_updated", { product_id: id });
-        return apiJson({ data: await getProduct(db, id) });
+        const updated = await getProduct(db, id);
+        await audit(db, config, "PRODUCT_UPDATE", "PRODUCT", id, existing, updated);
+        return apiJson({ data: updated });
       }
 
       if (method === "DELETE") {
         await softDeleteProduct(db, id);
         logEvent("admin_product_deleted", { product_id: id });
+        await audit(db, config, "PRODUCT_DELETE", "PRODUCT", id, existing, await getProduct(db, id));
         return apiJson({ ok: true });
       }
       return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET, PATCH, DELETE" });
@@ -514,7 +547,9 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
           const id = await insertMappingIfAbsent(db, { ...checked.value, facebook_page_id: config.pageId }, sourceIds);
           if (!id) return mappingExists(await mappingsForPosts(db, config.pageId, sourceIds), checked.value.facebook_post_id);
           logEvent("admin_mapping_saved", { mapping_id: id, product_id: checked.value.product_id });
-          return apiJson({ data: await getMapping(db, id) }, 201);
+          const createdMapping = await getMapping(db, id);
+          await audit(db, config, "MAPPING_CREATE", "MAPPING", id, null, createdMapping);
+          return apiJson({ data: createdMapping }, 201);
         }
         return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET, POST" });
       }
@@ -554,12 +589,15 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
         const changed = await updateMappingGuarded(db, id, config.pageId, v, siblings);
         if (!changed) return mappingExists(await mappingsForPosts(db, config.pageId, siblings, id), existing.facebook_post_id);
         logEvent("admin_mapping_updated", { mapping_id: id });
-        return apiJson({ data: await getMapping(db, id) });
+        const updatedMapping = await getMapping(db, id);
+        await audit(db, config, "MAPPING_UPDATE", "MAPPING", id, existing, updatedMapping);
+        return apiJson({ data: updatedMapping });
       }
 
       if (method === "DELETE") {
         await deleteMapping(db, id, config.pageId);
         logEvent("admin_mapping_deleted", { mapping_id: id });
+        await audit(db, config, "MAPPING_DELETE", "MAPPING", id, existing, null);
         return apiJson({ ok: true });
       }
       return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "PATCH, DELETE" });
@@ -641,6 +679,7 @@ async function handleSuggestionReject(request, db, config, idSegment) {
   if (outcome === "NOT_FOUND") return apiError(404, "NOT_FOUND", "Suggestion not found");
   if (outcome === "NOT_PENDING") return apiError(409, "NOT_PENDING", "Only a pending suggestion can be rejected");
   logEvent("admin_suggestion_rejected", { suggestion_id: id });
+  await audit(db, config, "SUGGESTION_REJECT", "SUGGESTION", id, { status: "PENDING" }, { status: "REJECTED" });
   return apiJson({ data: { id, status: "REJECTED" } });
 }
 
@@ -682,6 +721,9 @@ async function handleSuggestionApprove(request, db, config, idSegment) {
     return apiError(status, result.code, message);
   }
   logEvent("admin_suggestion_approved", { suggestion_id: id, product_id: result.mapping.product_id, idempotent: Boolean(result.idempotent) });
+  if (!result.idempotent) {
+    await audit(db, config, "SUGGESTION_APPROVE", "SUGGESTION", id, { status: "PENDING" }, { status: "APPROVED", product_id: result.mapping.product_id, mapping_post_id: result.mapping.post_id });
+  }
   return apiJson({ ok: true, suggestion_id: id, idempotent: Boolean(result.idempotent), mapping: result.mapping });
 }
 
@@ -711,6 +753,7 @@ async function handleRetry(request, db, env, config, idSegment, ctx) {
   }
 
   logEvent("admin_retry", { comment_row_id: id, status: result.status, reason: result.reason ?? null, outcome: result.outcome ?? null });
+  await audit(db, config, "COMMENT_RETRY", "COMMENT", id, null, { status: result.status, reason: result.reason ?? null, outcome: result.outcome ?? null });
   return apiJson(
     {
       data: {
@@ -749,6 +792,7 @@ async function handleReconcile(request, db, env, config, idSegment) {
   if (!result.commentFound) return apiError(404, "NOT_FOUND", "Comment not found");
 
   logEvent("admin_reconcile", { comment_row_id: id, reason: result.reason, detail: result.detail ?? null });
+  await audit(db, config, "COMMENT_RECONCILE", "COMMENT", id, null, { reason: result.reason, detail: result.detail ?? null });
   const status =
     result.reason === RECONCILE_REASONS.RECONCILED ? 200 : String(result.reason).startsWith("GRAPH_READ_") ? 502 : 409;
   return apiJson(
