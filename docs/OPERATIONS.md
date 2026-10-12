@@ -4,24 +4,24 @@ All Cloudflare commands run **on the Raspberry Pi** (`~/TipsUseLife-AI`),
 where wrangler is authenticated. Never paste secret values into chat, logs
 or command lines; pipe them or use the interactive prompt.
 
-## Current Operational Status — AM-2.5
+## Current Operational Status — AM-2.6
 
-Recorded after the AM-2.5 production acceptance (2026-10-02). This is the
-operator-supplied baseline from that acceptance, not a fresh verification;
-re-check with `npx wrangler deployments status` before acting on it. Update
-this section when the state changes.
+Recorded after the AM-2.6-B + dashboard redesign deploy (2026-10-12). The
+version below is the operator's `npx wrangler deployments status` output for
+that deploy; re-check it before acting on it. Update this section when the
+state changes.
 
 **Production (current)**
 
 | Item | Value |
 |---|---|
 | Worker | `facebook-feed-webhook` |
-| Worker version | `07c822e2-97c5-44cc-b0cc-7b28a54e221c` (100% traffic, message `AM-2.5 0d57a4b guard manual mappings`) |
-| Source baseline | `0d57a4b` (`fix(admin): guard manual content mappings against overwrite and duplicates`) |
+| Worker version | `82a50ee6-69c9-42f1-a585-56f41f661a0a` (100% traffic, created 2026-10-12T04:58Z, message `AM-2.6-B + dashboard redesign f93fefd`) |
+| Source baseline | `f93fefd` (`feat(dashboard): redesign overview, add pagination and real Facebook links`), on top of `ffa9e00` (AM-2.6-B) |
 | `REPLY_MODE` | `LIVE` (permanent; see "Permanent LIVE enablement" below) |
-| Rollback target | `3ce5794c-8556-4287-8b08-5f0b5d39e343` (AM-2.4, source `7f97e6c`); AM-2.5 added no migration, so no schema rollback is needed |
-| Tests | 448 / 448 pass |
-| Completed phases since 8.62 | permanent LIVE (`c141193`), AM-2 discovery (`f910975`), AM-2.2 canonical Reels (`356826c`), AM-2.3 suggestions (`81637ed`), AM-2.4 human approval (`7f97e6c`), AM-2.5 manual mapping guards (`0d57a4b`) — AM-2.5 closed / accepted |
+| Rollback target | `07c822e2-97c5-44cc-b0cc-7b28a54e221c` (AM-2.5, source `0d57a4b`); AM-2.6 added no migration, so no schema rollback is needed. Older: `3ce5794c-8556-4287-8b08-5f0b5d39e343` (AM-2.4) |
+| Tests | 459 / 459 pass |
+| Completed phases since 8.62 | permanent LIVE (`c141193`), AM-2 discovery (`f910975`), AM-2.2 canonical Reels (`356826c`), AM-2.3 suggestions (`81637ed`), AM-2.4 human approval (`7f97e6c`), AM-2.5 manual mapping guards (`0d57a4b`), AM-2.6-A docs sync (`3f196db`), AM-2.6-B atomic product soft-delete + product-OFF confirmation (`ffa9e00`), dashboard redesign / pagination / Facebook links (`f93fefd`) |
 
 **Permanent LIVE enablement.** Commit `c141193` (`feat(webhook): enable
 permanent LIVE mode`, 2026-10-02) changed `wrangler.jsonc` from
@@ -442,5 +442,16 @@ then `npx wrangler deploy`. No `wrangler.jsonc` change.
 - New post/reel: after its first comment it appears under
   "โพสต์ที่มีคอมเมนต์แต่ยังไม่ผูกสินค้า" → ผูกสินค้า. Or paste its id.
 - Product sold out / link dead: toggle it off — mapped posts stop getting a
-  link immediately (replies degrade to text-only or SKIP).
+  link immediately (replies degrade to text-only or SKIP). If the product
+  still has mapped posts the Dashboard asks first (AM-2.6-B); the mappings
+  stay and links resume when the product is switched on again. Deleting a
+  product soft-deletes it and switches its mappings off in one D1 batch (all
+  or nothing); a deleted product cannot be restored from the Dashboard.
+- Dashboard navigation (2026-10-12): every tab is a `#hash` link
+  (`/admin/#activity`, …). Overview cards open the filtered list behind the
+  number. Long lists are paged (10/25/50/100 per page; cursor lists keep each
+  page's cursor). Post/comment ids open Facebook: a stored facebook.com
+  permalink is used when present, otherwise the URL is built from the numeric
+  id (`/<page>/posts/<post>`, comments add `?comment_id=<n>`); non-numeric ids
+  stay plain text.
 - Graph API version: bump `GRAPH_API_VERSION` before 2027-01-21.
