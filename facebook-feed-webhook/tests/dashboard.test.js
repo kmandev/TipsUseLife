@@ -498,3 +498,61 @@ test("AM-2.6-B dashboard: the product list switch uses the handler; delete confi
   assert.match(app, /การลบจะปิด mapping เหล่านั้นด้วย/, "delete warning kept");
   assert.match(app, /active: h\("input", \{ type: "checkbox", checked: Number\(p\.active\) === 1 \}\)/, "edit form checkbox unchanged");
 });
+
+/* ---------------- Dashboard redesign: Facebook links + pagination ---------------- */
+
+function loadLinkHelpers() {
+  const app = readFileSync(new URL("../dashboard/app.js", import.meta.url), "utf8");
+  const start = app.indexOf("/* --------------------------- Facebook links --------------------------- */");
+  const end = app.indexOf("/** Text with every https:// URL turned into a real link");
+  assert.ok(start > 0 && end > start, "link helpers present");
+  // eslint-disable-next-line no-new-func
+  return new Function(app.slice(start, end) + "\nreturn { isFacebookUrl, fbPostUrl, fbCommentUrl };")();
+}
+
+test("dashboard links: post and comment ids become real Facebook URLs; anything else stays text", () => {
+  const { fbPostUrl, fbCommentUrl } = loadLinkHelpers();
+  assert.equal(fbPostUrl("853313081388711_1694107882724308"), "https://www.facebook.com/853313081388711/posts/1694107882724308");
+  assert.equal(fbPostUrl("998877", null, "REEL"), "https://www.facebook.com/reel/998877");
+  assert.equal(fbPostUrl("998877"), "https://www.facebook.com/998877");
+  assert.equal(fbPostUrl("x", "https://www.facebook.com/reel/42/"), "https://www.facebook.com/reel/42/", "a stored Facebook permalink wins");
+  assert.equal(fbPostUrl("853313081388711_1", "javascript:alert(1)"), "https://www.facebook.com/853313081388711/posts/1", "a non-Facebook permalink is ignored");
+  assert.equal(fbPostUrl("../evil"), null);
+  assert.equal(fbPostUrl("123_abc"), null);
+  assert.equal(fbPostUrl(null), null);
+  assert.equal(
+    fbCommentUrl("1694107882724308_1081348987969658", "853313081388711_1694107882724308"),
+    "https://www.facebook.com/853313081388711/posts/1694107882724308?comment_id=1081348987969658");
+  assert.equal(fbCommentUrl("bad id", "853313081388711_1"), "https://www.facebook.com/853313081388711/posts/1", "falls back to the post");
+  assert.equal(fbCommentUrl("1_2", null), null, "no post -> no link");
+});
+
+test("dashboard pagination: long lists are paged; cursor APIs page with the stored cursor; no 'load more'", () => {
+  const app = readFileSync(new URL("../dashboard/app.js", import.meta.url), "utf8");
+  assert.doesNotMatch(app, /โหลดเพิ่ม/, "the old 'load more' buttons are gone");
+  for (const view of ["viewActivity", "viewDiscovered", "viewSuggestions"]) {
+    const at = app.indexOf("async function " + view);
+    const body = app.slice(at, app.indexOf("\n  }\n", at));
+    assert.match(body, /cursorPaging\(/, view + " uses page-by-page cursor navigation");
+    assert.match(body, /paging\.bar/, view + " renders the pager");
+  }
+  assert.match(app, /return pagedList\(rows, \(page\) => h\("table"/, "products are paged");
+  assert.match(app, /mappings\.length \? pagedList\(mappings,/, "mappings are paged");
+  assert.match(app, /unmapped\.length \? pagedList\(unmapped,/, "unmapped posts are paged");
+  assert.match(app, /const PAGE_SIZES = \[10, 25, 50, 100\];/, "page sizes stay within the API limit (1-100)");
+  assert.match(app, /cursors\[n\] = res\.next_cursor \|\| null;/, "each page's cursor is remembered for 'previous'");
+});
+
+test("dashboard links: ids, comments, reply URLs and tabs render as real links (text nodes only)", () => {
+  const app = readFileSync(new URL("../dashboard/app.js", import.meta.url), "utf8");
+  assert.match(app, /extLink\(fbCommentUrl\(r\.facebook_comment_id, r\.facebook_post_id\)/, "attention rows link the comment");
+  assert.match(app, /extLink\(fbPostUrl\(m\.facebook_post_id, m\.permalink, m\.facebook_content_type\)/, "mapped posts always link");
+  assert.match(app, /extLink\(fbPostUrl\(c\.post_id, c\.permalink, c\.content_type\)/, "discovered ids link");
+  assert.match(app, /commentLinks\(c\)/, "activity rows link the comment and its post");
+  assert.match(app, /href: "#" \+ key/, "tabs are hash links");
+  assert.match(app, /window\.addEventListener\("hashchange"/);
+  const linkify = app.slice(app.indexOf("function linkify("), app.indexOf("/** External link"));
+  assert.match(linkify, /createTextNode/);
+  assert.match(linkify, /rel: "noopener noreferrer"/);
+  assert.match(app, /rel: "noopener noreferrer", class: "ext "/, "external links never leak the opener");
+});

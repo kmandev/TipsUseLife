@@ -41,7 +41,7 @@
     return isNaN(d) ? String(v) : d.toLocaleString("th-TH", { dateStyle: "short", timeStyle: "short" });
   };
 
-  const state = { authenticated: null, tab: "overview", mode: null, products: [], toast: null };
+  const state = { authenticated: null, tab: "overview", mode: null, products: [], toast: null, nav: null };
 
   function toast(message, kind = "ok") {
     state.toast = { message, kind };
@@ -52,6 +52,168 @@
   }
 
   function badge(text, kind) { return h("span", { class: "badge " + (kind || ""), text }); }
+
+  /* ------------------------------ icons ------------------------------ */
+  // Inline SVG line icons (stroke paths only); built with createElementNS, never parsed markup.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const ICONS = {
+    chat: ["M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"],
+    zap: ["M13 2L3 14h9l-1 8 10-12h-9l1-8z"],
+    send: ["M22 2L11 13", "M22 2l-7 20-4-9-9-4 20-7z"],
+    link: ["M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71", "M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"],
+    alert: ["M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z", "M12 9v4", "M12 17h.01"],
+    box: ["M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z", "M3.27 6.96L12 12.01l8.73-5.05", "M12 22.08V12"],
+    file: ["M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z", "M14 2v6h6", "M16 13H8", "M16 17H8"],
+    skip: ["M5 4l10 8-10 8V4z", "M19 5v14"],
+    clock: ["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z", "M12 6v6l4 2"],
+    check: ["M22 11.08V12a10 10 0 1 1-5.93-9.14", "M22 4L12 14.01l-3-3"],
+    refresh: ["M23 4v6h-6", "M1 20v-6h6", "M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"],
+    ext: ["M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6", "M15 3h6v6", "M10 14L21 3"],
+    arrow: ["M5 12h14", "M12 5l7 7-7 7"],
+  };
+  function icon(name, cls) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("class", "icon" + (cls ? " " + cls : ""));
+    for (const d of ICONS[name] || []) {
+      const path = document.createElementNS(SVG_NS, "path");
+      path.setAttribute("d", d);
+      svg.appendChild(path);
+    }
+    return svg;
+  }
+
+  /* --------------------------- Facebook links --------------------------- */
+  /** Only real Facebook https links become anchors; anything else is shown as text. */
+  const isFacebookUrl = (u) => /^https:\/\/([a-z0-9-]+\.)*facebook\.com\//i.test(String(u || ""));
+  const FB_BASE = "https://www.facebook.com/";
+  /**
+   * A clickable Facebook URL for a post/Reel. A stored Facebook permalink wins;
+   * otherwise it is built from the numeric id only (`<page>_<post>` ->
+   * /<page>/posts/<post>; a bare Reel/video id -> /reel/<id> or /<id>).
+   * Anything that is not purely numeric gives null (rendered as plain text).
+   */
+  function fbPostUrl(postId, permalink, type) {
+    if (isFacebookUrl(permalink)) return String(permalink);
+    const id = String(postId || "");
+    const pair = /^([0-9]+)_([0-9]+)$/.exec(id);
+    if (pair) return FB_BASE + pair[1] + "/posts/" + pair[2];
+    if (/^[0-9]+$/.test(id)) return FB_BASE + (type === "REEL" ? "reel/" : "") + id;
+    return null;
+  }
+  /** The post URL with `?comment_id=` so Facebook scrolls to / highlights that comment. */
+  function fbCommentUrl(commentId, postId, permalink) {
+    const base = fbPostUrl(postId, permalink);
+    const m = /^(?:[0-9]+_)?([0-9]+)$/.exec(String(commentId || ""));
+    if (!base || !m) return base;
+    try { const u = new URL(base); u.searchParams.set("comment_id", m[1]); return u.toString(); } catch { return base; }
+  }
+  /** Text with every https:// URL turned into a real link (built as text nodes + anchors, never markup). */
+  function linkify(text, cls) {
+    const el = h("div", { class: cls || "" });
+    const str = String(text || "");
+    const re = /https:\/\/[^\s<>"']+/g;
+    let last = 0; let m;
+    while ((m = re.exec(str))) {
+      const url = m[0].replace(/[).,!?…]+$/, "");
+      if (m.index > last) el.appendChild(document.createTextNode(str.slice(last, m.index)));
+      el.appendChild(h("a", { href: url, target: "_blank", rel: "noopener noreferrer", class: "ext", text: url }));
+      last = m.index + url.length;
+      re.lastIndex = last;
+    }
+    if (last < str.length) el.appendChild(document.createTextNode(str.slice(last)));
+    return el;
+  }
+  /** External link (new tab, no referrer/opener) or plain text when there is no safe URL. */
+  function extLink(url, text, cls) {
+    if (!url) return h("span", { class: cls || "", text });
+    return h("a", { href: url, target: "_blank", rel: "noopener noreferrer", class: "ext " + (cls || ""), text });
+  }
+
+  /* --------------------------- in-app navigation --------------------------- */
+  const tabFromHash = () => { const k = String(location.hash || "").replace(/^#/, ""); return TABS.some(([key]) => key === k) ? k : "overview"; };
+  /** Switch tab (keeps the URL hash in sync so tabs are real, shareable links). `nav` carries a one-shot filter. */
+  function goTo(tab, nav) {
+    state.nav = nav || null;
+    if (location.hash !== "#" + tab) location.hash = tab; // hashchange -> render()
+    else { state.tab = tab; render(); }
+  }
+  /** Internal link to the product catalog, pre-filtered by name. */
+  function productLink(name) {
+    if (!name) return h("span", { class: "muted", text: "-" });
+    return h("a", { href: "#products", class: "plink", text: name, onclick: (e) => { e.preventDefault(); goTo("products", { search: name }); } });
+  }
+
+  /* ------------------------------ pagination ------------------------------ */
+  const PAGE_SIZES = [10, 25, 50, 100];
+  function pageSizeSelect(value, onChange) {
+    return h("select", { class: "page-size", "aria-label": "จำนวนต่อหน้า", onchange: (e) => onChange(Number(e.target.value)) },
+      PAGE_SIZES.map((n) => h("option", { value: n, text: n + " / หน้า", selected: n === value })));
+  }
+  /**
+   * Pager bar. With `pages` known: numbered buttons (1 … p-1 p p+1 … last).
+   * Without (cursor APIs): previous / "หน้า N" / next, next enabled by `hasMore`.
+   */
+  function pagerBar({ page, pages, from, to, total, count, hasMore, size, onPage, onSize }) {
+    const btn = (label, target, opts = {}) => h("button", { type: "button", class: "pg-btn" + (opts.active ? " active" : ""), text: label, disabled: Boolean(opts.disabled), "aria-current": opts.active ? "page" : null, "aria-label": opts.label || null, onclick: () => onPage(target) });
+    const nums = [];
+    if (pages) {
+      const shown = [...new Set([1, pages, page - 1, page, page + 1])].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b);
+      let prev = 0;
+      for (const n of shown) {
+        if (n - prev > 1) nums.push(h("span", { class: "pg-gap", text: "…" }));
+        nums.push(btn(String(n), n, { active: n === page }));
+        prev = n;
+      }
+    } else {
+      nums.push(h("span", { class: "pg-current", text: "หน้า " + page }));
+    }
+    const info = total !== undefined ? from + "–" + to + " จาก " + total + " รายการ" : "แสดง " + (count ?? 0) + " รายการ" + (hasMore ? "" : " · หน้าสุดท้าย");
+    return h("div", { class: "pager" },
+      h("span", { class: "pg-info", text: info }),
+      h("div", { class: "pg-nav" },
+        btn("‹", page - 1, { disabled: page <= 1, label: "หน้าก่อนหน้า" }),
+        ...nums,
+        btn("›", page + 1, { disabled: pages ? page >= pages : !hasMore, label: "หน้าถัดไป" })),
+      onSize ? pageSizeSelect(size, onSize) : null);
+  }
+  /** Client-side pagination over a list already in memory. */
+  function pagedList(items, renderPage, size = 25) {
+    const wrap = h("div", { class: "paged" });
+    let page = 1;
+    const draw = () => {
+      const pages = Math.max(1, Math.ceil(items.length / size));
+      if (page > pages) page = pages;
+      const start = (page - 1) * size;
+      const pager = items.length > PAGE_SIZES[0] ? pagerBar({ page, pages, from: start + 1, to: Math.min(start + size, items.length), total: items.length, size,
+          onPage: (n) => { page = n; draw(); }, onSize: (n) => { size = n; page = 1; draw(); } }) : null;
+      wrap.replaceChildren(...[renderPage(items.slice(start, start + size)), pager].filter(Boolean)); // replaceChildren(null) would print "null"
+    };
+    draw();
+    return wrap;
+  }
+  /**
+   * Page-by-page navigation over a cursor API ({data, next_cursor, has_more}).
+   * The cursor of every visited page is kept, so "previous" returns exactly.
+   */
+  function cursorPaging(fetchPage, onRows, initialSize = 25) {
+    let size = initialSize; let page = 1; let cursors = [null];
+    const bar = h("div", { class: "pager-slot" });
+    const go = async (n) => {
+      const res = await fetchPage(cursors[n - 1] || null, size);
+      page = n;
+      cursors[n] = res.next_cursor || null;
+      cursors.length = n + 1;
+      onRows(res.data || []);
+      const hasMore = Boolean(res.has_more);
+      bar.replaceChildren(page > 1 || hasMore ? pagerBar({ page, hasMore, size, count: (res.data || []).length,
+        onPage: (k) => { go(k).then(() => bar.scrollIntoView({ block: "nearest" })).catch((ex) => toast(ex.message, "err")); },
+        onSize: (k) => { size = k; reset().catch((ex) => toast(ex.message, "err")); } }) : h("span"));
+    };
+    const reset = () => { cursors = [null]; return go(1); };
+    return { bar, reset, reload: () => go(page) };
+  }
 
   const STATUS_KIND = { PROCESSED: "blue", REPLIED: "green", SKIPPED: "gray", ERROR: "red", RECEIVED: "gray", GENERATED: "blue", SENT: "green", FAILED: "red" };
   const SOURCE_LABEL = { MAPPING: "ผูกกับโพสต์", KEYWORD: "คีย์เวิร์ด (ข้อมูลเก่า)", NONE: "ไม่มี" };
@@ -86,14 +248,16 @@
   ];
 
   function renderShell(root) {
-    const nav = h("nav", { class: "tabs" }, TABS.map(([key, label]) =>
-      h("button", { class: "tab" + (state.tab === key ? " active" : ""), text: label, onclick: () => { state.tab = key; render(); } })));
-    const modeBadge = state.mode ? badge(state.mode === "LIVE" ? "LIVE — ตอบจริง" : "DRY_RUN — ไม่โพสต์จริง", state.mode === "LIVE" ? "red" : "blue") : null;
+    // Tabs are real links (#overview, #products, …): bookmarkable, back/forward works.
+    const nav = h("nav", { class: "tabs", "aria-label": "เมนูหลัก" }, TABS.map(([key, label]) =>
+      h("a", { class: "tab" + (state.tab === key ? " active" : ""), href: "#" + key, text: label, "aria-current": state.tab === key ? "page" : null })));
+    const modeBadge = state.mode ? modePill(state.mode) : null;
     const logout = h("button", { class: "btn ghost", text: "ออกจากระบบ", onclick: async () => { await fetch("/admin/logout", { method: "POST", credentials: "same-origin" }); state.authenticated = false; render(); } });
     root.appendChild(h("header", { class: "topbar" },
-      h("div", { class: "brand" }, h("div", { class: "logo", text: "T" }), h("div", null, h("strong", { text: "TipsUseLife AI" }), h("div", { class: "muted", text: "Facebook Page Comment Agent" }))),
-      h("div", { class: "topbar-right" }, modeBadge, logout)));
-    root.appendChild(nav);
+      h("div", { class: "topbar-inner" },
+        h("a", { class: "brand", href: "#overview" }, h("div", { class: "logo", text: "T" }), h("div", null, h("strong", { text: "TipsUseLife AI" }), h("div", { class: "muted small", text: "Facebook Page Comment Agent" }))),
+        h("div", { class: "topbar-right" }, modeBadge, logout)),
+      nav));
     const main = h("main", { id: "view" }, h("p", { class: "muted", text: "กำลังโหลด…" }));
     root.appendChild(main);
     root.appendChild(h("div", { id: "toast", class: "toast" }));
@@ -102,22 +266,111 @@
   }
 
   /* ----------------------------- overview ---------------------------- */
+  const fmtNum = (v) => Number(v || 0).toLocaleString("th-TH");
+  const num = (v) => Number(v) || 0;
+  const pct = (a, b) => (num(b) > 0 ? Math.round((num(a) / num(b)) * 100) : 0);
+
+  /** A KPI card is a real link to the list behind the number. */
+  function kpiCard(k) {
+    return h("a", { class: "kpi tone-" + k.tone, href: "#" + k.to[0], onclick: (e) => { e.preventDefault(); goTo(k.to[0], k.to[1]); } },
+      h("div", { class: "kpi-icon" }, icon(k.icon)),
+      h("div", { class: "kpi-body" },
+        h("div", { class: "kpi-label", text: k.label }),
+        h("div", { class: "kpi-value", text: fmtNum(k.value) }),
+        h("div", { class: "kpi-sub", text: k.sub })));
+  }
+
+  function bar(value, max, tone) {
+    const fill = h("span", { class: "bar-fill tone-" + (tone || "blue") });
+    fill.style.width = Math.max(0, Math.min(100, pct(value, max))) + "%"; // CSSOM, allowed by the CSP
+    return h("span", { class: "bar" }, fill);
+  }
+
+  function funnel(d) {
+    const total = num(d.comments_received);
+    const steps = [
+      ["คอมเมนต์ที่รับ", d.comments_received, "blue"],
+      ["AI เลือกตอบ", d.ai_replies, "violet"],
+      ["ส่งจริง (SENT)", d.replies_sent, "green"],
+      ["คำตอบที่แนบลิงก์", d.replies_with_link, "amber"],
+    ];
+    return h("div", { class: "funnel" }, steps.map(([label, value, tone]) => h("div", { class: "funnel-row" },
+      h("div", { class: "funnel-label" }, h("span", { text: label }), h("span", { class: "funnel-num", text: fmtNum(value) + (total ? " · " + pct(value, total) + "%" : "") })),
+      bar(value, total, tone))));
+  }
+
+  function meterRow(label, active, total, tab) {
+    return h("a", { class: "meter", href: "#" + tab, onclick: (e) => { e.preventDefault(); goTo(tab); } },
+      h("div", { class: "meter-head" }, h("span", { text: label }), h("strong", { text: fmtNum(active) + " / " + fmtNum(total) })),
+      bar(active, total, "green"),
+      h("div", { class: "muted small", text: "เปิดใช้ " + pct(active, total) + "%" }));
+  }
+
+  function miniStat(label, value, tone, to) {
+    return h("a", { class: "mini tone-" + tone, href: "#" + to[0], onclick: (e) => { e.preventDefault(); goTo(to[0], to[1]); } },
+      h("span", { class: "mini-value", text: fmtNum(value) }), h("span", { class: "mini-label", text: label }));
+  }
+
+  /** Links to the comment (and its post) on Facebook; omitted when no safe URL can be built. */
+  function commentLinks(c) {
+    const cu = fbCommentUrl(c.facebook_comment_id, c.facebook_post_id);
+    const pu = fbPostUrl(c.facebook_post_id);
+    const out = [];
+    if (cu) out.push(extLink(cu, "ดูคอมเมนต์ ↗", "small"));
+    if (pu) out.push(extLink(pu, "ดูโพสต์ ↗", "small"));
+    return out.length ? h("span", { class: "links" }, out) : null;
+  }
+
+  function recentFeed(rows) {
+    if (!rows.length) return h("p", { class: "muted", text: "ยังไม่มีคอมเมนต์" });
+    return h("ul", { class: "feed" }, rows.map((c) => h("li", { class: "feed-item" },
+      h("div", { class: "avatar", text: (String(c.author_name || "").trim().charAt(0) || "?").toUpperCase() }),
+      h("div", { class: "feed-body" },
+        h("div", { class: "feed-top" },
+          h("strong", { text: c.author_name || "ไม่ทราบชื่อ" }),
+          h("span", { class: "muted small", text: fmtTime(c.created_at) }),
+          badge(c.status, STATUS_KIND[c.status]),
+          c.reply ? badge(c.reply.mode, c.reply.mode === "LIVE" ? "red" : "blue") : null),
+        h("div", { class: "feed-text", text: c.comment_text || "" }),
+        c.reply && c.reply.response_text ? h("div", { class: "feed-reply" }, icon("send", "sm"), linkify(c.reply.response_text, "pre")) : null,
+        h("div", { class: "feed-links" }, commentLinks(c), c.matched_product ? h("span", { class: "small" }, "สินค้า: ", productLink(c.matched_product.name)) : null)))));
+  }
+
   async function viewOverview(main) {
     const [ov, recent, health, attention] = await Promise.all([api("/admin/api/overview"), api("/admin/comments?limit=10"), api("/admin/api/health"), api("/admin/api/recovery")]);
     state.mode = ov.mode;
     const d = ov.data || {};
-    const tiles = [
-      ["คอมเมนต์ที่รับ", d.comments_received], ["AI เลือกตอบ", d.ai_replies], ["AI ข้าม (SKIP)", d.ai_skipped],
-      ["ร่างคำตอบ DRY_RUN (GENERATED)", d.replies_generated_dry_run], ["LIVE ค้างสถานะ GENERATED", d.replies_generated_live], ["ส่งจริง (SENT)", d.replies_sent],
-      ["คำตอบที่แนบลิงก์", d.replies_with_link], ["สินค้าเปิดใช้", (d.products_active ?? 0) + " / " + (d.products_total ?? 0)],
-      ["Mapping เปิดใช้", (d.mappings_active ?? 0) + " / " + (d.mappings_total ?? 0)], ["ข้อผิดพลาด", d.errors],
+    const kpis = [
+      { icon: "chat", tone: "blue", label: "คอมเมนต์ที่รับ", value: d.comments_received, sub: "ดูกิจกรรมทั้งหมด →", to: ["activity"] },
+      { icon: "zap", tone: "violet", label: "AI เลือกตอบ", value: d.ai_replies, sub: pct(d.ai_replies, d.comments_received) + "% ของคอมเมนต์", to: ["activity", { status: "PROCESSED" }] },
+      { icon: "send", tone: "green", label: "ส่งจริง (SENT)", value: d.replies_sent, sub: "แนบลิงก์ " + fmtNum(d.replies_with_link) + " ครั้ง", to: ["activity", { status: "REPLIED" }] },
+      { icon: "alert", tone: num(d.errors) > 0 ? "red" : "gray", label: "ข้อผิดพลาด", value: d.errors, sub: num(d.errors) > 0 ? "ดูรายการ ERROR →" : "ไม่มีข้อผิดพลาด", to: ["activity", { status: "ERROR" }] },
     ];
+    const refreshBtn = h("button", { class: "btn ghost icon-btn", "aria-label": "รีเฟรช", onclick: () => viewOverview(main).catch((e) => toast(e.message, "err")) }, icon("refresh"), "รีเฟรช");
     main.replaceChildren(
-      h("h2", { text: "ภาพรวม" }),
-      h("div", { class: "tiles" }, tiles.map(([label, value]) => h("div", { class: "tile" }, h("div", { class: "tile-value", text: value ?? 0 }), h("div", { class: "tile-label", text: label })))),
+      h("section", { class: "hero" },
+        h("div", null,
+          h("h2", { text: "ภาพรวม" }),
+          h("p", { class: "muted", text: "สรุปการทำงานของระบบตอบคอมเมนต์ · อัปเดต " + new Date().toLocaleTimeString("th-TH", { hour: "2-digit", minute: "2-digit" }) })),
+        h("div", { class: "hero-actions" }, refreshBtn)),
+      h("div", { class: "kpi-grid" }, kpis.map(kpiCard)),
+      h("div", { class: "ov-grid" },
+        h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", { text: "เส้นทางคอมเมนต์" }), h("span", { class: "muted small", text: "เทียบกับคอมเมนต์ที่รับ" })), funnel(d),
+          h("div", { class: "mini-row" },
+            miniStat("AI ข้าม (SKIP)", d.ai_skipped, "gray", ["activity", { status: "SKIPPED" }]),
+            miniStat("ร่างคำตอบ DRY_RUN (GENERATED)", d.replies_generated_dry_run, "blue", ["activity", { status: "PROCESSED" }]),
+            miniStat("LIVE ค้างสถานะ GENERATED", d.replies_generated_live, num(d.replies_generated_live) > 0 ? "amber" : "gray", ["activity"]))),
+        h("div", { class: "card" }, h("div", { class: "card-head" }, h("h3", { text: "แคตตาล็อกและการผูกสินค้า" })),
+          meterRow("สินค้าเปิดใช้", d.products_active, d.products_total, "products"),
+          meterRow("Mapping เปิดใช้", d.mappings_active, d.mappings_total, "content"),
+          h("div", { class: "quick" },
+            h("a", { class: "btn small", href: "#discovered", text: "โพสต์ที่ค้นพบ" }),
+            h("a", { class: "btn small", href: "#suggestions", text: "สินค้าแนะนำ" }),
+            h("a", { class: "btn small", href: "#content", text: "ผูกสินค้ากับโพสต์" })))),
       opsSection(health.data || {}, attention.data || [], () => viewOverview(main)),
-      h("h3", { text: "กิจกรรมล่าสุด" }),
-      activityTable(recent.data || []));
+      h("div", { class: "card" },
+        h("div", { class: "card-head" }, h("h3", { text: "กิจกรรมล่าสุด" }), h("a", { class: "link-more", href: "#activity" }, "ดูทั้งหมด ", icon("arrow", "sm"))),
+        recentFeed(recent.data || [])));
     renderModeInHeader();
   }
 
@@ -138,23 +391,29 @@
   };
 
   function opsSection(hd, rows, refresh) {
+    // [label, value, tone when non-zero] -- a problem metric turns amber/red only when it is > 0.
     const tiles = [
-      ["ERROR ที่กู้คืนได้", hd.recoverable_errors], ["RECEIVED ค้างที่กู้คืนได้", hd.recoverable_stale_received],
-      ["LIVE ผลส่งไม่แน่นอน", hd.live_outcome_unknown], ["LIVE กำลังส่ง (ค้าง)", hd.live_send_in_progress],
-      ["LIVE Facebook 4xx", hd.live_failed_4xx], ["LIVE ส่งแล้ว (SENT)", hd.live_sent],
-      ["ERROR 1 ชม. / 24 ชม.", (hd.errors_1h ?? 0) + " / " + (hd.errors_24h ?? 0)],
+      ["ERROR ที่กู้คืนได้", hd.recoverable_errors, "amber"], ["RECEIVED ค้างที่กู้คืนได้", hd.recoverable_stale_received, "amber"],
+      ["LIVE ผลส่งไม่แน่นอน", hd.live_outcome_unknown, "red"], ["LIVE กำลังส่ง (ค้าง)", hd.live_send_in_progress, "amber"],
+      ["LIVE Facebook 4xx", hd.live_failed_4xx, "red"], ["LIVE ส่งแล้ว (SENT)", hd.live_sent, "green"],
+      ["ERROR 1 ชม. / 24 ชม.", (hd.errors_1h ?? 0) + " / " + (hd.errors_24h ?? 0), num(hd.errors_1h) > 0 ? "red" : num(hd.errors_24h) > 0 ? "amber" : "gray"],
     ];
-    return h("div", null,
-      h("h3", { text: "สถานะการทำงาน" }),
-      h("div", { class: "tiles" }, tiles.map(([label, value]) => h("div", { class: "tile" }, h("div", { class: "tile-value", text: value ?? 0 }), h("div", { class: "tile-label", text: label })))),
-      rows.length ? h("table", null,
-        h("thead", null, h("tr", null, ["เวลา", "คอมเมนต์", "สถานะ", "คำตอบล่าสุด", "การกู้คืน"].map((t) => h("th", { text: t })))),
-        h("tbody", null, rows.map((r) => h("tr", null,
-          h("td", { class: "nowrap small", text: fmtTime(r.created_at) }),
-          h("td", { class: "mono small", text: r.facebook_comment_id || "" }),
-          h("td", null, badge(r.status, STATUS_KIND[r.status])),
-          h("td", { class: "small", text: r.reply ? r.reply.mode + " " + r.reply.status + (r.reply.reason ? " · " + r.reply.reason : "") : "-" }),
-          h("td", null, recoveryCell(r, refresh)))))) : h("p", { class: "muted", text: "ไม่มีรายการที่ต้องดูแล" }));
+    const tone = (value, hot) => (hot === "green" || hot === "gray" ? hot : num(value) > 0 ? hot : "ok");
+    const table = (page) => h("table", null,
+      h("thead", null, h("tr", null, ["เวลา", "คอมเมนต์", "สถานะ", "คำตอบล่าสุด", "การกู้คืน"].map((t) => h("th", { text: t })))),
+      h("tbody", null, page.map((r) => h("tr", null,
+        h("td", { class: "nowrap small", text: fmtTime(r.created_at) }),
+        h("td", null, extLink(fbCommentUrl(r.facebook_comment_id, r.facebook_post_id), r.facebook_comment_id || "", "mono small")),
+        h("td", null, badge(r.status, STATUS_KIND[r.status])),
+        h("td", { class: "small", text: r.reply ? r.reply.mode + " " + r.reply.status + (r.reply.reason ? " · " + r.reply.reason : "") : "-" }),
+        h("td", null, recoveryCell(r, refresh))))));
+    const attentionCount = rows.length;
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h3", { text: "สถานะการทำงาน" }),
+        attentionCount ? badge(attentionCount + " รายการต้องดูแล", "red") : h("span", { class: "badge green" }, "ปกติ")),
+      h("div", { class: "health-grid" }, tiles.map(([label, value, hot]) => h("div", { class: "health tone-" + tone(value, hot) },
+        h("div", { class: "health-value", text: value ?? 0 }), h("div", { class: "health-label", text: label })))),
+      attentionCount ? pagedList(rows, table, 10) : h("p", { class: "muted small ok-line" }, icon("check", "sm"), " ไม่มีรายการที่ต้องดูแล"));
   }
 
   function recoveryCell(r, refresh) {
@@ -175,11 +434,15 @@
     return h("span", { class: "muted small", text: RECOVERY_REASON_TEXT[r.recovery && r.recovery.reason] || "-" });
   }
 
+  function modePill(mode) {
+    return h("span", { class: "badge mode " + (mode === "LIVE" ? "red live" : "blue") }, h("span", { class: "dot" }), mode === "LIVE" ? "LIVE — ตอบจริง" : "DRY_RUN — ไม่โพสต์จริง");
+  }
+
   function renderModeInHeader() {
     const right = $(".topbar-right");
     if (!right || !state.mode) return;
     const existing = right.querySelector(".badge");
-    const b = badge(state.mode === "LIVE" ? "LIVE — ตอบจริง" : "DRY_RUN — ไม่โพสต์จริง", state.mode === "LIVE" ? "red" : "blue");
+    const b = modePill(state.mode);
     if (existing) existing.replaceWith(b); else right.prepend(b);
   }
 
@@ -250,6 +513,8 @@
     const filter = h("select", null, h("option", { value: "", text: "ทั้งหมด" }), h("option", { value: "1", text: "เปิดใช้" }), h("option", { value: "0", text: "ปิดอยู่" }));
     const formSlot = h("div");
     const tableSlot = h("div");
+    const nav = state.nav; state.nav = null;
+    if (nav && nav.search) search.value = nav.search;
     const refresh = async () => {
       const qs = new URLSearchParams();
       if (search.value.trim()) qs.set("search", search.value.trim());
@@ -268,15 +533,15 @@
 
   function productTable(rows, refresh, formSlot) {
     if (!rows.length) return h("p", { class: "muted", text: "ยังไม่มีสินค้า — กด “เพิ่มสินค้า”" });
-    return h("table", null,
+    return pagedList(rows, (page) => h("table", null,
       h("thead", null, h("tr", null, ["", "สินค้า", "แพลตฟอร์ม", "คีย์เวิร์ด", "ลิงก์", "ผูกโพสต์", "สถานะ", ""].map((t) => h("th", { text: t })))),
-      h("tbody", null, rows.map((p) => h("tr", null,
+      h("tbody", null, page.map((p) => h("tr", null,
         h("td", null, p.image_url ? h("img", { src: p.image_url, alt: "", class: "thumb", referrerpolicy: "no-referrer", loading: "lazy" }) : h("div", { class: "thumb empty" })),
         h("td", null, h("strong", { text: p.name }), p.description ? h("div", { class: "muted small", text: p.description.slice(0, 80) }) : null),
         h("td", { text: p.platform || "-" }),
         h("td", { class: "small", text: p.keywords || "-" }),
         h("td", null, p.affiliate_url ? h("a", { href: p.affiliate_url, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: "ทดสอบลิงก์ ↗" }) : "-"),
-        h("td", { text: p.mapping_count ?? 0 }),
+        h("td", null, Number(p.mapping_count) > 0 ? h("a", { href: "#content", text: String(p.mapping_count), onclick: (e) => { e.preventDefault(); goTo("content"); } }) : h("span", { class: "muted", text: "0" })),
         h("td", null, h("label", { class: "switch" }, h("input", { type: "checkbox", checked: Number(p.active) === 1, onchange: productToggleHandler(p, refresh) }), h("span", { text: Number(p.active) === 1 ? "เปิด" : "ปิด" }))),
         h("td", { class: "nowrap" },
           h("button", { class: "btn small", text: "แก้ไข", onclick: () => formSlot.replaceChildren(productForm(p, () => { formSlot.replaceChildren(); refresh(); })) }),
@@ -284,7 +549,7 @@
             const msg = Number(p.mapping_count) > 0 ? "สินค้านี้ผูกกับ " + p.mapping_count + " โพสต์ — การลบจะปิด mapping เหล่านั้นด้วย ยืนยัน?" : "ลบสินค้านี้? (เก็บประวัติไว้ ไม่ลบถาวร)";
             if (!window.confirm(msg)) return;
             try { await api("/admin/api/products/" + p.id, { method: "DELETE" }); toast("ลบสินค้าแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); }
-          } }))))));
+          } })))))), 25);
   }
 
   /* ----------------------------- content ----------------------------- */
@@ -318,9 +583,9 @@
       h("p", { class: "muted", text: "Facebook Graph API ไม่เปิดให้อ่านสินค้าที่แท็กในโพสต์/Reel ของเพจ จึงกำหนดสินค้าของแต่ละโพสต์ที่นี่ ระบบจะแนบลิงก์ Affiliate ของสินค้านั้นเมื่อ AI ตัดสินใจใส่ CTA — การผูกโพสต์/Reel เป็นแหล่งเดียวที่กำหนดสินค้า ระบบไม่เลือกสินค้าจากคีย์เวิร์ดในคอมเมนต์" }),
       h("form", { class: "card form inline", onsubmit: add }, h("div", { class: "field" }, h("label", { text: "Post / Reel ID" }), postId), h("div", { class: "field" }, h("label", { text: "ประเภท" }), type), h("div", { class: "field" }, h("label", { text: "สินค้า" }), product), h("div", { class: "field" }, h("label", { text: "บันทึก" }), note), h("button", { class: "btn primary", type: "submit", text: "ผูกสินค้า" }), err),
       h("h3", { text: "โพสต์ที่ผูกสินค้าแล้ว" }),
-      mappings.length ? h("table", null,
+      mappings.length ? pagedList(mappings, (page) => h("table", null,
         h("thead", null, h("tr", null, ["โพสต์", "ประเภท", "สินค้า", "คอมเมนต์", "สถานะ", ""].map((t) => h("th", { text: t })))),
-        h("tbody", null, mappings.map((m) => {
+        h("tbody", null, page.map((m) => {
           // AM-2.5: changing a live mapping's product needs an explicit confirmation.
           // Cancel restores the persisted value and sends nothing; an error reloads the persisted state.
           const sel = h("select", { onchange: async (e) => {
@@ -334,21 +599,21 @@
           } }, productOptions(m.product_id));
           const unusable = Number(m.product_active) !== 1 || m.product_deleted_at;
           return h("tr", null,
-            h("td", null, m.permalink ? h("a", { href: m.permalink, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: m.facebook_post_id }) : h("span", { class: "mono small", text: m.facebook_post_id }), m.note ? h("div", { class: "muted small", text: m.note }) : null),
+            h("td", null, extLink(fbPostUrl(m.facebook_post_id, m.permalink, m.facebook_content_type), m.facebook_post_id, "mono small"), m.note ? h("div", { class: "muted small", text: m.note }) : null),
             h("td", { text: m.facebook_content_type === "REEL" ? "Reel" : "โพสต์" }),
             h("td", null, products.some((p) => Number(p.id) === Number(m.product_id)) ? sel : h("span", { text: m.product_name }), unusable ? h("div", { class: "error small", text: "สินค้าถูกปิด/ลบ — จะไม่แนบลิงก์" }) : null),
-            h("td", { text: m.comment_count ?? 0 }),
+            h("td", null, Number(m.comment_count) > 0 ? h("a", { href: "#activity", text: String(m.comment_count), onclick: (e) => { e.preventDefault(); goTo("activity"); } }) : h("span", { class: "muted", text: "0" })),
             h("td", null, h("label", { class: "switch" }, h("input", { type: "checkbox", checked: Number(m.active) === 1, onchange: async (e) => { try { await api("/admin/api/content/" + m.id, { method: "PATCH", body: { active: e.target.checked } }); toast("อัปเดตแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); e.target.checked = !e.target.checked; } } }), h("span", { text: Number(m.active) === 1 ? "เปิด" : "ปิด" }))),
             h("td", null, h("button", { class: "btn small danger", text: "ยกเลิก", onclick: async () => { if (!window.confirm("ยกเลิกการผูกสินค้ากับโพสต์นี้?")) return; try { await api("/admin/api/content/" + m.id, { method: "DELETE" }); toast("ยกเลิกแล้ว"); refresh(); } catch (ex) { toast(ex.message, "err"); } } })));
-        }))) : h("p", { class: "muted", text: "ยังไม่มี mapping" }),
+        }))), 25) : h("p", { class: "muted", text: "ยังไม่มี mapping" }),
       h("h3", { text: "โพสต์ที่มีคอมเมนต์แต่ยังไม่ผูกสินค้า" }),
       h("p", { class: "muted small", text: "โพสต์เหล่านี้จะไม่ได้รับลิงก์ Affiliate อัตโนมัติ ผูกโพสต์/Reel กับสินค้าก่อน จึงจะใช้ CTA และลิงก์ได้" }),
-      unmapped.length ? h("table", null,
+      unmapped.length ? pagedList(unmapped, (page) => h("table", null,
         h("thead", null, h("tr", null, ["โพสต์", "คอมเมนต์", "ล่าสุด", ""].map((t) => h("th", { text: t })))),
-        h("tbody", null, unmapped.map((u) => h("tr", null,
-          h("td", null, u.permalink ? h("a", { href: u.permalink, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: u.facebook_post_id }) : h("span", { class: "mono small", text: u.facebook_post_id })),
+        h("tbody", null, page.map((u) => h("tr", null,
+          h("td", null, extLink(fbPostUrl(u.facebook_post_id, u.permalink), u.facebook_post_id, "mono small")),
           h("td", { text: u.comment_count }), h("td", { text: fmtTime(u.last_comment_at) }),
-          h("td", null, h("button", { class: "btn small", text: "ผูกสินค้า", onclick: () => { postId.value = u.facebook_post_id; product.focus(); window.scrollTo({ top: 0, behavior: "smooth" }); } })))))) : h("p", { class: "muted", text: "ไม่มี" }));
+          h("td", null, h("button", { class: "btn small", text: "ผูกสินค้า", onclick: () => { postId.value = u.facebook_post_id; product.focus(); window.scrollTo({ top: 0, behavior: "smooth" }); } })))))), 10) : h("p", { class: "muted", text: "ไม่มี" }));
   }
 
   /* ------------------------- discovered posts (AM-2) ------------------------- */
@@ -372,8 +637,6 @@
     INTERNAL_ERROR: "ข้อผิดพลาดภายใน",
   };
   const errText = (code) => (code ? ERROR_TEXT[code] || code : "");
-  /** Only real Facebook https links become anchors; anything else is shown as text. */
-  const isFacebookUrl = (u) => /^https:\/\/([a-z0-9-]+\.)*facebook\.com\//i.test(String(u || ""));
   const preview = (t) => { const s = String(t || "").replace(/\s+/g, " ").trim(); return s.length > 140 ? s.slice(0, 140) + "…" : s; };
 
   async function viewDiscovered(main) {
@@ -382,30 +645,26 @@
     const summarySlot = h("div");
     const runsSlot = h("div");
     const tableSlot = h("div");
-    const more = h("button", { class: "btn ghost", text: "โหลดเพิ่ม" });
-    let cursor = null; let rows = [];
+    let rows = [];
 
     const table = () => !rows.length ? h("p", { class: "muted", text: "ยังไม่มีโพสต์ที่ค้นพบ — กด “ค้นหาโพสต์ใหม่”" }) : h("table", null,
       h("thead", null, h("tr", null, ["ข้อความ", "ประเภท", "สร้างเมื่อ", "สถานะ", "การผูกสินค้า", "ลิงก์"].map((t) => h("th", { text: t })))),
       h("tbody", null, rows.map((c) => h("tr", null,
-        h("td", null, h("div", { text: preview(c.message) || "(ไม่มีข้อความ)", class: c.message ? "" : "muted" }), h("div", { class: "mono small muted", text: c.post_id }), Number(c.source_count) > 1 ? h("div", { class: "muted small", text: "รวม " + c.source_count + " แหล่งข้อมูล (Reel เดียวกัน)" }) : null),
+        h("td", null, h("div", { text: preview(c.message) || "(ไม่มีข้อความ)", class: c.message ? "" : "muted" }), h("div", null, extLink(fbPostUrl(c.post_id, c.permalink, c.content_type), c.post_id, "mono small")), Number(c.source_count) > 1 ? h("div", { class: "muted small", text: "รวม " + c.source_count + " แหล่งข้อมูล (Reel เดียวกัน)" }) : null),
         h("td", { text: c.content_type === "REEL" ? "Reel" : c.content_type === "POST" ? "โพสต์" : "ไม่ทราบ" }),
         h("td", { class: "nowrap small", text: fmtTime(c.fb_created_time) }),
         h("td", null, badge(CANDIDATE_STATUS_LABEL[c.status] || c.status, c.status === "UPDATED" ? "blue" : "gray")),
         h("td", null, badge(MAPPING_STATE_LABEL[c.mapping_state] || c.mapping_state, MAPPING_STATE_KIND[c.mapping_state])),
         h("td", null, isFacebookUrl(c.permalink) ? h("a", { href: c.permalink, target: "_blank", rel: "noopener noreferrer", class: "small", text: "เปิดบน Facebook ↗" }) : h("span", { class: "muted small", text: "-" }))))));
 
-    const load = async (reset) => {
-      if (reset) { cursor = null; rows = []; }
-      const qs = new URLSearchParams({ limit: "25" });
+    const paging = cursorPaging((cursor, size) => {
+      const qs = new URLSearchParams({ limit: String(size) });
       if (status.value) qs.set("status", status.value);
       if (mapping.value) qs.set("mapping", mapping.value);
       if (cursor) qs.set("cursor", cursor);
-      const res = await api("/admin/api/post-candidates?" + qs);
-      rows = rows.concat(res.data || []); cursor = res.next_cursor;
-      tableSlot.replaceChildren(table());
-      more.style.display = res.has_more ? "" : "none";
-    };
+      return api("/admin/api/post-candidates?" + qs);
+    }, (data) => { rows = data; tableSlot.replaceChildren(table()); }, 25);
+    const load = () => paging.reset();
 
     const runsTable = (runs) => !runs.length ? h("p", { class: "muted small", text: "ยังไม่เคยค้นหา" }) : h("table", null,
       h("thead", null, h("tr", null, ["เวลา", "ผล", "พบ", "ใหม่", "แก้ไข", "ไม่เปลี่ยน", "ข้าม", "ล้มเหลว", "ข้อผิดพลาด"].map((t) => h("th", { text: t })))),
@@ -432,20 +691,19 @@
         }
       } catch (ex) { summarySlot.replaceChildren(h("p", { class: "error", text: ex.message })); }
       e.target.disabled = false;
-      try { await Promise.all([load(true), loadRuns()]); } catch (ex) { toast(ex.message, "err"); }
+      try { await Promise.all([load(), loadRuns()]); } catch (ex) { toast(ex.message, "err"); }
     } });
 
-    status.addEventListener("change", () => load(true));
-    mapping.addEventListener("change", () => load(true));
-    more.addEventListener("click", () => load(false));
+    status.addEventListener("change", () => load().catch((ex) => toast(ex.message, "err")));
+    mapping.addEventListener("change", () => load().catch((ex) => toast(ex.message, "err")));
     main.replaceChildren(
       h("div", { class: "row-between" }, h("h2", { text: "โพสต์ที่ค้นพบ" }), run),
       h("p", { class: "muted", text: "อ่านโพสต์/Reel ของเพจจาก Facebook แบบอ่านอย่างเดียวและเก็บไว้เป็นรายการ — ขั้นนี้ไม่ผูกสินค้า ไม่ตอบคอมเมนต์ และไม่แก้ไข mapping ใด ๆ ทั้งสิ้น ผูกสินค้าได้ที่แท็บ “โพสต์ / Reel”" }),
       summarySlot,
       h("div", { class: "toolbar" }, status, mapping),
-      tableSlot, more,
+      tableSlot, paging.bar,
       h("h3", { text: "ประวัติการค้นหา" }), runsSlot);
-    await Promise.all([load(true), loadRuns()]);
+    await Promise.all([load(), loadRuns()]);
   }
 
   /* --------------------------- suggestions (AM-2.3) --------------------------- */
@@ -456,32 +714,31 @@
     const status = h("select", null, h("option", { value: "PENDING", text: "รอตรวจสอบ" }), h("option", { value: "", text: "ทุกสถานะ" }), h("option", { value: "REJECTED", text: "ปฏิเสธแล้ว" }), h("option", { value: "SUPERSEDED", text: "ล้าสมัย" }), h("option", { value: "APPROVED", text: "อนุมัติแล้ว" }));
     const summarySlot = h("div");
     const tableSlot = h("div");
-    const more = h("button", { class: "btn ghost", text: "โหลดเพิ่ม" });
-    let cursor = null; let rows = [];
+    let rows = [];
 
     // AM-2.4: explicit human approval (confirmation dialog) -> server creates ONE mapping.
     const mapButton = (s) => s.mappable ? h("span", null,
       h("button", { class: "btn small primary", text: "ผูกสินค้านี้", onclick: async (e) => {
         if (!window.confirm("ยืนยันผูกสินค้า “" + (s.product_name || ("#" + s.product_id)) + "” กับโพสต์ " + s.representative_post_id + " ?\nระบบจะสร้าง mapping จริง และคำตอบคอมเมนต์ถัดไปของโพสต์นี้จะแนบลิงก์สินค้านี้")) return;
         e.target.disabled = true;
-        try { await api("/admin/api/suggestions/" + s.id + "/approve", { method: "POST", body: {} }); toast("ผูกสินค้าแล้ว"); await load(true); }
+        try { await api("/admin/api/suggestions/" + s.id + "/approve", { method: "POST", body: {} }); toast("ผูกสินค้าแล้ว"); await load(); }
         catch (ex) { toast(ex.message, "err"); e.target.disabled = false; }
       } }),
       h("button", { class: "btn small ghost", text: "แก้ไขในฟอร์ม", onclick: () => {
         state.prefill = { post_id: s.representative_post_id, product_id: s.product_id, type: s.content_type, suggestion_id: s.id };
-        state.tab = "content"; render();
+        goTo("content");
       } })) : h("span", { class: "muted small", text: s.status === "APPROVED" ? "ผูกสินค้าแล้ว" : s.status !== "PENDING" ? "-" : !s.product_id ? "ไม่มีสินค้าที่ตรง" : !s.product_usable ? "สินค้าถูกปิด/ลบ" : "ยังไม่มีรหัสโพสต์ของเพจ" });
 
     const rejectButton = (s) => s.status === "PENDING" ? h("button", { class: "btn small danger", text: "ปฏิเสธ", onclick: async (e) => {
       e.target.disabled = true;
-      try { await api("/admin/api/suggestions/" + s.id + "/reject", { method: "POST", body: {} }); toast("ปฏิเสธแล้ว"); await load(true); } catch (ex) { toast(ex.message, "err"); e.target.disabled = false; }
+      try { await api("/admin/api/suggestions/" + s.id + "/reject", { method: "POST", body: {} }); toast("ปฏิเสธแล้ว"); await load(); } catch (ex) { toast(ex.message, "err"); e.target.disabled = false; }
     } }) : null;
 
     const table = () => !rows.length ? h("p", { class: "muted", text: "ยังไม่มีสินค้าแนะนำ — กด “สร้างคำแนะนำ”" }) : h("table", null,
       h("thead", null, h("tr", null, ["โพสต์", "สินค้าแนะนำ", "ความมั่นใจ", "เหตุผล", "คะแนนคัดกรอง", "สถานะ", "เวลา", ""].map((t) => h("th", { text: t })))),
       h("tbody", null, rows.map((s) => h("tr", null,
-        h("td", null, h("div", { text: preview(s.message) || "(ไม่มีข้อความ)" }), isFacebookUrl(s.permalink) ? h("a", { href: s.permalink, target: "_blank", rel: "noopener noreferrer", class: "mono small", text: s.representative_post_id }) : h("div", { class: "mono small muted", text: s.representative_post_id })),
-        h("td", null, s.product_id ? h("span", { text: s.product_name || ("#" + s.product_id) }) : h("span", { class: "muted", text: "ไม่มีสินค้าที่ตรง" })),
+        h("td", null, h("div", { text: preview(s.message) || "(ไม่มีข้อความ)" }), isFacebookUrl(s.permalink) ? h("a", { href: s.permalink, target: "_blank", rel: "noopener noreferrer", class: "ext mono small", text: s.representative_post_id }) : extLink(fbPostUrl(s.representative_post_id, null, s.content_type), s.representative_post_id, "mono small")),
+        h("td", null, s.product_id ? productLink(s.product_name || ("#" + s.product_id)) : h("span", { class: "muted", text: "ไม่มีสินค้าที่ตรง" })),
         h("td", null, badge(s.confidence, CONFIDENCE_KIND[s.confidence])),
         h("td", { class: "small", text: s.reason || "" }),
         h("td", { text: s.prefilter_score }),
@@ -489,16 +746,14 @@
         h("td", { class: "nowrap small", text: fmtTime(s.created_at) }),
         h("td", { class: "nowrap" }, mapButton(s), rejectButton(s))))));
 
-    const load = async (reset) => {
-      if (reset) { cursor = null; rows = []; }
-      const qs = new URLSearchParams({ limit: "25" });
+    const paging = cursorPaging((cursor, size) => {
+      const qs = new URLSearchParams({ limit: String(size) });
       if (status.value) qs.set("status", status.value);
       if (cursor) qs.set("cursor", cursor);
-      const res = await api("/admin/api/suggestions?" + qs);
-      rows = rows.concat(res.data || []); cursor = res.next_cursor;
-      tableSlot.replaceChildren(table());
-      more.style.display = res.has_more ? "" : "none";
-    };
+      return api("/admin/api/suggestions?" + qs);
+    }, (data) => { rows = data; tableSlot.replaceChildren(table()); }, 25);
+    // After approve/reject, stay on the current page (rows change status, not position).
+    const load = () => paging.reload();
 
     const generate = h("button", { class: "btn primary", text: "สร้างคำแนะนำ", onclick: async (e) => {
       e.target.disabled = true; summarySlot.replaceChildren(h("p", { class: "muted", text: "กำลังวิเคราะห์ (สูงสุด 5 โพสต์ต่อครั้ง)…" }));
@@ -510,16 +765,15 @@
         else summarySlot.replaceChildren(h("p", { class: "error", text: "สร้างคำแนะนำไม่สำเร็จ: " + ((data && data.error && data.error.code) || res.status) }));
       } catch (ex) { summarySlot.replaceChildren(h("p", { class: "error", text: ex.message })); }
       e.target.disabled = false;
-      try { await load(true); } catch (ex) { toast(ex.message, "err"); }
+      try { await paging.reset(); } catch (ex) { toast(ex.message, "err"); }
     } });
 
-    status.addEventListener("change", () => load(true));
-    more.addEventListener("click", () => load(false));
+    status.addEventListener("change", () => paging.reset().catch((ex) => toast(ex.message, "err")));
     main.replaceChildren(
       h("div", { class: "row-between" }, h("h2", { text: "สินค้าแนะนำ" }), generate),
       h("p", { class: "muted", text: "AI แนะนำสินค้าจากรายการที่ระบบคัดกรองแล้วเท่านั้น สำหรับโพสต์/Reel ที่ยังไม่ผูกสินค้า — เป็นคำแนะนำให้ตรวจสอบเท่านั้น ระบบไม่ผูกสินค้าเอง “ผูกสินค้านี้” จะถามยืนยันก่อน แล้วจึงสร้าง mapping ให้ (หรือกด “แก้ไขในฟอร์ม” เพื่อเปิดฟอร์มเดิม)" }),
-      summarySlot, h("div", { class: "toolbar" }, status), tableSlot, more);
-    await load(true);
+      summarySlot, h("div", { class: "toolbar" }, status), tableSlot, paging.bar);
+    await paging.reset();
   }
 
   /* ----------------------------- activity ---------------------------- */
@@ -529,33 +783,28 @@
       h("thead", null, h("tr", null, ["เวลา", "คอมเมนต์", "AI", "คำตอบ", "สินค้า", "โหมด", "สถานะ"].map((t) => h("th", { text: t })))),
       h("tbody", null, rows.map((c) => h("tr", null,
         h("td", { class: "nowrap small", text: fmtTime(c.created_at) }),
-        h("td", null, h("div", { class: "small muted", text: c.author_name || "" }), h("div", { text: c.comment_text || "" })),
+        h("td", null, h("div", { class: "small muted", text: c.author_name || "" }), h("div", { text: c.comment_text || "" }), commentLinks(c)),
         h("td", null, c.ai_action ? badge(c.ai_action, c.ai_action === "REPLY" ? "blue" : "gray") : "-"),
-        h("td", { class: "reply" }, c.reply && c.reply.response_text ? h("div", { class: "pre", text: c.reply.response_text }) : h("span", { class: "muted small", text: (c.reply && c.reply.reason) || "-" })),
-        h("td", null, c.matched_product ? h("div", null, h("div", { text: c.matched_product.name }), h("div", { class: "muted small", text: SOURCE_LABEL[c.product_source] || "" })) : "-"),
+        h("td", { class: "reply" }, c.reply && c.reply.response_text ? linkify(c.reply.response_text, "pre") : h("span", { class: "muted small", text: (c.reply && c.reply.reason) || "-" })),
+        h("td", null, c.matched_product ? h("div", null, h("div", null, productLink(c.matched_product.name)), h("div", { class: "muted small", text: SOURCE_LABEL[c.product_source] || "" })) : "-"),
         h("td", null, c.reply ? badge(c.reply.mode, c.reply.mode === "LIVE" ? "red" : "blue") : "-"),
         h("td", null, badge(c.status, STATUS_KIND[c.status]), c.reply ? h("div", null, badge(c.reply.status, STATUS_KIND[c.reply.status])) : null)))));
   }
 
   async function viewActivity(main) {
     const filter = h("select", null, ["", "PROCESSED", "REPLIED", "SKIPPED", "ERROR", "RECEIVED"].map((s) => h("option", { value: s, text: s || "ทุกสถานะ" })));
+    const nav = state.nav; state.nav = null;
+    if (nav && nav.status) filter.value = nav.status;
     const slot = h("div");
-    const more = h("button", { class: "btn ghost", text: "โหลดเพิ่ม" });
-    let cursor = null; let rows = [];
-    const load = async (reset) => {
-      if (reset) { cursor = null; rows = []; }
-      const qs = new URLSearchParams({ limit: "30" });
+    const paging = cursorPaging((cursor, size) => {
+      const qs = new URLSearchParams({ limit: String(size) });
       if (filter.value) qs.set("status", filter.value);
       if (cursor) qs.set("cursor", cursor);
-      const res = await api("/admin/comments?" + qs);
-      rows = rows.concat(res.data || []); cursor = res.next_cursor;
-      slot.replaceChildren(activityTable(rows));
-      more.style.display = res.has_more ? "" : "none";
-    };
-    filter.addEventListener("change", () => load(true));
-    more.addEventListener("click", () => load(false));
-    main.replaceChildren(h("div", { class: "row-between" }, h("h2", { text: "กิจกรรมคอมเมนต์" }), filter), slot, more);
-    await load(true);
+      return api("/admin/comments?" + qs);
+    }, (rows) => slot.replaceChildren(activityTable(rows)), 25);
+    filter.addEventListener("change", () => paging.reset().catch((ex) => toast(ex.message, "err")));
+    main.replaceChildren(h("div", { class: "row-between" }, h("h2", { text: "กิจกรรมคอมเมนต์" }), filter), slot, paging.bar);
+    await paging.reset();
   }
 
   /* ----------------------------- settings ---------------------------- */
@@ -586,5 +835,6 @@
     renderShell(root);
   }
 
-  document.addEventListener("DOMContentLoaded", render);
+  window.addEventListener("hashchange", () => { state.tab = tabFromHash(); render(); window.scrollTo(0, 0); });
+  document.addEventListener("DOMContentLoaded", () => { state.tab = tabFromHash(); render(); });
 })();
