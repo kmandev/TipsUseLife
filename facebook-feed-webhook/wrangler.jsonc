@@ -23,7 +23,16 @@
     // Graph send abort (ms). Phase 8.29: both real LIVE sends hit the 5000 ms
     // default while Facebook still posted the reply. Hermes budget shrinks by
     // the same amount (pipeline.js hermesBudgetMs).
-    "GRAPH_TIMEOUT_MS": "10000"
+    "GRAPH_TIMEOUT_MS": "10000",
+    // Upgrade U1: link included in Telegram alerts (no secret).
+    "DASHBOARD_URL": "https://facebook-feed-webhook.farkram.workers.dev"
+  },
+
+  // Upgrade U1: operator alerts. Every 5 minutes a READ-ONLY health + token
+  // check runs (src/alerts.js); it only sends a Telegram message on change.
+  // Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (absent = alerts off).
+  "triggers": {
+    "crons": ["*/5 * * * *"]
   },
 
   "d1_databases": [

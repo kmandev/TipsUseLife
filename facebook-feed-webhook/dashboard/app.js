@@ -808,8 +808,42 @@
   }
 
   /* ----------------------------- settings ---------------------------- */
+  /* Upgrade U1: Telegram alerts + Page-token health (read-only check). */
+  const TOKEN_STATUS_TEXT = { OK: ["ใช้งานได้", "green"], MISSING: ["ยังไม่ได้ตั้งค่า", "red"], INVALID: ["หมดอายุ/ถูกยกเลิก", "red"], PERMISSION_DENIED: ["สิทธิ์ไม่พอ", "red"], PAGE_MISMATCH: ["ไม่ใช่ token ของเพจนี้", "red"] };
+  const ALERT_ERROR_TEXT = { NOT_CONFIGURED: "ยังไม่ได้ตั้งค่า Telegram", TELEGRAM_BAD_TOKEN: "Bot token ไม่ถูกต้อง", TELEGRAM_BAD_CHAT: "Chat ID ไม่ถูกต้อง หรือยังไม่ได้กด Start กับบอท", TELEGRAM_RATE_LIMITED: "Telegram จำกัดอัตราการส่ง", TELEGRAM_TIMEOUT: "Telegram ไม่ตอบ (หมดเวลา)", TELEGRAM_NETWORK: "เชื่อมต่อ Telegram ไม่ได้" };
+
+  function alertsCard(a, reload) {
+    const st = a.state || {};
+    const tok = TOKEN_STATUS_TEXT[st.token_status];
+    const kv = (k, v) => h("tr", null, h("th", { text: k }), h("td", null, v));
+    const btn = (label, path, okText) => h("button", { class: "btn small", text: label, onclick: async (e) => {
+      e.target.disabled = true;
+      try {
+        const r = await api(path, { method: "POST", body: {} });
+        const d = r.data || {};
+        toast(okText(d));
+      } catch (ex) { toast(ex.message, "err"); }
+      e.target.disabled = false;
+      reload();
+    } });
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h3", { text: "การแจ้งเตือน (Telegram) และสุขภาพ Page token" }),
+        a.telegram_configured ? badge("Telegram พร้อมใช้", "green") : badge("ยังไม่ได้ตั้งค่า Telegram", "gray")),
+      h("p", { class: "muted small", text: "ระบบตรวจทุก 5 นาที (อ่านอย่างเดียว) และส่งข้อความเฉพาะเมื่อมีปัญหาใหม่ เช่น ERROR ใหม่ ผลส่ง LIVE ไม่แน่นอน Facebook ปฏิเสธ คอมเมนต์ค้าง หรือ token ใช้ไม่ได้ — และแจ้งอีกครั้งเมื่อกลับมาปกติ ระบบไม่ Retry และไม่แก้ข้อมูลใด ๆ" }),
+      h("table", { class: "kv" }, h("tbody", null,
+        kv("Page access token", tok ? badge(tok[0], tok[1]) : h("span", { class: "muted", text: "ยังไม่ได้ตรวจ" })),
+        kv("ตรวจ token ล่าสุด", h("span", { text: fmtTime(st.token_checked_at) })),
+        kv("ตรวจสุขภาพล่าสุด", h("span", { text: fmtTime(st.last_check_at) })),
+        kv("ส่งแจ้งเตือนล่าสุด", h("span", { text: fmtTime(st.last_sent_at) })),
+        kv("ปัญหาการส่งล่าสุด", st.last_error ? h("span", { class: "error small", text: ALERT_ERROR_TEXT[st.last_error] || st.last_error }) : h("span", { class: "muted", text: "-" })))),
+      h("div", { class: "actions" },
+        btn("ตรวจตอนนี้", "/admin/api/alerts/check", (d) => "ตรวจแล้ว: แจ้งเตือน " + (d.alerts || 0) + " · กลับมาปกติ " + (d.recovered || 0) + (d.send_error ? " · " + (ALERT_ERROR_TEXT[d.send_error] || d.send_error) : "")),
+        a.telegram_configured ? btn("ส่งข้อความทดสอบ", "/admin/api/alerts/test", () => "ส่งข้อความทดสอบแล้ว — ตรวจใน Telegram") : null),
+      a.telegram_configured ? null : h("p", { class: "hint", text: "ตั้งค่า: สร้างบอทกับ @BotFather แล้วรัน npx wrangler secret put TELEGRAM_BOT_TOKEN และ npx wrangler secret put TELEGRAM_CHAT_ID บน Pi (ดู docs/OPERATIONS.md)" }));
+  }
+
   async function viewSettings(main) {
-    const res = await api("/admin/api/settings");
+    const [res, alerts] = await Promise.all([api("/admin/api/settings"), api("/admin/api/alerts").catch(() => ({ data: { telegram_configured: false, state: null } }))]);
     const s = res.data || {};
     state.mode = s.reply_mode;
     const kv = (k, v) => h("tr", null, h("th", { text: k }), h("td", { class: "mono", text: v }));
@@ -820,6 +854,7 @@
         kv("HERMES_TIMEOUT_MS", s.hermes_timeout_ms), kv("GRAPH_API_VERSION", s.graph_api_version), kv("MAX_REPLY_LENGTH", s.max_reply_length),
         kv("โดเมนลิงก์ที่อนุญาต", (s.affiliate_allowed_hosts || []).join(", ")),
         ...Object.entries(s.secrets_present || {}).map(([k, v]) => kv(k, v ? "ตั้งค่าแล้ว" : "ยังไม่ตั้งค่า"))))),
+      alertsCard(alerts.data || {}, () => viewSettings(main)),
       h("div", { class: "card note" }, h("h3", { text: "การเปิด LIVE" }), h("p", { text: "ระบบจะตอบคอมเมนต์จริงเฉพาะเมื่อ REPLY_MODE = LIVE และตั้งค่า PAGE_ACCESS_TOKEN แล้วเท่านั้น การเปลี่ยนโหมดทำได้โดยการ deploy อย่างตั้งใจ (ดู docs/OPERATIONS.md) ไม่สามารถเปิดจากหน้านี้ได้" })));
     renderModeInHeader();
   }

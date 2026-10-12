@@ -398,7 +398,15 @@ test("P8.2 dashboard: Retry only for action RETRY; ambiguous rows show the warni
   assert.ok(DASHBOARD_JS.includes("replies_generated_dry_run") && DASHBOARD_JS.includes("replies_generated_live"));
 });
 
-test("P8.2: no scheduled/automatic recovery exists", async () => {
+test("P8.2: no scheduled/automatic recovery exists (the only cron is the read-only alert check, U1)", async () => {
   const idx = await import("../src/index.js");
-  assert.equal(typeof idx.default.scheduled, "undefined");
+  // U1 added a scheduled() handler; it may only run the alert check.
+  assert.equal(typeof idx.default.scheduled, "function");
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
+  const body = src.slice(src.indexOf("async scheduled("), src.indexOf("\n};", src.indexOf("async scheduled(")));
+  assert.match(body, /runAlertCheck\(/);
+  assert.doesNotMatch(body, /recover|reconcile|retry|processCommentEvent|handleWebhook|sendReply/i);
+  const alerts = readFileSync(new URL("../src/alerts.js", import.meta.url), "utf8");
+  assert.doesNotMatch(alerts, /recoverComment|reconcileComment|processCommentEvent|pipeline\.js|facebook-reply\.js|hermes\.js|requestAgentReply/);
 });

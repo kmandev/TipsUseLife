@@ -23,6 +23,7 @@ import { hmacSha256Hex, timingSafeEqual } from "./crypto.js";
 import { extractCommentEvents, isSelfEvent } from "./facebook.js";
 import { processCommentEvent } from "./pipeline.js";
 import { logEvent, logError } from "./log.js";
+import { runAlertCheck } from "./alerts.js";
 
 export default {
   /**
@@ -52,6 +53,20 @@ export default {
     }
 
     return handleWebhook(request, env, ctx);
+  },
+
+  /**
+   * Cron Trigger (wrangler.jsonc "triggers.crons"): operator alerts only.
+   * Read-only health + Page-token check -> Telegram message on change.
+   * It never replies, retries, recovers or reconciles anything (src/alerts.js).
+   * @param {{scheduledTime: number, cron: string}} controller
+   */
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(
+      runAlertCheck(env, { now: new Date(controller?.scheduledTime ?? Date.now()) }).catch(() => {
+        logError("alert_check_failed", "UNEXPECTED");
+      })
+    );
   },
 };
 

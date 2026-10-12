@@ -20,6 +20,9 @@
  *   POST   /admin/api/suggestions/:id/reject  PENDING -> REJECTED (AM-2.3)
  *   POST   /admin/api/suggestions/:id/approve HUMAN approval -> one content mapping (AM-2.4)
  *   GET    /admin/api/health              operational counts (Phase 8.2)
+ *   GET    /admin/api/alerts              alert status (Telegram configured?, last check, token verdict)
+ *   POST   /admin/api/alerts/test         send one Telegram test message (no D1 write)
+ *   POST   /admin/api/alerts/check        run the read-only alert check now (same as the cron)
  *   GET    /admin/api/recovery            rows needing operator attention
  *   POST   /admin/api/comments/:id/retry  operator recovery of ONE comment
  *   POST   /admin/api/comments/:id/reconcile  link an AMBIGUOUS LIVE send to the
@@ -53,6 +56,7 @@ import { runDiscovery, listCandidates, listRuns, CANDIDATE_STATUSES, MAPPING_FIL
 import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, approveSuggestion, SUGGESTION_STATUSES } from "./suggestions.js";
 import { logEvent, logError } from "./log.js";
 import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
+import { runAlertCheck, sendTestAlert, readAlertState, telegramConfigured } from "./alerts.js";
 
 const PLATFORMS = ["shopee", "lazada", "tiktok", "other"];
 const CONTENT_TYPES = ["POST", "REEL"];
@@ -241,6 +245,26 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       return apiJson({ data: await healthStats(db, config.pageId), mode: config.mode });
     }
 
+    // Upgrade U1: operator alerts (Telegram). GET status; POST test / check.
+    if (resource === "alerts") {
+      if (idSegment === undefined) {
+        if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+        return apiJson({ data: { telegram_configured: telegramConfigured(env), state: await readAlertState(db) } });
+      }
+      if (idSegment === "test" || idSegment === "check") {
+        if (method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+        if (idSegment === "test") {
+          if (!telegramConfigured(env)) return apiError(503, "TELEGRAM_NOT_CONFIGURED", "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID first");
+          const r = await sendTestAlert(env);
+          logEvent("admin_alert_test", { ok: r.ok, error: r.error ?? null });
+          return r.ok ? apiJson({ data: { ok: true } }) : apiError(502, r.error || "TELEGRAM_FAILED", "Telegram did not accept the message");
+        }
+        const r = await runAlertCheck(env, { forceTokenCheck: true });
+        return apiJson({ data: r }, r.ok ? 200 : 500);
+      }
+      return apiError(404, "NOT_FOUND", "Not found");
+    }
+
     if (resource === "discovery" && (idSegment === "run" || idSegment === "runs")) {
       if (idSegment === "runs") {
         if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
@@ -341,6 +365,8 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
             META_VERIFY_TOKEN: Boolean(env?.META_VERIFY_TOKEN),
             HERMES_API_KEY: Boolean(env?.HERMES_API_KEY),
             PAGE_ACCESS_TOKEN: Boolean(env?.PAGE_ACCESS_TOKEN),
+            TELEGRAM_BOT_TOKEN: Boolean(env?.TELEGRAM_BOT_TOKEN),
+            TELEGRAM_CHAT_ID: Boolean(env?.TELEGRAM_CHAT_ID),
           },
         },
       });

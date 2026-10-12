@@ -88,6 +88,9 @@ Kept for history; the evidence notes and the row 196 record below still apply.
 | `ADMIN_PASSWORD`, `ADMIN_SESSION_SECRET` | secret | Dashboard login / session signing |
 | `PAGE_ACCESS_TOKEN` | secret, **LIVE only** | Page token with `pages_manage_engagement`; absent = hard DRY_RUN lock |
 | `HERMES_SECRET` | secret, **unused** | Not read by any Worker code (all repo references removed in Phase 6). It belonged to the retired `/webhooks/facebook-comments` path. Still present as a production Worker secret; safe to delete with `npx wrangler secret delete HERMES_SECRET` (creates a new Worker version — do it as a separate, audited change). Hermes auth uses `HERMES_API_KEY` only. |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | secret, optional | Upgrade U1 operator alerts. Absent = alerts off (the check still runs and records state). |
+| `DASHBOARD_URL` | var | `https://facebook-feed-webhook.farkram.workers.dev` — link placed in alert messages |
+| `triggers.crons` | cron | `*/5 * * * *` — the read-only alert check (below). The only scheduled work; it never replies, retries or recovers. |
 | `ADMIN_LOGIN_LIMITER` | rate-limit binding | `ratelimits` in `wrangler.jsonc`: 5 login attempts / 60 s per client IP → `429 RATE_LIMITED`. Per-location and approximate. If the binding is missing, login still works (logged as `admin_login_ratelimit_unavailable`). |
 
 ## Recovery and health (Phase 8.2)
@@ -423,6 +426,43 @@ affects replies, discovery or Graph sends.
 `database/migrations/0006_product_suggestions.sql` (two new tables, nothing
 existing altered) with `npx wrangler d1 migrations apply tipsuselife-ai --remote`,
 then `npx wrangler deploy`. No `wrangler.jsonc` change.
+
+## Operator alerts (Upgrade U1 — Telegram, read-only)
+
+Every 5 minutes the Cron Trigger runs `src/alerts.js runAlertCheck`
+(also Dashboard → ตั้งค่า → **ตรวจตอนนี้**). It reads `healthStats` and, at
+most hourly, checks the Page token with one Graph `GET /me?fields=id`. It
+**never** replies, retries, recovers, reconciles, calls Hermes or POSTs to
+Facebook; its only write is its own state in `settings`
+(`key = 'alert_state_v1'`). No migration.
+
+A Telegram message is sent only on change:
+- a counter **increased** since the last check: `live_outcome_unknown`
+  (🔴 check the post on Facebook, never retry), `live_failed_total`,
+  `errors_total`, `stale_received`. The first check after a deploy only
+  records the baseline, so existing rows (e.g. protected row 196) never alert;
+- a LIVE send still `GRAPH_SEND_IN_PROGRESS` on two consecutive checks;
+- the Page token became `MISSING` / `INVALID` (Graph 190/463/467/401) /
+  `PERMISSION_DENIED` / `PAGE_MISMATCH`. Transient Graph errors keep the
+  previous verdict. Recovery (token OK again, stuck send gone) is announced once.
+
+Messages hold counts and a Dashboard link only — never a token, comment text
+or author. A failed send is not retried within the run; the baseline is kept,
+so the next check (5 min later) tries again. Without the Telegram secrets the
+check still runs and moves its baseline (no flood when you configure it later).
+
+**Set up (once, on the Pi):**
+1. Telegram → @BotFather → `/newbot` → copy the bot token.
+2. Open the new bot and press **Start** (send it any message), then read your
+   chat id: `curl -s "https://api.telegram.org/bot<TOKEN>/getUpdates"` →
+   `result[0].message.chat.id` (do not paste the token into chat or logs).
+3. `npx wrangler secret put TELEGRAM_BOT_TOKEN` and
+   `npx wrangler secret put TELEGRAM_CHAT_ID` (interactive prompts).
+4. Dashboard → ตั้งค่า → **ส่งข้อความทดสอบ**, then **ตรวจตอนนี้**.
+
+Turn alerts off: `npx wrangler secret delete TELEGRAM_BOT_TOKEN` (the cron
+keeps recording state silently). Remove the cron entirely: delete
+`triggers` from `wrangler.jsonc` and deploy.
 
 ## Routine operations
 
