@@ -23,7 +23,7 @@ import { hmacSha256Hex, timingSafeEqual } from "./crypto.js";
 import { extractCommentEvents, isSelfEvent } from "./facebook.js";
 import { processCommentEvent } from "./pipeline.js";
 import { logEvent, logError } from "./log.js";
-import { runAlertCheck } from "./alerts.js";
+import { runScheduled } from "./scheduled.js";
 
 export default {
   /**
@@ -56,16 +56,19 @@ export default {
   },
 
   /**
-   * Cron Trigger (wrangler.jsonc "triggers.crons"): operator alerts only.
-   * Read-only health + Page-token check -> Telegram message on change.
-   * It never replies, retries, recovers or reconciles anything (src/alerts.js).
+   * Cron Triggers (wrangler.jsonc "triggers.crons"), dispatched by
+   * src/scheduled.js: the 5-minute read-only alert check and the daily
+   * housekeeping run. Neither replies to, retries, recovers or reconciles a
+   * comment.
    * @param {{scheduledTime: number, cron: string}} controller
    */
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(
-      runAlertCheck(env, { now: new Date(controller?.scheduledTime ?? Date.now()) }).catch(() => {
-        logError("alert_check_failed", "UNEXPECTED");
-      })
+      Promise.resolve()
+        .then(() => runScheduled(controller, env))
+        .catch(() => {
+          logError("scheduled_failed", "UNEXPECTED");
+        })
     );
   },
 };

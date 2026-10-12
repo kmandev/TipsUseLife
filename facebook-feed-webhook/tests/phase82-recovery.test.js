@@ -405,8 +405,10 @@ test("P8.2: no scheduled/automatic recovery exists (the only cron is the read-on
   const { readFileSync } = await import("node:fs");
   const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
   const body = src.slice(src.indexOf("async scheduled("), src.indexOf("\n};", src.indexOf("async scheduled(")));
-  assert.match(body, /runAlertCheck\(/);
+  assert.match(body, /runScheduled\(/);
   assert.doesNotMatch(body, /recover|reconcile|retry|processCommentEvent|handleWebhook|sendReply/i);
-  const alerts = readFileSync(new URL("../src/alerts.js", import.meta.url), "utf8");
-  assert.doesNotMatch(alerts, /recoverComment|reconcileComment|processCommentEvent|pipeline\.js|facebook-reply\.js|hermes\.js|requestAgentReply/);
+  for (const f of ["alerts.js", "scheduled.js", "daily-jobs.js"]) {
+    const src2 = readFileSync(new URL("../src/" + f, import.meta.url), "utf8");
+    assert.doesNotMatch(src2, /recoverComment|reconcileComment|processCommentEvent|pipeline\.js|facebook-reply\.js|requestAgentReply|approveSuggestion|insertMapping|content_mappings/, f);
+  }
 });

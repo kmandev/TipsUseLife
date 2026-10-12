@@ -1038,8 +1038,32 @@
       a.telegram_configured ? null : h("p", { class: "hint", text: "ตั้งค่า: สร้างบอทกับ @BotFather แล้วรัน npx wrangler secret put TELEGRAM_BOT_TOKEN และ npx wrangler secret put TELEGRAM_CHAT_ID บน Pi (ดู docs/OPERATIONS.md)" }));
   }
 
+  /* Upgrade U7: daily housekeeping (discovery + review-only suggestions). */
+  function dailyCard(dj, reload) {
+    const st = dj.state || {};
+    const d = st.discovery; const s = st.suggestions;
+    const kv = (k, v) => h("tr", null, h("th", { text: k }), h("td", null, v));
+    const run = h("button", { class: "btn small", text: "รันตอนนี้", onclick: async (e) => {
+      if (!window.confirm("รันค้นหาโพสต์ใหม่และสร้างคำแนะนำสินค้าตอนนี้?\n(อ่านโพสต์จาก Facebook แบบอ่านอย่างเดียว และเรียก AI สูงสุด 5 ครั้ง — ไม่ผูกสินค้าเอง)")) return;
+      e.target.disabled = true;
+      try { const r = (await api("/admin/api/daily/run", { method: "POST", body: {} })).data || {}; toast("เสร็จแล้ว: โพสต์ใหม่ " + ((r.discovery && r.discovery.inserted) || 0) + " · คำแนะนำใหม่ " + ((r.suggestions && r.suggestions.suggested) || 0)); }
+      catch (ex) { toast(ex.message, "err"); }
+      e.target.disabled = false; reload();
+    } });
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h3", { text: "งานประจำวันอัตโนมัติ (ทุกวัน " + (dj.schedule || "06:17") + ")" }),
+        h("span", null, badge(dj.auto_discovery ? "ค้นหาโพสต์: เปิด" : "ค้นหาโพสต์: ปิด", dj.auto_discovery ? "green" : "gray"), " ", badge(dj.auto_suggestions ? "คำแนะนำ AI: เปิด" : "คำแนะนำ AI: ปิด", dj.auto_suggestions ? "green" : "gray"))),
+      h("p", { class: "muted small", text: "ค้นหาโพสต์/Reel ใหม่ (อ่านอย่างเดียว) แล้วให้ AI แนะนำสินค้า จากนั้นส่งสรุปเข้า Telegram — การผูกสินค้ายังต้องให้คุณกดอนุมัติเองทุกครั้ง" }),
+      h("table", { class: "kv" }, h("tbody", null,
+        kv("รันล่าสุด", h("span", { text: fmtTime(st.ran_at) })),
+        kv("ค้นหาโพสต์", d ? h("span", { text: d.status + " · ใหม่ " + d.inserted + " · แก้ไข " + d.updated + (d.error ? " · " + d.error : "") }) : h("span", { class: "muted", text: "-" })),
+        kv("คำแนะนำ AI", s ? h("span", { text: s.status + " · แนะนำ " + s.suggested + " · ไม่ตรง " + s.no_match + (s.error ? " · " + s.error : "") }) : h("span", { class: "muted", text: "-" })),
+        kv("รออนุมัติ", st.pending ? h("a", { href: "#suggestions", text: st.pending + " รายการ →" }) : h("span", { class: "muted", text: st.pending === 0 ? "0" : "-" })))),
+      h("div", { class: "actions" }, run));
+  }
+
   async function viewSettings(main) {
-    const [res, alerts] = await Promise.all([api("/admin/api/settings"), api("/admin/api/alerts").catch(() => ({ data: { telegram_configured: false, state: null } }))]);
+    const [res, alerts, daily] = await Promise.all([api("/admin/api/settings"), api("/admin/api/alerts").catch(() => ({ data: { telegram_configured: false, state: null } })), api("/admin/api/daily").catch(() => ({ data: {} }))]);
     const s = res.data || {};
     state.mode = s.reply_mode;
     const kv = (k, v) => h("tr", null, h("th", { text: k }), h("td", { class: "mono", text: v }));
@@ -1051,6 +1075,7 @@
         kv("โดเมนลิงก์ที่อนุญาต", (s.affiliate_allowed_hosts || []).join(", ")),
         ...Object.entries(s.secrets_present || {}).map(([k, v]) => kv(k, v ? "ตั้งค่าแล้ว" : "ยังไม่ตั้งค่า"))))),
       alertsCard(alerts.data || {}, () => viewSettings(main)),
+      dailyCard(daily.data || {}, () => viewSettings(main)),
       h("div", { class: "card note" }, h("h3", { text: "การเปิด LIVE" }), h("p", { text: "ระบบจะตอบคอมเมนต์จริงเฉพาะเมื่อ REPLY_MODE = LIVE และตั้งค่า PAGE_ACCESS_TOKEN แล้วเท่านั้น การเปลี่ยนโหมดทำได้โดยการ deploy อย่างตั้งใจ (ดู docs/OPERATIONS.md) ไม่สามารถเปิดจากหน้านี้ได้" })));
     renderModeInHeader();
   }

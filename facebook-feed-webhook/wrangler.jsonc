@@ -25,14 +25,19 @@
     // the same amount (pipeline.js hermesBudgetMs).
     "GRAPH_TIMEOUT_MS": "10000",
     // Upgrade U1: link included in Telegram alerts (no secret).
-    "DASHBOARD_URL": "https://facebook-feed-webhook.farkram.workers.dev"
+    "DASHBOARD_URL": "https://facebook-feed-webhook.farkram.workers.dev",
+    // Upgrade U7: daily housekeeping switches ("0" = off).
+    "AUTO_DISCOVERY": "1",
+    "AUTO_SUGGESTIONS": "1"
   },
 
   // Upgrade U1: operator alerts. Every 5 minutes a READ-ONLY health + token
   // check runs (src/alerts.js); it only sends a Telegram message on change.
   // Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (absent = alerts off).
+  // Upgrade U7: "17 23 * * *" (06:17 Bangkok) runs post discovery + review-only
+  // product suggestions (src/daily-jobs.js); it never creates a mapping.
   "triggers": {
-    "crons": ["*/5 * * * *"]
+    "crons": ["*/5 * * * *", "17 23 * * *"]
   },
 
   "d1_databases": [

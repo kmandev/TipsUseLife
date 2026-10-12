@@ -90,7 +90,8 @@ Kept for history; the evidence notes and the row 196 record below still apply.
 | `HERMES_SECRET` | secret, **unused** | Not read by any Worker code (all repo references removed in Phase 6). It belonged to the retired `/webhooks/facebook-comments` path. Still present as a production Worker secret; safe to delete with `npx wrangler secret delete HERMES_SECRET` (creates a new Worker version — do it as a separate, audited change). Hermes auth uses `HERMES_API_KEY` only. |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | secret, optional | Upgrade U1 operator alerts. Absent = alerts off (the check still runs and records state). |
 | `DASHBOARD_URL` | var | `https://facebook-feed-webhook.farkram.workers.dev` — link placed in alert messages |
-| `triggers.crons` | cron | `*/5 * * * *` — the read-only alert check (below). The only scheduled work; it never replies, retries or recovers. |
+| `triggers.crons` | cron | `*/5 * * * *` — the read-only alert check; `17 23 * * *` (06:17 Bangkok) — daily housekeeping (U7). Dispatched by `src/scheduled.js`; neither replies, retries, recovers nor creates a mapping. |
+| `AUTO_DISCOVERY`, `AUTO_SUGGESTIONS` | var | `"1"` (on) / `"0"` (off) — the two steps of the daily housekeeping run |
 | `ADMIN_LOGIN_LIMITER` | rate-limit binding | `ratelimits` in `wrangler.jsonc`: 5 login attempts / 60 s per client IP → `429 RATE_LIMITED`. Per-location and approximate. If the binding is missing, login still works (logged as `admin_login_ratelimit_unavailable`). |
 
 ## Recovery and health (Phase 8.2)
@@ -463,6 +464,22 @@ check still runs and moves its baseline (no flood when you configure it later).
 Turn alerts off: `npx wrangler secret delete TELEGRAM_BOT_TOKEN` (the cron
 keeps recording state silently). Remove the cron entirely: delete
 `triggers` from `wrangler.jsonc` and deploy.
+
+## Daily housekeeping (Upgrade U7)
+
+Every day at 06:17 Asia/Bangkok (`17 23 * * *` UTC) `src/daily-jobs.js`
+runs the two existing operator actions, unchanged and with their own locks
+and budgets: **post discovery** (read-only Graph GETs) and **product
+suggestions** (review-only, ≤ 5 serial Hermes calls). It then sends one
+Telegram summary if something new needs review (new posts, new suggestions,
+how many are pending, or a failure). It **never** creates, changes or
+approves a mapping — approval stays the explicit AM-2.4 click — never
+replies to a comment and never POSTs to Facebook. A second fire within 20 h
+is a no-op. State: `settings` key `daily_jobs_v1`.
+
+Dashboard → ตั้งค่า → "งานประจำวันอัตโนมัติ" shows the last run and has
+**รันตอนนี้** (asks first; `POST /admin/api/daily/run`). Turn a step off with
+`"AUTO_DISCOVERY": "0"` / `"AUTO_SUGGESTIONS": "0"` in `wrangler.jsonc` and deploy.
 
 ## Insights (Upgrades U3–U6 — read-only)
 

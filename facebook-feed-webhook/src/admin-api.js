@@ -28,6 +28,8 @@
  *   GET    /admin/api/alerts              alert status (Telegram configured?, last check, token verdict)
  *   POST   /admin/api/alerts/test         send one Telegram test message (no D1 write)
  *   POST   /admin/api/alerts/check        run the read-only alert check now (same as the cron)
+ *   GET    /admin/api/daily               daily housekeeping status + switches (U7)
+ *   POST   /admin/api/daily/run           run discovery + review-only suggestions now (never maps)
  *   GET    /admin/api/recovery            rows needing operator attention
  *   POST   /admin/api/comments/:id/retry  operator recovery of ONE comment
  *   POST   /admin/api/comments/:id/reconcile  link an AMBIGUOUS LIVE send to the
@@ -68,6 +70,7 @@ import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggest
 import { logEvent, logError } from "./log.js";
 import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
 import { runAlertCheck, sendTestAlert, readAlertState, telegramConfigured } from "./alerts.js";
+import { runDailyJobs, readDailyState } from "./daily-jobs.js";
 
 const PLATFORMS = ["shopee", "lazada", "tiktok", "other"];
 const CONTENT_TYPES = ["POST", "REEL"];
@@ -299,6 +302,20 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
       return apiJson({ data: page, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
+    }
+
+    // Upgrade U7: daily housekeeping (discovery + review-only suggestions).
+    if (resource === "daily") {
+      if (idSegment === undefined) {
+        if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
+        return apiJson({ data: { auto_discovery: String(env?.AUTO_DISCOVERY ?? "1") !== "0", auto_suggestions: String(env?.AUTO_SUGGESTIONS ?? "1") !== "0", schedule: "06:17 Asia/Bangkok", state: await readDailyState(db) } });
+      }
+      if (idSegment === "run") {
+        if (method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+        const r = await runDailyJobs(env, { force: true });
+        return apiJson({ data: r }, r.ok ? 200 : 500);
+      }
+      return apiError(404, "NOT_FOUND", "Not found");
     }
 
     // Upgrade U1: operator alerts (Telegram). GET status; POST test / check.

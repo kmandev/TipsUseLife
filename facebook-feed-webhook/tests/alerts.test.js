@@ -190,7 +190,7 @@ test("U1 the cron handler only schedules the alert check (no reply / retry / D1 
 
 test("U1 wrangler.jsonc: one 5-minute cron, dashboard URL var, no secret values", () => {
   const raw = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
-  assert.match(raw, /"crons": \["\*\/5 \* \* \* \*"\]/);
+  assert.match(raw, /"crons": \["\*\/5 \* \* \* \*", "17 23 \* \* \*"\]/);
   assert.match(raw, /"DASHBOARD_URL": "https:\/\/facebook-feed-webhook\.farkram\.workers\.dev"/);
   assert.match(raw, /"REPLY_MODE": "LIVE"/, "LIVE unchanged");
   assert.doesNotMatch(raw, /TELEGRAM_BOT_TOKEN"\s*:/, "bot token is a secret, never a var");
