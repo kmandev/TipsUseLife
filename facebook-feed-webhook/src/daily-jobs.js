@@ -18,6 +18,7 @@ import { runDiscovery } from "./discovery.js";
 import { generateSuggestions } from "./suggestions.js";
 import { sendTelegram, telegramConfigured } from "./alerts.js";
 import { notifyPendingSuggestions } from "./telegram-bot.js";
+import { autoMapHighConfidence } from "./auto-map.js";
 import { logEvent, logError } from "./log.js";
 
 export const DAILY_STATE_KEY = "daily_jobs_v1";
@@ -86,6 +87,14 @@ export async function runDailyJobs(env, opts = {}) {
       state.suggestions = { status: "FAILED", suggested: 0, no_match: 0, error: "UNHANDLED_EXCEPTION" };
     }
   }
+  // U13: map HIGH-confidence suggestions automatically (AM-2.4 approval path, audited, undo in Telegram).
+  try {
+    const a = await autoMapHighConfidence(env, { fetchImpl: opts.fetchImpl });
+    state.auto_mapped = a.mapped || 0;
+  } catch {
+    state.auto_mapped = 0;
+    logError("auto_map_failed", "UNHANDLED_EXCEPTION");
+  }
   try {
     const row = await db
       .prepare(`SELECT COUNT(*) AS n FROM product_suggestions WHERE page_id = ? AND status = 'PENDING' AND product_id IS NOT NULL`)
@@ -103,6 +112,7 @@ export async function runDailyJobs(env, opts = {}) {
   if (d && d.status !== "OK" && d.status !== "NOT_RUN") lines.push(`• การค้นหาโพสต์: ${d.status}${d.error ? " (" + d.error + ")" : ""}`);
   if (d && d.status === "NOT_RUN" && d.error !== "ALREADY_RUNNING") lines.push(`• การค้นหาโพสต์ไม่ได้ทำงาน (${d.error})`);
   if (s && s.suggested) lines.push(`• AI แนะนำสินค้าใหม่ ${s.suggested} รายการ`);
+  if (state.auto_mapped) lines.push(`• ผูกสินค้าอัตโนมัติ (AI มั่นใจสูง) ${state.auto_mapped} รายการ — ยกเลิกได้จากข้อความแจ้งแต่ละรายการ`);
   if (s && s.status === "FAILED") lines.push(`• การสร้างคำแนะนำล้มเหลว${s.error ? " (" + s.error + ")" : ""}`);
   if ((s && s.suggested) || (d && d.inserted)) {
     if (state.pending) lines.push(`• รอคุณตรวจและอนุมัติ ${state.pending} รายการ (ระบบไม่ผูกสินค้าเอง)`);

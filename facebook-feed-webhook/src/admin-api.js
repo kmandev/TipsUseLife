@@ -361,7 +361,7 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
     if (resource === "daily") {
       if (idSegment === undefined) {
         if (method !== "GET") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "GET" });
-        return apiJson({ data: { auto_discovery: String(env?.AUTO_DISCOVERY ?? "1") !== "0", auto_suggestions: String(env?.AUTO_SUGGESTIONS ?? "1") !== "0", schedule: "06:17 Asia/Bangkok", state: await readDailyState(db) } });
+        return apiJson({ data: { auto_discovery: String(env?.AUTO_DISCOVERY ?? "1") !== "0", auto_suggestions: String(env?.AUTO_SUGGESTIONS ?? "1") !== "0", auto_map_high: String(env?.AUTO_MAP_HIGH ?? "1") !== "0", schedule: "06:17 Asia/Bangkok", state: await readDailyState(db) } });
       }
       if (idSegment === "run") {
         if (method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });

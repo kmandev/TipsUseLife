@@ -28,7 +28,9 @@
     "DASHBOARD_URL": "https://facebook-feed-webhook.farkram.workers.dev",
     // Upgrade U7: daily housekeeping switches ("0" = off).
     "AUTO_DISCOVERY": "1",
-    "AUTO_SUGGESTIONS": "1"
+    "AUTO_SUGGESTIONS": "1",
+    // Upgrade U13: auto-map HIGH-confidence suggestions in the daily run ("0" = off).
+    "AUTO_MAP_HIGH": "1"
   },
 
   // Upgrade U1: operator alerts. Every 5 minutes a READ-ONLY health + token

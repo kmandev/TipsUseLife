@@ -19,10 +19,10 @@
 
 import { hmacSha256Hex, timingSafeEqual } from "./crypto.js";
 import { resolveConfig } from "./config.js";
-import { listSuggestions, approveSuggestion, rejectSuggestion, subjectKeyOf, isMappableRepresentative } from "./suggestions.js";
+import { listSuggestions, approveSuggestion, rejectSuggestion, subjectKeyOf, isMappableRepresentative, approvalNote } from "./suggestions.js";
 import { listCandidates } from "./discovery.js";
 import { prefilterProducts } from "./suggestion-prefilter.js";
-import { getProduct, subjectSourcePostIds, insertMappingIfAbsent, recordAudit } from "./admin-db.js";
+import { getProduct, subjectSourcePostIds, insertMappingIfAbsent, recordAudit, deactivateMapping } from "./admin-db.js";
 import { telegramConfigured } from "./alerts.js";
 import { logEvent, logError } from "./log.js";
 
@@ -31,7 +31,7 @@ export const NOTIFIED_KEY = "telegram_notified_v1";
 const TG_TIMEOUT_MS = 8000;
 const MAX_UPDATE_BYTES = 64 * 1024;
 const MAX_PRODUCT_CHOICES = 8;
-const CALLBACK_RE = /^([vaArRopP]):([0-9]{1,9})(?::([0-9]{1,9}))?$/;
+const CALLBACK_RE = /^([vaArRopPuU]):([0-9]{1,9})(?::([0-9]{1,9}))?$/;
 
 /** Derived webhook secret (Telegram allows A-Z a-z 0-9 _ -, 1-256 chars). */
 export async function webhookSecret(env) {
@@ -203,6 +203,27 @@ export async function handleCallback(db, pageId, data) {
   const s = await getSuggestion(db, pageId, sid);
   if (!s) return { toast: FAIL_TEXT.NOT_FOUND, text: `คำแนะนำ #${sid} — ไม่พบแล้ว`, keyboard: null };
   const decided = (extra) => ({ text: suggestionText(s) + "\n\n" + extra, keyboard: null });
+
+  // U13: undo an automatic (or any approved) mapping -- two taps, deactivates it.
+  if (op === "u" || op === "U") {
+    const row = await db
+      .prepare(`SELECT id, facebook_post_id, facebook_content_type, product_id, active, note FROM content_mappings WHERE facebook_page_id = ? AND note = ? LIMIT 1`)
+      .bind(pageId, approvalNote(sid))
+      .first();
+    if (!row) return { toast: "ไม่พบการผูกของคำแนะนำนี้", text: `คำแนะนำ #${sid} — ไม่พบการผูก`, keyboard: null };
+    if (Number(row.active) !== 1) return { toast: "ปิดการผูกไปแล้ว", text: `↩️ คำแนะนำ #${sid}: การผูกถูกปิดแล้ว`, keyboard: null };
+    if (op === "u") {
+      return { text: `ยกเลิกการผูก “${s.product_name || "#" + row.product_id}” กับโพสต์ ${row.facebook_post_id}?\nโพสต์นี้จะไม่ได้รับลิงก์สินค้าอีก จนกว่าจะผูกใหม่ในแดชบอร์ด`, keyboard: { inline_keyboard: [[btn("↩️ ยืนยันยกเลิก", `U:${sid}`)]] }, toast: "" };
+    }
+    const changed = await deactivateMapping(db, Number(row.id), pageId);
+    if (changed) {
+      const ok = await recordAudit(db, { pageId, action: "MAPPING_UPDATE", targetType: "MAPPING", targetId: Number(row.id), before: row, after: { ...row, active: 0 } });
+      if (!ok) logError("admin_audit_write_failed", "D1_WRITE_FAILED", { action: "MAPPING_UPDATE" });
+      logEvent("telegram_mapping_undone", { suggestion_id: sid, mapping_id: Number(row.id) });
+    }
+    return { toast: "ยกเลิกการผูกแล้ว", text: `↩️ ยกเลิกการผูก “${s.product_name || "#" + row.product_id}” กับโพสต์ ${row.facebook_post_id} แล้ว — แก้ไขหรือผูกใหม่ได้ที่แดชบอร์ด (โพสต์ / Reel)`, keyboard: null };
+  }
+
   if (s.status !== "PENDING" && op !== "v") return { toast: FAIL_TEXT.NOT_PENDING, ...decided(`สถานะ: ${s.status}`) };
 
   if (op === "v") return { text: suggestionText(s), keyboard: s.status === "PENDING" ? suggestionKeyboard(s) : null, toast: "" };

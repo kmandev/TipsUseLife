@@ -559,6 +559,15 @@ export async function productPerformance(db, pageId) {
     .filter((r) => !r.deleted_at || r.comments > 0);
 }
 
+/** U13 undo: switch one mapping OFF (deactivation is always allowed, AM-2.5). */
+export async function deactivateMapping(db, id, pageId) {
+  const r = await db
+    .prepare(`UPDATE content_mappings SET active = 0, updated_at = datetime('now') WHERE id = ? AND facebook_page_id = ? AND active = 1`)
+    .bind(id, pageId)
+    .run();
+  return Number(r?.meta?.changes ?? 0);
+}
+
 /* ------------------------ Upgrade U8: admin audit ------------------------ */
 
 export const AUDIT_ACTIONS = Object.freeze([

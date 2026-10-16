@@ -416,7 +416,9 @@ lookup — the reply path itself is unchanged. Errors (409 unless noted):
 `NOT_FOUND` (404), `NOT_PENDING`, `NO_PRODUCT`, `PRODUCT_UNAVAILABLE`,
 `SUBJECT_NOT_FOUND`, `MAPPING_EXISTS`, `NO_SAFE_REPRESENTATIVE`,
 `CONTENT_TYPE_UNKNOWN`, `SUGGESTION_STALE`, `CONFLICT`, `MAPPING_WRITE_FAILED`.
-There is no automatic approval of any kind.
+Since Upgrade U13 (2026-10-16, owner decision) the daily run auto-approves
+HIGH-confidence suggestions through this same function — see "Automatic
+mapping (Upgrade U13)". Nothing else approves automatically.
 
 **Hermes contention.** Suggestions share Hermes' concurrency cap with live
 comment replies. Runs are serial and capped at 5 calls; run them at a quiet
@@ -464,6 +466,23 @@ check still runs and moves its baseline (no flood when you configure it later).
 Turn alerts off: `npx wrangler secret delete TELEGRAM_BOT_TOKEN` (the cron
 keeps recording state silently). Remove the cron entirely: delete
 `triggers` from `wrangler.jsonc` and deploy.
+
+## Automatic mapping (Upgrade U13)
+
+Owner decision 2026-10-16 ("map automatically when confidence is above 60%",
+interpreted as AI confidence HIGH). In the daily run, after suggestions are
+generated, `src/auto-map.js` approves a PENDING suggestion automatically when
+**all** hold: confidence `HIGH`; deterministic prefilter score ≥ 5 (at least a
+brand-word or full-name match in the post text); product active and not
+deleted; representative is a posts-edge `<page>_<n>` id. The write is the
+unchanged AM-2.4 `approveSuggestion` (text hash unchanged, no mapping of any
+state on any source id of the Reel, one D1 batch) — no guard is bypassed and
+an existing mapping is never replaced or re-activated. At most 5 per run.
+
+Each auto-mapping is audited (`via: auto`) and announced in Telegram with
+**↩️ ยกเลิกการผูก** (two taps → the mapping is switched off; fix it in the
+Dashboard). Turn off: `"AUTO_MAP_HIGH": "0"` in `wrangler.jsonc` and deploy.
+From the next comment on that post the reply carries the product's link (LIVE).
 
 ## Map products from Telegram (Upgrade U12)
 
@@ -516,9 +535,9 @@ runs the two existing operator actions, unchanged and with their own locks
 and budgets: **post discovery** (read-only Graph GETs) and **product
 suggestions** (review-only, ≤ 5 serial Hermes calls). It then sends one
 Telegram summary if something new needs review (new posts, new suggestions,
-how many are pending, or a failure). It **never** creates, changes or
-approves a mapping — approval stays the explicit AM-2.4 click — never
-replies to a comment and never POSTs to Facebook. A second fire within 20 h
+how many are pending, or a failure). Apart from the HIGH-confidence
+auto-mapping below (U13, switchable) it never creates, changes or approves a
+mapping; it never replies to a comment and never POSTs to Facebook. A second fire within 20 h
 is a no-op. State: `settings` key `daily_jobs_v1`.
 
 Dashboard → ตั้งค่า → "งานประจำวันอัตโนมัติ" shows the last run and has

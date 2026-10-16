@@ -411,4 +411,8 @@ test("P8.2: no scheduled/automatic recovery exists (the only cron is the read-on
     const src2 = readFileSync(new URL("../src/" + f, import.meta.url), "utf8");
     assert.doesNotMatch(src2, /recoverComment|reconcileComment|processCommentEvent|pipeline\.js|facebook-reply\.js|requestAgentReply|approveSuggestion|insertMapping|content_mappings/, f);
   }
+  // U13: the only scheduled mapping write is auto-map.js, through the unchanged AM-2.4 approval.
+  const auto = readFileSync(new URL("../src/auto-map.js", import.meta.url), "utf8");
+  assert.match(auto, /approveSuggestion\(/);
+  assert.doesNotMatch(auto, /insertMapping|INSERT INTO content_mappings|UPDATE content_mappings|recoverComment|processCommentEvent|requestAgentReply/);
 });

@@ -1131,12 +1131,13 @@
     } });
     return h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h3", { text: "งานประจำวันอัตโนมัติ (ทุกวัน " + (dj.schedule || "06:17") + ")" }),
-        h("span", null, badge(dj.auto_discovery ? "ค้นหาโพสต์: เปิด" : "ค้นหาโพสต์: ปิด", dj.auto_discovery ? "green" : "gray"), " ", badge(dj.auto_suggestions ? "คำแนะนำ AI: เปิด" : "คำแนะนำ AI: ปิด", dj.auto_suggestions ? "green" : "gray"))),
-      h("p", { class: "muted small", text: "ค้นหาโพสต์/Reel ใหม่ (อ่านอย่างเดียว) แล้วให้ AI แนะนำสินค้า จากนั้นส่งสรุปเข้า Telegram — การผูกสินค้ายังต้องให้คุณกดอนุมัติเองทุกครั้ง" }),
+        h("span", null, badge(dj.auto_discovery ? "ค้นหาโพสต์: เปิด" : "ค้นหาโพสต์: ปิด", dj.auto_discovery ? "green" : "gray"), " ", badge(dj.auto_suggestions ? "คำแนะนำ AI: เปิด" : "คำแนะนำ AI: ปิด", dj.auto_suggestions ? "green" : "gray"), " ", badge(dj.auto_map_high ? "ผูกอัตโนมัติ (HIGH): เปิด" : "ผูกอัตโนมัติ: ปิด", dj.auto_map_high ? "blue" : "gray"))),
+      h("p", { class: "muted small", text: "ค้นหาโพสต์/Reel ใหม่ (อ่านอย่างเดียว) แล้วให้ AI แนะนำสินค้า คำแนะนำที่ AI มั่นใจสูง (HIGH) และชื่อ/แบรนด์สินค้าตรงกับโพสต์จะถูกผูกอัตโนมัติ (สูงสุด 5 ต่อวัน, ยกเลิกได้จาก Telegram) ที่เหลือรอคุณอนุมัติ" }),
       h("table", { class: "kv" }, h("tbody", null,
         kv("รันล่าสุด", h("span", { text: fmtTime(st.ran_at) })),
         kv("ค้นหาโพสต์", d ? h("span", { text: d.status + " · ใหม่ " + d.inserted + " · แก้ไข " + d.updated + (d.error ? " · " + d.error : "") }) : h("span", { class: "muted", text: "-" })),
         kv("คำแนะนำ AI", s ? h("span", { text: s.status + " · แนะนำ " + s.suggested + " · ไม่ตรง " + s.no_match + (s.error ? " · " + s.error : "") }) : h("span", { class: "muted", text: "-" })),
+        kv("ผูกอัตโนมัติ", h("span", { text: st.auto_mapped === undefined ? "-" : String(st.auto_mapped) + " รายการ" })),
         kv("รออนุมัติ", st.pending ? h("a", { href: "#suggestions", text: st.pending + " รายการ →" }) : h("span", { class: "muted", text: st.pending === 0 ? "0" : "-" })))),
       h("div", { class: "actions" }, run));
   }
