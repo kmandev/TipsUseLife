@@ -219,6 +219,7 @@ export async function handleCallback(db, pageId, data) {
     if (changed) {
       const ok = await recordAudit(db, { pageId, action: "MAPPING_UPDATE", targetType: "MAPPING", targetId: Number(row.id), before: row, after: { ...row, active: 0 } });
       if (!ok) logError("admin_audit_write_failed", "D1_WRITE_FAILED", { action: "MAPPING_UPDATE" });
+      await recordAudit(db, { pageId, action: "SUGGESTION_UNDO", targetType: "SUGGESTION", targetId: sid, after: { status: "APPROVED", product_id: row.product_id, via: "telegram" } });
       logEvent("telegram_mapping_undone", { suggestion_id: sid, mapping_id: Number(row.id) });
     }
     return { toast: "ยกเลิกการผูกแล้ว", text: `↩️ ยกเลิกการผูก “${s.product_name || "#" + row.product_id}” กับโพสต์ ${row.facebook_post_id} แล้ว — แก้ไขหรือผูกใหม่ได้ที่แดชบอร์ด (โพสต์ / Reel)`, keyboard: null };

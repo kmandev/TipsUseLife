@@ -41,7 +41,7 @@
     return isNaN(d) ? String(v) : d.toLocaleString("th-TH", { dateStyle: "short", timeStyle: "short" });
   };
 
-  const state = { authenticated: null, tab: "overview", mode: null, products: [], toast: null, nav: null };
+  const state = { authenticated: null, tab: "overview", mode: null, products: [], toast: null, nav: null, settingsTab: "general" };
 
   function toast(message, kind = "ok") {
     state.toast = { message, kind };
@@ -852,6 +852,19 @@
   const SUGGESTION_STATUS_LABEL = { PENDING: "รอตรวจสอบ", REJECTED: "ปฏิเสธแล้ว", SUPERSEDED: "ล้าสมัย", APPROVED: "อนุมัติแล้ว" };
   const CONFIDENCE_KIND = { HIGH: "green", MEDIUM: "blue", LOW: "gray" };
 
+  /* U14: who decided and how (from admin_audit). */
+  const VIA_TEXT = { dashboard: "โดยคุณ · แดชบอร์ด", telegram: "โดยคุณ · Telegram", auto: "อัตโนมัติ · AI มั่นใจสูง" };
+  function decisionLine(s) {
+    const d = s.decision;
+    if (s.status !== "APPROVED" && s.status !== "REJECTED") return null;
+    if (!d || !d.decision) return h("div", { class: "muted small", text: "ไม่ทราบช่องทาง (ก่อนมีระบบประวัติ)" + (s.decided_at ? " · " + fmtTime(s.decided_at) : "") });
+    return h("div", { class: "small decision" },
+      h("div", { class: d.via === "auto" ? "via-auto" : "via-human", text: (VIA_TEXT[d.via] || d.via) }),
+      h("div", { class: "muted", text: fmtTime(d.decided_at || s.decided_at) }),
+      d.confirmed_at ? h("div", { class: "ok-text", text: "✔ คุณยืนยันแล้ว · " + fmtTime(d.confirmed_at) }) : null,
+      d.undone_at ? h("div", { class: "error", text: "↩️ ยกเลิกการผูกแล้ว · " + fmtTime(d.undone_at) }) : null);
+  }
+
   async function viewSuggestions(main) {
     const status = h("select", null, h("option", { value: "PENDING", text: "รอตรวจสอบ" }), h("option", { value: "", text: "ทุกสถานะ" }), h("option", { value: "REJECTED", text: "ปฏิเสธแล้ว" }), h("option", { value: "SUPERSEDED", text: "ล้าสมัย" }), h("option", { value: "APPROVED", text: "อนุมัติแล้ว" }));
     const summarySlot = h("div");
@@ -860,7 +873,7 @@
 
     // AM-2.4: explicit human approval (confirmation dialog) -> server creates ONE mapping.
     const mapButton = (s) => s.mappable ? h("span", null,
-      h("button", { class: "btn small primary", text: "ผูกสินค้านี้", onclick: async (e) => {
+      h("button", { class: "btn small primary", text: "✅ อนุมัติ (ผูกสินค้านี้)", onclick: async (e) => {
         if (!window.confirm("ยืนยันผูกสินค้า “" + (s.product_name || ("#" + s.product_id)) + "” กับโพสต์ " + s.representative_post_id + " ?\nระบบจะสร้าง mapping จริง และคำตอบคอมเมนต์ถัดไปของโพสต์นี้จะแนบลิงก์สินค้านี้")) return;
         e.target.disabled = true;
         try { await api("/admin/api/suggestions/" + s.id + "/approve", { method: "POST", body: {} }); toast("ผูกสินค้าแล้ว"); await load(); }
@@ -869,7 +882,22 @@
       h("button", { class: "btn small ghost", text: "แก้ไขในฟอร์ม", onclick: () => {
         state.prefill = { post_id: s.representative_post_id, product_id: s.product_id, type: s.content_type, suggestion_id: s.id };
         goTo("content");
-      } })) : h("span", { class: "muted small", text: s.status === "APPROVED" ? "ผูกสินค้าแล้ว" : s.status !== "PENDING" ? "-" : !s.product_id ? "ไม่มีสินค้าที่ตรง" : !s.product_usable ? "สินค้าถูกปิด/ลบ" : "ยังไม่มีรหัสโพสต์ของเพจ" });
+      } })) : s.status === "APPROVED" ? reviewButtons(s) : h("span", { class: "muted small", text: s.status !== "PENDING" ? "-" : !s.product_id ? "ไม่มีสินค้าที่ตรง" : !s.product_usable ? "สินค้าถูกปิด/ลบ" : "ยังไม่มีรหัสโพสต์ของเพจ" });
+
+    // U14: owner review of an approved suggestion (confirm an automatic one, or undo the mapping).
+    const reviewButtons = (s) => {
+      const d = s.decision || {};
+      if (d.undone_at) return h("span", { class: "muted small", text: "ยกเลิกการผูกแล้ว" });
+      const post = (path, ask, okText) => async (e) => {
+        if (ask && !window.confirm(ask)) return;
+        e.target.disabled = true;
+        try { await api("/admin/api/suggestions/" + s.id + path, { method: "POST", body: {} }); toast(okText); await load(); }
+        catch (ex) { toast(ex.message, "err"); e.target.disabled = false; }
+      };
+      return h("span", null,
+        d.via === "auto" && !d.confirmed_at ? h("button", { class: "btn small primary", text: "👍 ยืนยันโดยฉัน", onclick: post("/confirm", null, "ยืนยันแล้ว") }) : null,
+        h("button", { class: "btn small ghost", text: "↩️ ยกเลิกการผูก", onclick: post("/undo", "ยกเลิกการผูก “" + (s.product_name || ("#" + s.product_id)) + "” กับโพสต์ " + s.representative_post_id + " ?\nโพสต์นี้จะไม่ได้รับลิงก์สินค้าอีก จนกว่าจะแก้ในหน้า โพสต์ / Reel", "ยกเลิกการผูกแล้ว") }));
+    };
 
     const rejectButton = (s) => s.status === "PENDING" ? h("button", { class: "btn small danger", text: "ปฏิเสธ", onclick: async (e) => {
       e.target.disabled = true;
@@ -884,7 +912,7 @@
         h("td", null, badge(s.confidence, CONFIDENCE_KIND[s.confidence])),
         h("td", { class: "small", text: s.reason || "" }),
         h("td", { text: s.prefilter_score }),
-        h("td", null, badge(SUGGESTION_STATUS_LABEL[s.status] || s.status, s.status === "PENDING" ? "blue" : "gray")),
+        h("td", null, badge(SUGGESTION_STATUS_LABEL[s.status] || s.status, s.status === "PENDING" ? "blue" : s.status === "APPROVED" ? "green" : "gray"), decisionLine(s)),
         h("td", { class: "nowrap small", text: fmtTime(s.created_at) }),
         h("td", { class: "nowrap" }, mapButton(s), rejectButton(s))))));
 
@@ -913,7 +941,7 @@
     status.addEventListener("change", () => paging.reset().catch((ex) => toast(ex.message, "err")));
     main.replaceChildren(
       h("div", { class: "row-between" }, h("h2", { text: "สินค้าแนะนำ" }), generate),
-      h("p", { class: "muted", text: "AI แนะนำสินค้าจากรายการที่ระบบคัดกรองแล้วเท่านั้น สำหรับโพสต์/Reel ที่ยังไม่ผูกสินค้า — เป็นคำแนะนำให้ตรวจสอบเท่านั้น ระบบไม่ผูกสินค้าเอง “ผูกสินค้านี้” จะถามยืนยันก่อน แล้วจึงสร้าง mapping ให้ (หรือกด “แก้ไขในฟอร์ม” เพื่อเปิดฟอร์มเดิม)" }),
+      h("p", { class: "muted", text: "AI แนะนำสินค้าจากรายการที่ระบบคัดกรองแล้วเท่านั้น สำหรับโพสต์/Reel ที่ยังไม่ผูกสินค้า — คำแนะนำที่ AI มั่นใจสูง (HIGH) และชื่อ/แบรนด์สินค้าตรงกับโพสต์ ระบบผูกให้อัตโนมัติในงานประจำวัน (กด “ยืนยันโดยฉัน” หรือ “ยกเลิกการผูก” ได้) ที่เหลือกด “✅ อนุมัติ” เพื่อผูกเอง ระบบจะถามยืนยันก่อนเสมอ (หรือกด “แก้ไขในฟอร์ม” เพื่อเปิดฟอร์มเดิม) — คอลัมน์สถานะบอกว่าใครอนุมัติ และผ่านช่องทางไหน" }),
       summarySlot, h("div", { class: "toolbar" }, status), tableSlot, paging.bar);
     await paging.reset();
   }
@@ -1142,24 +1170,71 @@
       h("div", { class: "actions" }, run));
   }
 
+  /* U14: settings sub-tabs. */
+  const SETTINGS_TABS = [["general", "ทั่วไป"], ["theme", "ธีม"], ["alerts", "การแจ้งเตือน"], ["telegram", "Telegram"], ["daily", "งานอัตโนมัติ"]];
+
   async function viewSettings(main) {
     const [res, alerts, daily, tg] = await Promise.all([api("/admin/api/settings"), api("/admin/api/alerts").catch(() => ({ data: { telegram_configured: false, state: null } })), api("/admin/api/daily").catch(() => ({ data: {} })), api("/admin/api/telegram").catch(() => ({ data: { configured: false } }))]);
     const s = res.data || {};
     state.mode = s.reply_mode;
     const kv = (k, v) => h("tr", null, h("th", { text: k }), h("td", { class: "mono", text: v }));
-    main.replaceChildren(
-      h("h2", { text: "ตั้งค่า (อ่านอย่างเดียว)" }),
-      h("div", { class: "card" }, h("table", { class: "kv" }, h("tbody", null,
-        kv("REPLY_MODE (มีผลจริง)", s.reply_mode), kv("REPLY_MODE (ที่ตั้งไว้)", s.reply_mode_requested), kv("PAGE_ID", s.page_id), kv("Hermes", s.hermes_host),
-        kv("HERMES_TIMEOUT_MS", s.hermes_timeout_ms), kv("GRAPH_API_VERSION", s.graph_api_version), kv("MAX_REPLY_LENGTH", s.max_reply_length),
-        kv("โดเมนลิงก์ที่อนุญาต", (s.affiliate_allowed_hosts || []).join(", ")),
-        ...Object.entries(s.secrets_present || {}).map(([k, v]) => kv(k, v ? "ตั้งค่าแล้ว" : "ยังไม่ตั้งค่า"))))),
-      alertsCard(alerts.data || {}, () => viewSettings(main)),
-      telegramMapCard(tg.data || {}, () => viewSettings(main)),
-      dailyCard(daily.data || {}, () => viewSettings(main)),
-      h("div", { class: "card note" }, h("h3", { text: "การเปิด LIVE" }), h("p", { text: "ระบบจะตอบคอมเมนต์จริงเฉพาะเมื่อ REPLY_MODE = LIVE และตั้งค่า PAGE_ACCESS_TOKEN แล้วเท่านั้น การเปลี่ยนโหมดทำได้โดยการ deploy อย่างตั้งใจ (ดู docs/OPERATIONS.md) ไม่สามารถเปิดจากหน้านี้ได้" })));
+    const panels = {
+      general: () => [
+        h("div", { class: "card" }, h("h3", { text: "การตั้งค่าระบบ (อ่านอย่างเดียว)" }), h("table", { class: "kv" }, h("tbody", null,
+          kv("REPLY_MODE (มีผลจริง)", s.reply_mode), kv("REPLY_MODE (ที่ตั้งไว้)", s.reply_mode_requested), kv("PAGE_ID", s.page_id), kv("Hermes", s.hermes_host),
+          kv("HERMES_TIMEOUT_MS", s.hermes_timeout_ms), kv("GRAPH_API_VERSION", s.graph_api_version), kv("MAX_REPLY_LENGTH", s.max_reply_length),
+          kv("โดเมนลิงก์ที่อนุญาต", (s.affiliate_allowed_hosts || []).join(", ")),
+          ...Object.entries(s.secrets_present || {}).map(([k, v]) => kv(k, v ? "ตั้งค่าแล้ว" : "ยังไม่ตั้งค่า"))))),
+        h("div", { class: "card note" }, h("h3", { text: "การเปิด LIVE" }), h("p", { text: "ระบบจะตอบคอมเมนต์จริงเฉพาะเมื่อ REPLY_MODE = LIVE และตั้งค่า PAGE_ACCESS_TOKEN แล้วเท่านั้น การเปลี่ยนโหมดทำได้โดยการ deploy อย่างตั้งใจ (ดู docs/OPERATIONS.md) ไม่สามารถเปิดจากหน้านี้ได้" }))],
+      theme: () => [themeCard()],
+      alerts: () => [alertsCard(alerts.data || {}, () => viewSettings(main))],
+      telegram: () => [telegramMapCard(tg.data || {}, () => viewSettings(main))],
+      daily: () => [dailyCard(daily.data || {}, () => viewSettings(main))],
+    };
+    const tab = panels[state.settingsTab] ? state.settingsTab : "general";
+    const body = h("div", { class: "subtab-body", role: "tabpanel" });
+    const bar = h("div", { class: "subtabs", role: "tablist", "aria-label": "หมวดการตั้งค่า" });
+    const show = (key) => {
+      state.settingsTab = key;
+      for (const b of bar.children) { const on = b.dataset.key === key; b.classList.toggle("active", on); b.setAttribute("aria-selected", on ? "true" : "false"); }
+      body.replaceChildren(...panels[key]());
+    };
+    bar.replaceChildren(...SETTINGS_TABS.map(([key, label]) => { const b = h("button", { type: "button", class: "subtab", role: "tab", text: label, onclick: () => show(key) }); b.dataset.key = key; return b; }));
+    main.replaceChildren(h("h2", { text: "ตั้งค่า" }), bar, body);
+    show(tab);
     renderModeInHeader();
   }
+
+  /* U14: themes (accent palettes) + light/dark mode, saved in this browser only. */
+  const THEMES = [["indigo", "Indigo", "#3A5BF5", "#7C4DFF"], ["ocean", "Ocean", "#0B8FAC", "#2563EB"], ["sunset", "Sunset", "#E0475B", "#F08C2E"], ["grape", "Grape", "#7C3AED", "#DB2777"]];
+  const MODES = [["auto", "ตามระบบ"], ["light", "สว่าง"], ["dark", "มืด"]];
+  function readPref(key, fallback, allowed) {
+    try { const v = window.localStorage.getItem(key); return allowed.includes(v) ? v : fallback; } catch { return fallback; }
+  }
+  function applyTheme() {
+    const root = document.documentElement;
+    root.dataset.theme = readPref("tul_theme", "indigo", THEMES.map((t) => t[0]));
+    root.dataset.mode = readPref("tul_mode", "auto", MODES.map((m) => m[0]));
+  }
+  function savePref(key, value) { try { window.localStorage.setItem(key, value); } catch { /* private mode: applies to this page only */ } }
+  function themeCard() {
+    const cur = document.documentElement.dataset.theme || "indigo";
+    const mode = document.documentElement.dataset.mode || "auto";
+    const swatches = h("div", { class: "theme-grid", role: "radiogroup", "aria-label": "ธีมสี" }, THEMES.map(([key, label, a, b]) => {
+      const sw = h("span", { class: "theme-swatch" });
+      sw.style.background = "linear-gradient(135deg, " + a + ", " + b + ")"; // CSSOM, allowed by the CSP
+      return h("button", { type: "button", class: "theme-opt" + (cur === key ? " active" : ""), role: "radio", "aria-checked": cur === key ? "true" : "false", onclick: () => { savePref("tul_theme", key); applyTheme(); render(); } },
+        sw, h("span", { class: "theme-name", text: label }), cur === key ? h("span", { class: "theme-check", text: "✓" }) : null);
+    }));
+    const modes = h("div", { class: "seg", role: "radiogroup", "aria-label": "โหมดสี" }, MODES.map(([key, label]) =>
+      h("button", { type: "button", class: "seg-btn" + (mode === key ? " active" : ""), role: "radio", "aria-checked": mode === key ? "true" : "false", text: label, onclick: () => { savePref("tul_mode", key); applyTheme(); render(); } })));
+    return h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h3", { text: "ธีมและโหมดสี" })),
+      h("p", { class: "muted small", text: "ใช้กับเบราว์เซอร์นี้เท่านั้น (บันทึกในเครื่อง) — สีกราฟและสีสถานะไม่เปลี่ยน เพื่อให้อ่านค่าได้ถูกต้องเสมอ" }),
+      h("div", { class: "field" }, h("label", { text: "ธีมสี" }), swatches),
+      h("div", { class: "field" }, h("label", { text: "โหมด" }), modes));
+  }
+
 
   /* ------------------------------ render ----------------------------- */
   async function render() {
@@ -1173,5 +1248,6 @@
   }
 
   window.addEventListener("hashchange", () => { state.tab = tabFromHash(); render(); window.scrollTo(0, 0); });
+  applyTheme();
   document.addEventListener("DOMContentLoaded", () => { state.tab = tabFromHash(); render(); });
 })();

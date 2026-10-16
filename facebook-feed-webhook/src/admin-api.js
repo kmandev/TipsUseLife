@@ -70,9 +70,12 @@ import {
   productPerformance,
   recordAudit,
   listAudit,
+  suggestionDecisions,
+  approvalMapping,
+  deactivateMapping,
 } from "./admin-db.js";
 import { runDiscovery, listCandidates, listRuns, CANDIDATE_STATUSES, MAPPING_FILTERS } from "./discovery.js";
-import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, approveSuggestion, SUGGESTION_STATUSES } from "./suggestions.js";
+import { generateSuggestions, listSuggestions, listSuggestionRuns, rejectSuggestion, approveSuggestion, approvalNote, SUGGESTION_STATUSES } from "./suggestions.js";
 import { logEvent, logError } from "./log.js";
 import { recoverComment, listRecoveryAttention, healthStats, reconcileComment, RECONCILE_REASONS } from "./recovery.js";
 import { runAlertCheck, sendTestAlert, readAlertState, telegramConfigured } from "./alerts.js";
@@ -262,6 +265,10 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
   if (resource === "suggestions" && extra === "reject" && tooDeep === undefined) {
     return handleSuggestionReject(request, db, config, idSegment);
   }
+  // U14: POST /admin/api/suggestions/:id/confirm|undo -- owner review of an approved suggestion.
+  if (resource === "suggestions" && (extra === "confirm" || extra === "undo") && tooDeep === undefined) {
+    return handleSuggestionReview(request, db, config, idSegment, extra);
+  }
   // POST /admin/api/suggestions/:id/approve -- explicit human approval (AM-2.4).
   if (resource === "suggestions" && extra === "approve" && tooDeep === undefined) {
     return handleSuggestionApprove(request, db, config, idSegment);
@@ -428,7 +435,10 @@ export async function handleAdminApi(request, url, env, subpath, ctx) {
       const rows = await listSuggestions(db, config.pageId, { status, beforeId, limit: limit + 1 });
       const hasMore = rows.length > limit;
       const page = hasMore ? rows.slice(0, limit) : rows;
-      return apiJson({ data: page, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
+      // U14: who/how each decision was made (dashboard / telegram / auto), from admin_audit.
+      const decisions = await suggestionDecisions(db, config.pageId, page.map((r) => r.id));
+      const data = page.map((r) => ({ ...r, decision: decisions[r.id] ?? null }));
+      return apiJson({ data, has_more: hasMore, next_cursor: hasMore ? String(page[page.length - 1].id) : null });
     }
 
     if (resource === "post-candidates" && idSegment === undefined) {
@@ -706,7 +716,7 @@ async function handleSuggestionReject(request, db, config, idSegment) {
   if (outcome === "NOT_FOUND") return apiError(404, "NOT_FOUND", "Suggestion not found");
   if (outcome === "NOT_PENDING") return apiError(409, "NOT_PENDING", "Only a pending suggestion can be rejected");
   logEvent("admin_suggestion_rejected", { suggestion_id: id });
-  await audit(db, config, "SUGGESTION_REJECT", "SUGGESTION", id, { status: "PENDING" }, { status: "REJECTED" });
+  await audit(db, config, "SUGGESTION_REJECT", "SUGGESTION", id, { status: "PENDING" }, { status: "REJECTED", via: "dashboard" });
   return apiJson({ data: { id, status: "REJECTED" } });
 }
 
@@ -749,9 +759,42 @@ async function handleSuggestionApprove(request, db, config, idSegment) {
   }
   logEvent("admin_suggestion_approved", { suggestion_id: id, product_id: result.mapping.product_id, idempotent: Boolean(result.idempotent) });
   if (!result.idempotent) {
-    await audit(db, config, "SUGGESTION_APPROVE", "SUGGESTION", id, { status: "PENDING" }, { status: "APPROVED", product_id: result.mapping.product_id, mapping_post_id: result.mapping.post_id });
+    await audit(db, config, "SUGGESTION_APPROVE", "SUGGESTION", id, { status: "PENDING" }, { status: "APPROVED", product_id: result.mapping.product_id, mapping_post_id: result.mapping.post_id, via: "dashboard" });
   }
   return apiJson({ ok: true, suggestion_id: id, idempotent: Boolean(result.idempotent), mapping: result.mapping });
+}
+
+/**
+ * U14: owner review of an APPROVED suggestion (typically an automatic one).
+ *   confirm -> records "checked by me" (audit only; nothing else changes)
+ *   undo    -> switches the mapping the approval created OFF (deactivation is
+ *              always allowed, AM-2.5); the suggestion stays APPROVED in history.
+ */
+async function handleSuggestionReview(request, db, config, idSegment, op) {
+  if (request.method !== "POST") return apiError(405, "METHOD_NOT_ALLOWED", "Method not allowed", { Allow: "POST" });
+  const id = parseId(idSegment);
+  if (!id) return apiError(400, "INVALID_ID", "Invalid suggestion id");
+  try {
+    const row = await db.prepare(`SELECT id, status, product_id FROM product_suggestions WHERE id = ? AND page_id = ?`).bind(id, config.pageId).first();
+    if (!row) return apiError(404, "NOT_FOUND", "Suggestion not found");
+    if (row.status !== "APPROVED") return apiError(409, "NOT_APPROVED", "Only an approved suggestion can be reviewed");
+    const mapping = await approvalMapping(db, config.pageId, approvalNote(id));
+    if (op === "confirm") {
+      await audit(db, config, "SUGGESTION_CONFIRM", "SUGGESTION", id, null, { status: "APPROVED", product_id: row.product_id, via: "dashboard" });
+      logEvent("admin_suggestion_confirmed", { suggestion_id: id });
+      return apiJson({ data: { id, confirmed: true } });
+    }
+    if (!mapping) return apiError(409, "MAPPING_NOT_FOUND", "The mapping of this approval no longer exists");
+    if (Number(mapping.active) !== 1) return apiJson({ data: { id, mapping_id: Number(mapping.id), active: 0, idempotent: true } });
+    await deactivateMapping(db, Number(mapping.id), config.pageId);
+    await audit(db, config, "MAPPING_UPDATE", "MAPPING", Number(mapping.id), mapping, { ...mapping, active: 0, via: "dashboard" });
+    await audit(db, config, "SUGGESTION_UNDO", "SUGGESTION", id, null, { status: "APPROVED", product_id: row.product_id, via: "dashboard" });
+    logEvent("admin_suggestion_undone", { suggestion_id: id, mapping_id: Number(mapping.id) });
+    return apiJson({ data: { id, mapping_id: Number(mapping.id), active: 0 } });
+  } catch {
+    logError("admin_suggestion_review_failed", "UNHANDLED_EXCEPTION", { suggestion_id: id });
+    return apiError(500, "INTERNAL_ERROR", "Internal error");
+  }
 }
 
 /* ------------------------------ recovery ------------------------------ */

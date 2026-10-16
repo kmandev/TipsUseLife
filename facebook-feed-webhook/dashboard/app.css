@@ -1,7 +1,14 @@
-/* TipsUseLife AI Dashboard -- design tokens (light + dark), then components. */
+/* TipsUseLife AI Dashboard -- design tokens, then components.
+ * U14 themes: data-theme picks the accent pair (indigo | ocean | sunset | grape),
+ * data-mode picks light / dark / auto (system). Chart series (--s1..--s3) and
+ * status colours (green / amber / red) never change with the theme. */
+:root, :root[data-theme="indigo"] { --accent: #3A5BF5; --accent-2: #7C4DFF; --accent-d: #6E8BFF; --accent-2-d: #A98BFF; }
+:root[data-theme="ocean"] { --accent: #0B7F99; --accent-2: #2563EB; --accent-d: #3CC3DE; --accent-2-d: #7AA7FF; }
+:root[data-theme="sunset"] { --accent: #D63A50; --accent-2: #E57A1F; --accent-d: #FF7A8A; --accent-2-d: #FFB25C; }
+:root[data-theme="grape"] { --accent: #7C3AED; --accent-2: #DB2777; --accent-d: #B38BFF; --accent-2-d: #FF7AB8; }
 :root {
-  --blue: #3A5BF5; --blue-dark: #2741C9; --blue-soft: #ECF0FF;
-  --violet: #7C4DFF; --violet-soft: #F1EBFF;
+  --blue: var(--accent); --blue-dark: color-mix(in srgb, var(--accent) 80%, #000); --blue-soft: color-mix(in srgb, var(--accent) 11%, #fff);
+  --violet: var(--accent-2); --violet-soft: color-mix(in srgb, var(--accent-2) 11%, #fff);
   --green: #12A150; --green-soft: #E5F7EC;
   --amber: #C77700; --amber-soft: #FFF4E0;
   --red: #D93636; --red-soft: #FDECEC;
@@ -10,13 +17,14 @@
   --shadow: 0 1px 2px rgba(20, 27, 52, .04), 0 4px 16px rgba(20, 27, 52, .05);
   --shadow-lg: 0 8px 28px rgba(20, 27, 52, .10);
   --radius: 14px;
-  /* chart series: validated categorical slots 1-3 (dataviz validator, light) */
+  /* chart series: validated categorical slots 1-3 (dataviz validator) */
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a;
+  color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
-    --blue: #6E8BFF; --blue-dark: #8DA3FF; --blue-soft: #1D2650;
-    --violet: #A98BFF; --violet-soft: #2A1F4D;
+  :root:not([data-mode="light"]) {
+    --blue: var(--accent-d); --blue-dark: color-mix(in srgb, var(--accent-d) 78%, #fff); --blue-soft: color-mix(in srgb, var(--accent-d) 20%, #161B2F);
+    --violet: var(--accent-2-d); --violet-soft: color-mix(in srgb, var(--accent-2-d) 20%, #161B2F);
     --green: #3DD181; --green-soft: #133524;
     --amber: #F2B54B; --amber-soft: #3A2C10;
     --red: #FF6B6B; --red-soft: #3D1A1D;
@@ -25,7 +33,21 @@
     --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 16px rgba(0, 0, 0, .25);
     --shadow-lg: 0 8px 28px rgba(0, 0, 0, .45);
     --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    color-scheme: dark;
   }
+}
+:root[data-mode="dark"] {
+    --blue: var(--accent-d); --blue-dark: color-mix(in srgb, var(--accent-d) 78%, #fff); --blue-soft: color-mix(in srgb, var(--accent-d) 20%, #161B2F);
+    --violet: var(--accent-2-d); --violet-soft: color-mix(in srgb, var(--accent-2-d) 20%, #161B2F);
+    --green: #3DD181; --green-soft: #133524;
+    --amber: #F2B54B; --amber-soft: #3A2C10;
+    --red: #FF6B6B; --red-soft: #3D1A1D;
+    --ink: #E8EBF5; --ink-2: #C3C9DC; --muted: #9AA2BC; --muted-2: #7D85A0;
+    --line: #262C42; --line-2: #333A55; --bg: #0E1222; --card: #161B2F; --gray-soft: #1E2439; --hover: #1B2136;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 16px rgba(0, 0, 0, .25);
+    --shadow-lg: 0 8px 28px rgba(0, 0, 0, .45);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70;
+    color-scheme: dark;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.55 "IBM Plex Sans Thai", system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
@@ -239,6 +261,25 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12.5px; margi
 
 /* ---------- audit (U8) ---------- */
 .chg { line-height: 1.6; word-break: break-word; }
+
+/* ---------- settings sub-tabs + theme picker (U14) ---------- */
+.subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 0 0 16px; overflow-x: auto; scrollbar-width: none; }
+.subtab { border: 0; background: none; font: inherit; color: var(--muted); padding: 9px 14px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; white-space: nowrap; }
+.subtab:hover { color: var(--ink); }
+.subtab.active { color: var(--blue); border-bottom-color: var(--blue); font-weight: 600; }
+.theme-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.theme-opt { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 12px; background: var(--card); color: var(--ink); font: inherit; cursor: pointer; text-align: left; }
+.theme-opt:hover { border-color: var(--blue); }
+.theme-opt.active { border-color: var(--blue); box-shadow: 0 0 0 3px var(--blue-soft); }
+.theme-swatch { width: 28px; height: 28px; border-radius: 8px; flex: none; }
+.theme-name { flex: 1; font-weight: 600; }
+.theme-check { color: var(--blue); font-weight: 700; }
+
+/* ---------- suggestion decisions (U14) ---------- */
+.decision { margin-top: 4px; line-height: 1.5; }
+.via-auto { color: var(--violet); font-weight: 600; }
+.via-human { color: var(--ink-2); font-weight: 600; }
+.ok-text { color: var(--green); }
 
 @media (max-width: 1000px) {
   .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }

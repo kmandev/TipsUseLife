@@ -75,7 +75,7 @@ test("U13 undo from Telegram: two taps deactivate the auto-mapping and audit it"
   assert.equal(db._state.mappings[0].active, 0);
   assert.equal((await handleCallback(db, P, "U:1")).toast, "ปิดการผูกไปแล้ว", "repeat is a no-op");
   const actions = (await listAudit(db, P)).rows.map((r) => r.action);
-  assert.deepEqual(actions, ["MAPPING_UPDATE", "SUGGESTION_APPROVE"]);
+  assert.deepEqual(actions, ["SUGGESTION_UNDO", "MAPPING_UPDATE", "SUGGESTION_APPROVE"]);
 });
 
 test("U13 isAutoMappable rule and wiring", () => {

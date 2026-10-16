@@ -573,12 +573,12 @@ export async function deactivateMapping(db, id, pageId) {
 export const AUDIT_ACTIONS = Object.freeze([
   "PRODUCT_CREATE", "PRODUCT_UPDATE", "PRODUCT_TOGGLE", "PRODUCT_DELETE",
   "MAPPING_CREATE", "MAPPING_UPDATE", "MAPPING_DELETE",
-  "SUGGESTION_APPROVE", "SUGGESTION_REJECT",
+  "SUGGESTION_APPROVE", "SUGGESTION_REJECT", "SUGGESTION_CONFIRM", "SUGGESTION_UNDO",
   "COMMENT_RETRY", "COMMENT_RECONCILE",
 ]);
 const AUDIT_FIELDS = {
   PRODUCT: ["name", "platform", "affiliate_url", "active", "deleted_at"],
-  MAPPING: ["facebook_post_id", "facebook_content_type", "product_id", "active", "note"],
+  MAPPING: ["facebook_post_id", "facebook_content_type", "product_id", "active", "note", "via"],
   SUGGESTION: ["status", "product_id", "post_id", "mapping_post_id", "idempotent", "via"],
   COMMENT: ["status", "reason", "outcome", "detail"],
 };
@@ -628,4 +628,56 @@ export async function listAudit(db, pageId, { beforeId = null, limit = 25, targe
   } catch {
     return { available: false, rows: [] };
   }
+}
+
+/* ---------- Upgrade U14: who decided a suggestion (from admin_audit) ---------- */
+
+/**
+ * For each suggestion id: the latest decision (APPROVE / REJECT) with its
+ * channel (`via`: dashboard / telegram / auto; null = recorded before U8/U12)
+ * and whether the owner confirmed an automatic approval. Missing table -> {}.
+ */
+export async function suggestionDecisions(db, pageId, ids) {
+  const list = (ids || []).map(Number).filter((n) => Number.isSafeInteger(n) && n > 0);
+  if (!list.length) return {};
+  try {
+    const res = await db
+      .prepare(
+        `SELECT target_id, action, after_json, created_at FROM admin_audit
+          WHERE page_id = ? AND target_type = 'SUGGESTION' AND target_id IN (${list.map(() => "?").join(",")})
+          ORDER BY id ASC`
+      )
+      .bind(pageId, ...list)
+      .all();
+    const out = {};
+    for (const r of res?.results ?? []) {
+      const id = Number(r.target_id);
+      let after = null;
+      try { after = r.after_json ? JSON.parse(r.after_json) : null; } catch { after = null; }
+      const cur = out[id] || { via: null, decision: null, decided_at: null, confirmed_at: null, undone_at: null };
+      if (r.action === "SUGGESTION_APPROVE" || r.action === "SUGGESTION_REJECT") {
+        cur.decision = r.action === "SUGGESTION_APPROVE" ? "APPROVED" : "REJECTED";
+        cur.via = after?.via ?? "dashboard";
+        cur.decided_at = r.created_at;
+      } else if (r.action === "SUGGESTION_CONFIRM") {
+        cur.confirmed_at = r.created_at;
+      } else if (r.action === "SUGGESTION_UNDO") {
+        cur.undone_at = r.created_at;
+      }
+      out[id] = cur;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** The mapping an approval created (approveSuggestion writes note = approvalNote(id)). */
+export async function approvalMapping(db, pageId, note) {
+  return (
+    (await db
+      .prepare(`SELECT id, facebook_post_id, facebook_content_type, product_id, active, note FROM content_mappings WHERE facebook_page_id = ? AND note = ? LIMIT 1`)
+      .bind(pageId, note)
+      .first()) ?? null
+  );
 }

@@ -484,6 +484,22 @@ Each auto-mapping is audited (`via: auto`) and announced in Telegram with
 Dashboard). Turn off: `"AUTO_MAP_HIGH": "0"` in `wrangler.jsonc` and deploy.
 From the next comment on that post the reply carries the product's link (LIVE).
 
+## Review, themes and settings tabs (Upgrade U14)
+
+- **สินค้าแนะนำ → สถานะ** shows who/how each decision was made, read from
+  `admin_audit`: "โดยคุณ · แดชบอร์ด", "โดยคุณ · Telegram" or "อัตโนมัติ · AI
+  มั่นใจสูง" (+ time). Decisions made before the audit log existed show
+  "ไม่ทราบช่องทาง". Dashboard approvals/rejections are now recorded with
+  `via: dashboard`.
+- Approved rows get **↩️ ยกเลิกการผูก** (`POST /admin/api/suggestions/:id/undo`,
+  confirm dialog; switches the mapping OFF, never deletes) and automatic ones
+  also **👍 ยืนยันโดยฉัน** (`.../confirm`; records the review only). The
+  PENDING approve button is labelled "✅ อนุมัติ (ผูกสินค้านี้)".
+- **ตั้งค่า** is split into tabs: ทั่วไป · ธีม · การแจ้งเตือน · Telegram · งานอัตโนมัติ.
+  **ธีม**: Indigo / Ocean / Sunset / Grape accent palettes and ตามระบบ / สว่าง / มืด,
+  saved in this browser only (`localStorage` `tul_theme`, `tul_mode`). Chart
+  series and status colours never change with the theme.
+
 ## Map products from Telegram (Upgrade U12)
 
 The bot sends PENDING product suggestions to the owner's chat as button
